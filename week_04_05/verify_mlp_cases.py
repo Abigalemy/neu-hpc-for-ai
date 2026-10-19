@@ -2,6 +2,7 @@ import sqlite3
 import torch
 import torch.nn as nn
 import numpy as np
+import pickle
 
 class SimpleMLP(nn.Module):
     def __init__(self, hidden_size=256, intermediate_size=512):
@@ -17,16 +18,18 @@ class SimpleMLP(nn.Module):
 conn = sqlite3.connect("test_cases.db")
 cursor = conn.cursor()
 
-cursor.execute("SELECT input_data, output_data FROM mlp_test_cases")
+cursor.execute("SELECT weights_data, input_data, output_data FROM mlp_test_cases")
 row = cursor.fetchone()
 
 if row:
-    input_bytes, expected_output_bytes = row
+    weights_bytes, input_bytes, expected_output_bytes = row
     
+    weights_dict = pickle.loads(weights_bytes)
     input_tensor = torch.from_numpy(np.frombuffer(input_bytes, dtype=np.float32).copy().reshape(2, 4, 256))
     expected_output = torch.from_numpy(np.frombuffer(expected_output_bytes, dtype=np.float32).copy().reshape(2, 4, 256))
 
     model = SimpleMLP()
+    model.load_state_dict(weights_dict)
     model.eval()
 
     with torch.no_grad():
