@@ -26,15 +26,18 @@ mkdir -p "$OUT"
 COMMON=(--model "$MODEL" --url "$URL" --endpoint-type chat --streaming --tokenizer "$TOK"
         --extra-inputs '{"ignore_eos": true}' --warmup-request-count 8 --random-seed 0)
 
+# SCALE_PCT shrinks every request count (e.g. SCALE_PCT=25 for a cheap smoke run); minimum 8 requests.
+scale() { local n=$(( $1 * ${SCALE_PCT:-100} / 100 )); echo $(( n < 8 ? 8 : n )); }
+
 # closed(name conc isl isl_std osl osl_std nreq)
 closed() {
-  aiperf profile "${COMMON[@]}" --concurrency "$2" --request-count "$7" \
+  aiperf profile "${COMMON[@]}" --concurrency "$2" --request-count "$(scale "$7")" \
     --synthetic-input-tokens-mean "$3" --synthetic-input-tokens-stddev "$4" \
     --output-tokens-mean "$5" --output-tokens-stddev "$6" --artifact-dir "$OUT/$1_c$2"
 }
 # open(name rate isl isl_std osl osl_std nreq)
 open_loop() {
-  aiperf profile "${COMMON[@]}" --request-rate "$2" --arrival-pattern poisson --request-count "$7" \
+  aiperf profile "${COMMON[@]}" --request-rate "$2" --arrival-pattern poisson --request-count "$(scale "$7")" \
     --synthetic-input-tokens-mean "$3" --synthetic-input-tokens-stddev "$4" \
     --output-tokens-mean "$5" --output-tokens-stddev "$6" --artifact-dir "$OUT/$1_r$2"
 }
