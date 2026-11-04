@@ -17,7 +17,7 @@ class StubTok:
     def encode(self, text, add_special_tokens=False):
         return [ord(c) % 190 + 5 for c in text]
 
-    def decode(self, ids):
+    def decode(self, ids, **kw):
         return "".join(chr(97 + i % 26) for i in ids)
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kw):

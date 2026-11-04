@@ -66,8 +66,8 @@ class IncrementalDetokenizer:
 
     def push(self, token_id: int) -> str:
         self.ids.append(token_id)
-        prefix_text = self.tok.decode(self.ids[self.prefix:self.read])
-        new_text = self.tok.decode(self.ids[self.prefix:])
+        prefix_text = self.tok.decode(self.ids[self.prefix:self.read], skip_special_tokens=True)
+        new_text = self.tok.decode(self.ids[self.prefix:], skip_special_tokens=True)
         if len(new_text) > len(prefix_text) and not new_text.endswith("�"):
             self.prefix, self.read = self.read, len(self.ids)
             return new_text[len(prefix_text):]

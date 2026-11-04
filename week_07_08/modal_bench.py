@@ -52,6 +52,19 @@ vllm_image = (
 PRICE = {"t4": 0.59, "l4": 0.80, "a10g": 1.10, "a100-80gb": 2.50, "h100": 3.95}
 VALID = ["ours_paged", "ours_contiguous", "ours_nocache", "ours_static", "vllm"]
 
+# Final-run preset (--final). Sweeps are trimmed on purpose: concurrency-1 decode-heavy runs alone would take
+# ~25 min on our CPU-bound engine, and the no-cache engine re-runs the whole context every step so it only
+# gets the short, low-concurrency workloads. "name:a+b+c" = sweep values for that workload.
+_FULL = ["baseline", "balanced:4+16+64", "prefill_heavy:1+8+32", "decode_heavy:8+32+64",
+         "mixed_poisson:2+8", "pressure"]
+FINAL_PLAN = {  # config -> (workloads, max_minutes)
+    "vllm": (_FULL, 20),
+    "ours_paged": (_FULL, 40),
+    "ours_contiguous": (_FULL, 40),
+    "ours_nocache": (["baseline", "balanced:4+16", "prefill_heavy:1+8"], 25),
+    "ours_static": (["balanced:16+64", "mixed_poisson:2+8"], 20),  # optional batching ablation
+}
+
 
 def _wait_ready(proc, timeout_s=900):
     import urllib.request
@@ -78,6 +91,21 @@ def _server_cmd(config, model, kv_gb, max_len):
             "--port", str(PORT)]
 
 
+def _sanity(out, model):
+    """One real chat request, saved with the results, so garbage output (e.g. a bf16 problem) is visible."""
+    import json
+    import urllib.request
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": "What is the capital of France? Answer briefly."}],
+                       "max_tokens": 32}).encode()
+    req = urllib.request.Request(f"http://localhost:{PORT}/v1/chat/completions", body,
+                                 {"Content-Type": "application/json"})
+    try:
+        with open(f"{out}/sanity.json", "wb") as f:
+            f.write(urllib.request.urlopen(req, timeout=120).read())
+    except Exception as e:
+        open(f"{out}/sanity.json", "w").write(f"sanity request failed: {e}")
+
+
 def _run(config, model, kv_gb, workloads, scale_pct, max_minutes, max_len):
     os.chdir(APP_DIR)
     out = f"/tmp/results/{config}"
@@ -88,6 +116,7 @@ def _run(config, model, kv_gb, workloads, scale_pct, max_minutes, max_len):
     status = "ok"
     try:
         _wait_ready(server)
+        _sanity(out, model)
         env = dict(os.environ, OUT_DIR="/tmp/results", SCALE_PCT=str(scale_pct))
         cmd = ["timeout", str(max_minutes * 60), "bash", "bench/run_aiperf.sh", config,
                f"http://localhost:{PORT}", model, model] + workloads
@@ -192,6 +221,84 @@ def check_correctness(model: str):
     return report
 
 
+@app.function(image=ours_image, gpu="L4", volumes={HF_DIR: hf_cache}, timeout=1800)
+def profile_decode(model: str, gpu_label: str = "L4"):
+    """Where does a decode step spend its time? Wall time vs GPU-busy time vs CPU work, per batch size."""
+    import sys
+    import torch
+    sys.path.insert(0, APP_DIR)
+    os.chdir(APP_DIR)
+    from torch.profiler import ProfilerActivity, profile
+    from engine import EngineConfig, LLMEngine, SamplingParams
+    from kv_cache import PagedDecodeBatch
+    from qwen3_model import load_model
+
+    dev, dtype = "cuda", torch.bfloat16
+    m, cfg, _ = load_model(model, dev, dtype, max_positions=1024)
+
+    def sync():
+        torch.cuda.synchronize()
+
+    out = {"gpu": torch.cuda.get_device_name(0), "model": model, "batches": {}}
+    for B in [1, 8, 32]:
+        eng = LLMEngine(m, cfg, EngineConfig(cache_mode="paged", max_num_seqs=B, max_model_len=1024,
+                                             kv_cache_gb=2.0), [], dev, dtype)
+        for i in range(B):
+            eng.add_request([(7 * i + j) % 1000 + 10 for j in range(128)],
+                            SamplingParams(max_tokens=400, ignore_eos=True), lambda t, r: None)
+        for _ in range(3):  # prefill + warmup decode steps
+            eng.step()
+        sync()
+        n = 30
+        t0 = time.perf_counter()
+        for _ in range(n):
+            eng.step()
+        sync()
+        wall = (time.perf_counter() - t0) / n * 1e3
+
+        seqs = list(eng.running)
+        t0 = time.perf_counter()
+        for _ in range(n):
+            batch = PagedDecodeBatch(eng.cache, seqs, dev)
+        sync()
+        build = (time.perf_counter() - t0) / n * 1e3
+
+        ids = torch.tensor([s.output_ids[-1] for s in seqs], device=dev)
+        pos = torch.tensor([s.num_tokens - 1 for s in seqs], device=dev)
+        for _ in range(3):
+            m(ids, pos, batch)
+        sync()
+        t0 = time.perf_counter()
+        for _ in range(n):
+            logits = m(ids, pos, batch)
+        sync()
+        fwd = (time.perf_counter() - t0) / n * 1e3  # includes CPU launch overhead, GPU-synchronised
+
+        # CPU-side time to *issue* a forward without waiting for the GPU.
+        sync()
+        t0 = time.perf_counter()
+        for _ in range(n):
+            m(ids, pos, batch)
+        issue = (time.perf_counter() - t0) / n * 1e3
+        sync()
+
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            for _ in range(5):
+                m(ids, pos, batch)
+            sync()
+        gpu_us, kernels = 0.0, 0
+        for ka in prof.key_averages():
+            if str(ka.device_type).endswith("CUDA"):
+                gpu_us += getattr(ka, "self_device_time_total", None) or getattr(ka, "self_cuda_time_total", 0)
+                kernels += ka.count
+        out["batches"][B] = {
+            "engine_step_ms": round(wall, 2), "build_batch_ms": round(build, 2),
+            "forward_ms": round(fwd, 2), "forward_cpu_issue_ms": round(issue, 2),
+            "gpu_busy_ms_per_forward": round(gpu_us / 5 / 1e3, 2), "kernels_per_forward": kernels // 5,
+        }
+    return out
+
+
 @app.function(image=ours_image, volumes={HF_DIR: hf_cache}, timeout=3600)
 def download(models: list):
     from huggingface_hub import snapshot_download
@@ -204,7 +311,16 @@ def download(models: list):
 @app.local_entrypoint()
 def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str = "l4",
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
-         max_len: int = 4096, download_only: bool = False, check_only: bool = False, yes: bool = False):
+         max_len: int = 4096, download_only: bool = False, check_only: bool = False,
+         profile_only: bool = False, final: bool = False, with_static: bool = False,
+         yes: bool = False):
+    if profile_only:
+        print(f"Plan: decode-step profile of {model} on 1x L4 (a few minutes, ~cents).")
+        if not yes:
+            raise SystemExit("Add --yes to run.")
+        import json
+        print(json.dumps(profile_decode.remote(model), indent=2))
+        return
     if check_only:
         print(f"Plan: correctness check of {model} vs HuggingFace on 1x L4 (a few minutes, ~cents).")
         if not yes:
@@ -214,6 +330,11 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         print(json.dumps(rep, indent=2, ensure_ascii=False))
         print("ALL MATCH" if rep["all_match"] else "MISMATCH FOUND")
         return
+    if final:  # H100 / Qwen3-4B preset; --configs still selects which configs to run
+        if configs == "ours_paged":
+            configs = "vllm,ours_paged,ours_contiguous,ours_nocache" + (",ours_static" if with_static else "")
+        model, gpu = (model if "4B" in model else "Qwen/Qwen3-4B"), "h100"
+        kv_gb = kv_gb if kv_gb != 2.0 else 8.0
     cfgs = [c for c in configs.split(",") if c]
     bad = [c for c in cfgs if c not in VALID]
     if bad:
@@ -221,6 +342,7 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
     if gpu not in ("l4", "h100"):
         raise SystemExit("--gpu must be l4 (dev) or h100 (final)")
     wl = [w for w in workloads.split(",") if w]
+    plan = {c: (FINAL_PLAN[c][0], FINAL_PLAN[c][1]) if final else (wl, max_minutes) for c in cfgs}
 
     if download_only:
         print(f"Plan: download {model} into the Modal volume (CPU only, a few minutes).")
@@ -229,14 +351,16 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         download.remote([model, "Qwen/Qwen3-0.6B"] if "4B" in model else [model])
         return
 
-    worst = len(cfgs) * max_minutes / 60 * PRICE[gpu]
-    print(f"Plan: {len(cfgs)} config(s) {cfgs} on 1x {gpu.upper()} each, model={model}")
-    print(f"      workloads={wl}  scale={scale_pct}%  cap={max_minutes} min/config  kv_gb={kv_gb}")
-    print(f"      worst-case GPU cost ~ ${worst:.2f} (cap x ~${PRICE[gpu]:.2f}/h; excludes startup). SHARED class credit!")
+    startup_min = 8  # image start + model load (+ vLLM compile) per container, rough
+    worst = sum(plan[c][1] + startup_min for c in cfgs) / 60 * PRICE[gpu]
+    print(f"Plan: {len(cfgs)} config(s) on 1x {gpu.upper()} each, model={model}, scale={scale_pct}%, kv_gb={kv_gb}")
+    for c in cfgs:
+        print(f"  - {c}: cap {plan[c][1]} min; workloads {plan[c][0]}")
+    print(f"      worst-case GPU cost ~ ${worst:.2f} (caps + ~{startup_min} min startup each, ~${PRICE[gpu]:.2f}/h). SHARED class credit!")
     if not yes:
         raise SystemExit("Dry run only. Add --yes to start.")
 
-    args = [(c, model, kv_gb, wl, scale_pct, max_minutes, max_len) for c in cfgs]
+    args = [(c, model, kv_gb, plan[c][0], scale_pct, plan[c][1], max_len) for c in cfgs]
     ours = [a for a in args if a[0] != "vllm"]
     vl = [a for a in args if a[0] == "vllm"]
     ours_fn = ours_h100 if gpu == "h100" else ours_dev

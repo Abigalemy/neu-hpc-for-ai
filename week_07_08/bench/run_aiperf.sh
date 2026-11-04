@@ -42,15 +42,18 @@ open_loop() {
     --output-tokens-mean "$5" --output-tokens-stddev "$6" --artifact-dir "$OUT/$1_r$2"
 }
 
+# A workload may carry an explicit sweep, e.g. "balanced:4+16+64" (concurrency or request rates).
 for w in "${WORKLOADS[@]}"; do
-  echo "=== [$TAG] workload: $w ==="
-  case $w in
+  name=${w%%:*}; LIST=""
+  if [[ $w == *:* ]]; then LIST=${w#*:}; LIST=${LIST//+/ }; fi
+  echo "=== [$TAG] workload: $name ${LIST:+(sweep: $LIST)} ==="
+  case $name in
     baseline)      closed baseline 1 128 0 128 0 16 ;;
-    balanced)      for c in 1 4 16 64;   do closed balanced $c 256 0 256 0 $(( c*6 < 48 ? 48 : c*6 )); done ;;
-    prefill_heavy) for c in 1 8 32;      do closed prefill_heavy $c 2048 0 32 0 $(( c*6 < 48 ? 48 : c*6 )); done ;;
-    decode_heavy)  for c in 1 8 32 64;   do closed decode_heavy $c 64 0 1024 0 $(( c*4 < 32 ? 32 : c*4 )); done ;;
-    mixed_poisson) for r in 2 4 8 16;    do open_loop mixed_poisson $r 512 256 256 128 120; done ;;
+    balanced)      for c in ${LIST:-1 4 16 64};   do closed balanced $c 256 0 256 0 $(( c*6 < 48 ? 48 : c*6 )); done ;;
+    prefill_heavy) for c in ${LIST:-1 8 32};      do closed prefill_heavy $c 2048 0 32 0 $(( c*6 < 48 ? 48 : c*6 )); done ;;
+    decode_heavy)  for c in ${LIST:-1 8 32 64};   do closed decode_heavy $c 64 0 1024 0 $(( c*4 < 32 ? 32 : c*4 )); done ;;
+    mixed_poisson) for r in ${LIST:-2 4 8 16};    do open_loop mixed_poisson $r 512 256 256 128 120; done ;;
     pressure)      closed pressure 128 1024 0 512 0 256 ;;
-    *) echo "unknown workload $w" >&2; exit 1 ;;
+    *) echo "unknown workload $name" >&2; exit 1 ;;
   esac
 done
