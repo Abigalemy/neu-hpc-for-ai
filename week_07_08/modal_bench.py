@@ -12,6 +12,8 @@ Typical use (from week_07_08/):
   modal run modal_bench.py --configs ours_paged,ours_contiguous,ours_nocache,ours_static,vllm \\
         --model Qwen/Qwen3-4B --gpu h100 --kv-gb 8 --max-minutes 40 --yes                   # final run
 Results are written to ./results/<config>/ and ./results/summary.md.
+Use `modal run --detach ...` for long runs so the app keeps running if this terminal/session disconnects; results are
+also saved to the Modal volume `qwen3-results` (fetch with: modal volume get qwen3-results / ./results_modal).
 """
 import io
 import os
@@ -28,6 +30,10 @@ PORT = 8000
 
 app = modal.App(APP_NAME)
 hf_cache = modal.Volume.from_name("qwen3-hf-cache", create_if_missing=True)
+# Every finished config also saves its result tarball here, so a dropped local client can't lose paid-for runs:
+#   modal volume get qwen3-results / ./results_modal
+results_vol = modal.Volume.from_name("qwen3-results", create_if_missing=True)
+RES_DIR = "/results_store"
 
 _ignore = [".venv", "**/__pycache__", ".pytest_cache", "results", "logs", "artifacts", ".git"]
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -44,7 +50,8 @@ ours_image = (
 vllm_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("vllm", "aiperf", "huggingface_hub")
-    .env({"HF_HOME": HF_DIR})
+    # The slim image has no nvcc; vLLM's FlashInfer sampler would JIT-compile at warmup and crash.
+    .env({"HF_HOME": HF_DIR, "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_dir(_here, APP_DIR, ignore=_ignore)
 )
 
@@ -142,11 +149,24 @@ def _run(config, model, kv_gb, workloads, scale_pct, max_minutes, max_len):
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add("/tmp/results", arcname=".")
     print(f"[{config}] {status}")
-    return config, status, buf.getvalue()
+    if status != "ok" or config == "vllm":  # make failures diagnosable from the app logs alone
+        try:
+            tail = open(f"{out}/server.log").read().splitlines()[-60:]
+            print(f"--- last lines of {config} server.log ---\n" + "\n".join(tail))
+        except Exception:
+            pass
+    blob = buf.getvalue()
+    try:
+        with open(f"{RES_DIR}/{config}_{model.split('/')[-1]}_{int(time.time())}.tar.gz", "wb") as f:
+            f.write(blob)
+        results_vol.commit()
+    except Exception as e:
+        print(f"could not save to results volume: {e}")
+    return config, status, blob
 
 
 # One function per GPU tier (the GPU is fixed at decoration time).
-_common = dict(volumes={HF_DIR: hf_cache}, timeout=3 * 3600)
+_common = dict(volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=3 * 3600)
 
 
 @app.function(image=ours_image, gpu="L4", **_common)
@@ -368,9 +388,13 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
     handles = [ours_fn.spawn(*a) for a in ours] + [vllm_fn.spawn(*a) for a in vl]
     os.makedirs("results", exist_ok=True)
     for h in handles:  # configs run in parallel on separate GPUs: same cost, less wall-clock
-        config, status, blob = h.get()
+        try:
+            config, status, blob = h.get()
+        except Exception as e:  # one failing config must not lose the others
+            print(f"a config failed to return: {e}")
+            continue
         print(f"{config}: {status}")
         with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
-            tar.extractall("results")
+            tar.extractall("results", filter="data")
     subprocess.run(["python3", "bench/summarize.py", "results"], stdout=open("results/summary.md", "w"))
     print("wrote results/summary.md")

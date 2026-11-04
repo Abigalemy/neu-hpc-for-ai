@@ -1,6 +1,15 @@
 .venv/
 __pycache__/
 .pytest_cache/
-results/
+results/**/logs/
+results/**/*.csv
+results/**/server.log
 logs/
 artifacts/
+# keep per-run summaries only (profile_export_aiperf.json, console txt, engine_stats.json, sanity.json, summary.md)
+results/**/*.jsonl
+results/**/inputs.json
+results/**/phases/
+results/**/phase_manifest.json
+results/**/.aiperf_results_ready.json
+results/**/server_metrics_export*
