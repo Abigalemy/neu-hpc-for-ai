@@ -1,0 +1,9 @@
+torch>=2.5
+transformers>=4.51
+safetensors
+huggingface_hub
+fastapi
+uvicorn
+pydantic
+pytest
+aiperf
