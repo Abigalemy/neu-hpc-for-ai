@@ -140,6 +140,58 @@ def vllm_h100(*a):
     return _run(*a)
 
 
+@app.function(image=ours_image, gpu="L4", volumes={HF_DIR: hf_cache}, timeout=1800)
+def check_correctness(model: str):
+    """Real weights + real tokenizer: our engine (every cache mode, concurrent requests) vs HuggingFace.
+
+    float32 on both sides so that greedy decoding is deterministic enough to compare token by token.
+    """
+    import sys
+    import torch
+    sys.path.insert(0, APP_DIR)
+    os.chdir(APP_DIR)
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from engine import EngineConfig, LLMEngine, SamplingParams
+    from qwen3_model import load_model
+
+    dev, n_new = "cuda", 24
+    mine, cfg, d = load_model(model, dev, torch.float32, max_positions=1024)
+    tok = AutoTokenizer.from_pretrained(d)
+    hf = AutoModelForCausalLM.from_pretrained(d, dtype=torch.float32).to(dev).eval()
+    prompts = ["The capital of France is", "def fibonacci(n):\n    ", "中国的首都是",
+               "Once upon a time, in a small village by the sea, there lived an old fisherman who"]
+    ids = [tok.encode(p) for p in prompts]
+
+    ref = []
+    for p in ids:
+        seq = list(p)
+        for _ in range(n_new):
+            with torch.no_grad():
+                seq.append(int(hf(torch.tensor([seq], device=dev)).logits[0, -1].argmax()))
+        ref.append(seq[len(p):])
+
+    report, ok = {}, True
+    for mode in ["paged", "contiguous", "none"]:
+        ecfg = EngineConfig(cache_mode=mode, max_num_seqs=4, max_model_len=512, kv_cache_gb=1.0)
+        eng = LLMEngine(mine, cfg, ecfg, eos_token_ids=[], device=dev, dtype=torch.float32)
+        outs = [[] for _ in ids]
+        for i, p in enumerate(ids):
+            eng.add_request(p, SamplingParams(max_tokens=n_new, ignore_eos=True),
+                            lambda t, r, i=i: outs[i].append(t) if t is not None else None)
+        while eng.has_work():
+            eng.step()
+        res = []
+        for i in range(len(ids)):
+            same = outs[i] == ref[i]
+            first_bad = next((j for j, (a, b) in enumerate(zip(outs[i], ref[i])) if a != b), None)
+            res.append({"prompt": prompts[i], "match": same, "first_mismatch": first_bad,
+                        "ours": tok.decode(outs[i])[:120], "hf": tok.decode(ref[i])[:120]})
+            ok &= same
+        report[mode] = res
+    report["all_match"] = ok
+    return report
+
+
 @app.function(image=ours_image, volumes={HF_DIR: hf_cache}, timeout=3600)
 def download(models: list):
     from huggingface_hub import snapshot_download
@@ -152,7 +204,16 @@ def download(models: list):
 @app.local_entrypoint()
 def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str = "l4",
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
-         max_len: int = 4096, download_only: bool = False, yes: bool = False):
+         max_len: int = 4096, download_only: bool = False, check_only: bool = False, yes: bool = False):
+    if check_only:
+        print(f"Plan: correctness check of {model} vs HuggingFace on 1x L4 (a few minutes, ~cents).")
+        if not yes:
+            raise SystemExit("Add --yes to run.")
+        import json
+        rep = check_correctness.remote(model)
+        print(json.dumps(rep, indent=2, ensure_ascii=False))
+        print("ALL MATCH" if rep["all_match"] else "MISMATCH FOUND")
+        return
     cfgs = [c for c in configs.split(",") if c]
     bad = [c for c in cfgs if c not in VALID]
     if bad:
