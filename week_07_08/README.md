@@ -248,3 +248,52 @@ ablation results document targeted improvements and their limits.
 
 Correctness was checked with the CPU suite (9 tests), and a real Qwen3-4B H100 greedy-generation
 comparison against Hugging Face matched for four prompts in no-cache, contiguous, and paged modes.
+
+
+## Baseline anomaly and gather microbenchmark
+
+To revisit the single-run result where contiguous KV appeared slower than no-cache, the final code
+was measured on one H100 using the original baseline shape (concurrency 1, 128 input / 128 output
+tokens), with 8 warmups and 16 measured requests per condition. Three fresh server processes per
+cache mode were run sequentially; all nine profiles completed with zero request errors. Values are
+mean ± sample standard deviation across the three runs.
+
+| Cache mode | Output tok/s | TTFT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) |
+|---|---:|---:|---:|---:|
+| Contiguous | 45.80 ± 0.47 | 22.75 ± 0.19 | 21.79 ± 0.23 | 2,790.6 ± 29.7 |
+| No cache | 49.91 ± 1.76 | 22.01 ± 0.83 | 19.99 ± 0.69 | 2,560.2 ± 89.0 |
+| Paged + direct block-table kernel | 49.66 ± 1.11 | 23.08 ± 0.57 | 20.08 ± 0.42 | 2,573.5 ± 54.0 |
+
+The earlier single run showed 43.1 tok/s for contiguous and 51.3 tok/s for no-cache. The contiguous
+shortfall recurred at about 8.2% in this targeted run, while paged with the fused kernel was nearly
+tied with no-cache. This is a short-context, single-request observation; it does not show that KV
+caching generally reduces performance.
+
+A separate H100 attention microbenchmark used synthetic BF16 Qwen3-shaped Q/K/V tensors (32 query
+heads, 8 KV heads, head dimension 128, block size 16), shuffled physical block IDs, and contexts of
+128 and 1024 tokens. CUDA events measured 30 iterations after 5 warmups. “Gather + Tile” recreates
+the old block-table K/V materialization followed by one Tile attention call per sequence; “Direct”
+uses the fused block-table kernel. All six cases passed output comparison (`atol=0.02`, `rtol=0.02`).
+
+| Batch | Context | Gather only (µs) | Tile attention (µs) | Gather + Tile (µs) | Direct block table (µs) | Old / direct |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 21.1 | 49.9 | 75.3 | 20.2 | 3.73× |
+| 1 | 1024 | 20.0 | 49.8 | 73.8 | 75.8 | 0.97× |
+| 8 | 128 | 19.6 | 293.8 | 326.6 | 24.6 | 13.28× |
+| 8 | 1024 | 29.8 | 296.2 | 326.2 | 151.7 | 2.15× |
+| 32 | 128 | 20.0 | 1,137.3 | 1,165.8 | 89.5 | 13.03× |
+| 32 | 1024 | 98.2 | 1,136.7 | 1,168.6 | 594.0 | 1.97× |
+
+At batch 8–32, gather accounts for roughly 2–9% of the old combined time; repeated per-sequence Tile
+attention calls cost more. The direct kernel is 2.0–13.3× faster in those tested cases, but is slightly
+slower at batch 1 / context 1024. The data points to attention execution and launch structure as a
+larger high-batch cost than copying K/V alone. A plausible explanation for the short baseline anomaly
+is that no-cache recomputes a full query sequence and exposes more query tiles, while cached decode
+handles one query token at a time; better GPU parallelism can offset some redundant work at short
+contexts. This remains a hypothesis: this run did not profile a no-cache full-model step against a
+contiguous full-model step, and optional GPU telemetry was unavailable.
+
+Raw AIPerf exports, the full microbenchmark data, and the per-run audit are in
+[`results/gap_study/`](results/gap_study/); the detailed report is
+[`results/gap_study/summary.md`](results/gap_study/summary.md). Modal run:
+[ap-hYtLK44pCoN3y5eA8QQEPD](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-hYtLK44pCoN3y5eA8QQEPD).

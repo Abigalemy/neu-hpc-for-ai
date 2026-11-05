@@ -432,6 +432,103 @@ def profile_decode(model: str, gpu_label: str = "H100"):
     return out
 
 
+@app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=45 * 60)
+def gap_study(model: str):
+    """Repeat the original latency-floor comparison and isolate paged KV gather cost on H100."""
+    import json
+    import sys
+    import torch
+    sys.path.insert(0, APP_DIR)
+    os.chdir(APP_DIR)
+    from hpc_core.kernels.cutile_attention import paged_decode_attention
+    from hpc_core.kv_cache import _tile_attention
+
+    device, dtype = "cuda", torch.bfloat16
+    torch.manual_seed(20261105)
+    micro = {"gpu": torch.cuda.get_device_name(0), "dtype": str(dtype), "block_size": 16, "cases": []}
+
+    def timed_ms(fn, repeats=30):
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(repeats):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / repeats
+
+    # Isolate the former K/V materialization and attention costs from the model
+    # forward. Random physical block order exercises block-table indirection.
+    for batch_size in (1, 8, 32):
+        for seq_len in (128, 1024):
+            block_size, kv_heads, q_heads, head_dim = 16, 8, 32, 128
+            blocks_per_seq = (seq_len + block_size - 1) // block_size
+            nblocks = batch_size * blocks_per_seq
+            pool = torch.randn((nblocks, block_size, kv_heads, head_dim), device=device, dtype=dtype)
+            k_pool, v_pool = pool, torch.randn_like(pool)
+            q = torch.randn((batch_size, q_heads, head_dim), device=device, dtype=dtype)
+            tables = torch.empty((batch_size, blocks_per_seq), device=device, dtype=torch.int64)
+            for i in range(batch_size):
+                ids = torch.arange(i * blocks_per_seq, (i + 1) * blocks_per_seq, device=device)
+                tables[i] = ids[torch.randperm(blocks_per_seq, device=device)]
+            seq_lens = torch.full((batch_size,), seq_len, device=device, dtype=torch.int32)
+            offsets = torch.arange(block_size, device=device)
+            gather_idx = (tables[:, :, None] * block_size + offsets).reshape(batch_size, -1)
+            k_flat = k_pool.reshape(-1, kv_heads, head_dim)
+            v_flat = v_pool.reshape(-1, kv_heads, head_dim)
+
+            def gather():
+                return k_flat[gather_idx].transpose(1, 2), v_flat[gather_idx].transpose(1, 2)
+
+            def attend(gathered):
+                keys, values = gathered
+                return torch.cat([
+                    _tile_attention(q[i:i + 1, :, None, :], keys[i:i + 1, :, :seq_len, :],
+                                    values[i:i + 1, :, :seq_len, :], causal=False)
+                    for i in range(batch_size)
+                ], dim=0)[:, :, 0, :]
+
+            gathered = gather()
+            reference = attend(gathered)
+            actual = paged_decode_attention(q, k_pool, v_pool, tables, seq_lens)
+            torch.cuda.synchronize()
+            max_diff = (reference.float() - actual.float()).abs().max().item()
+            allclose = torch.allclose(reference.float(), actual.float(), atol=2e-2, rtol=2e-2)
+            gather_ms = timed_ms(gather)
+            attention_ms = timed_ms(lambda: attend(gathered))
+            combined_ms = timed_ms(lambda: attend(gather()))
+            direct_ms = timed_ms(lambda: paged_decode_attention(q, k_pool, v_pool, tables, seq_lens))
+            micro["cases"].append({
+                "batch": batch_size, "seq_len": seq_len,
+                "gather_only_ms": round(gather_ms, 4),
+                "tile_attention_on_materialized_kv_ms": round(attention_ms, 4),
+                "gather_plus_tile_attention_ms": round(combined_ms, 4),
+                "direct_block_table_attention_ms": round(direct_ms, 4),
+                "max_abs_output_diff": max_diff, "allclose_atol_rtol_0_02": allclose,
+            })
+
+    study_status = []
+    for repetition in range(1, 4):
+        for config in ("ours_contiguous", "ours_nocache", "ours_paged"):
+            _, status, _ = _run(config, model, 8.0, ["baseline"], 100, 3, 4096,
+                                output_group=f"gap_study/repeat{repetition}")
+            study_status.append({"repeat": repetition, "config": config, "status": status})
+
+    root = "/tmp/results/gap_study"
+    os.makedirs(root, exist_ok=True)
+    with open(f"{root}/h100_gather_microbench.json", "w") as f:
+        json.dump(micro, f, indent=2)
+    with open(f"{root}/run_status.json", "w") as f:
+        json.dump(study_status, f, indent=2)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(root, arcname=".")
+    return {"microbench": micro, "status": study_status, "results_tar": buf.getvalue()}
+
+
 @app.function(image=ours_image, gpu="L4", volumes={HF_DIR: hf_cache}, timeout=300)
 def model_performance_matrix(model: str):
     """Compare real Qwen3 HF and CUDA Tile prefill over batch/sequence shapes on L4."""
@@ -511,7 +608,7 @@ def download(models: list):
 def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str = "l4",
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
          max_len: int = 4096, download_only: bool = False, check_only: bool = False,
-         profile_only: bool = False, model_matrix: bool = False,
+         profile_only: bool = False, gap_study_only: bool = False, model_matrix: bool = False,
          final: bool = False, with_static: bool = False, ablation_budget_cap: bool = False,
          yes: bool = False):
     output_group = None
@@ -549,6 +646,22 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         profile_path.write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2))
         print(f"Saved {profile_path}")
+        return
+    if gap_study_only:
+        cap = 45 / 60 * PRICE["h100"]
+        print(f"Plan: exact baseline repeated 3x for contiguous/no-cache/paged plus an isolated H100 gather microbenchmark; "
+              f"one H100 container, 45-minute hard cap (~${cap:.2f} GPU-only; CPU/memory extra).")
+        if not yes:
+            raise SystemExit("Add --yes to run.")
+        import json
+        report = gap_study.remote(model if "4B" in model else "Qwen/Qwen3-4B")
+        result_dir = Path(__file__).resolve().parent / "results" / "gap_study"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(report.pop("results_tar")), mode="r:gz") as tar:
+            tar.extractall(result_dir, filter="data")
+        (result_dir / "run_manifest.json").write_text(json.dumps(report["status"], indent=2))
+        print(json.dumps({"microbench": report["microbench"], "status": report["status"]}, indent=2))
+        print(f"Saved raw profiles and microbenchmark to {result_dir}")
         return
     if check_only:
         print(f"Plan: correctness check of {model} vs HuggingFace on 1x H100, max 15 minutes. "

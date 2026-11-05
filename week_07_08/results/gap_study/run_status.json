@@ -1,0 +1,47 @@
+[
+  {
+    "repeat": 1,
+    "config": "ours_contiguous",
+    "status": "ok"
+  },
+  {
+    "repeat": 1,
+    "config": "ours_nocache",
+    "status": "ok"
+  },
+  {
+    "repeat": 1,
+    "config": "ours_paged",
+    "status": "ok"
+  },
+  {
+    "repeat": 2,
+    "config": "ours_contiguous",
+    "status": "ok"
+  },
+  {
+    "repeat": 2,
+    "config": "ours_nocache",
+    "status": "ok"
+  },
+  {
+    "repeat": 2,
+    "config": "ours_paged",
+    "status": "ok"
+  },
+  {
+    "repeat": 3,
+    "config": "ours_contiguous",
+    "status": "ok"
+  },
+  {
+    "repeat": 3,
+    "config": "ours_nocache",
+    "status": "ok"
+  },
+  {
+    "repeat": 3,
+    "config": "ours_paged",
+    "status": "ok"
+  }
+]

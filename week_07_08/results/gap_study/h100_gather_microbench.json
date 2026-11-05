@@ -1,0 +1,67 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "dtype": "torch.bfloat16",
+  "block_size": 16,
+  "cases": [
+    {
+      "batch": 1,
+      "seq_len": 128,
+      "gather_only_ms": 0.0211,
+      "tile_attention_on_materialized_kv_ms": 0.0499,
+      "gather_plus_tile_attention_ms": 0.0753,
+      "direct_block_table_attention_ms": 0.0202,
+      "max_abs_output_diff": 0.001953125,
+      "allclose_atol_rtol_0_02": true
+    },
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "gather_only_ms": 0.02,
+      "tile_attention_on_materialized_kv_ms": 0.0498,
+      "gather_plus_tile_attention_ms": 0.0738,
+      "direct_block_table_attention_ms": 0.0758,
+      "max_abs_output_diff": 0.00048828125,
+      "allclose_atol_rtol_0_02": true
+    },
+    {
+      "batch": 8,
+      "seq_len": 128,
+      "gather_only_ms": 0.0196,
+      "tile_attention_on_materialized_kv_ms": 0.2938,
+      "gather_plus_tile_attention_ms": 0.3266,
+      "direct_block_table_attention_ms": 0.0246,
+      "max_abs_output_diff": 0.00390625,
+      "allclose_atol_rtol_0_02": true
+    },
+    {
+      "batch": 8,
+      "seq_len": 1024,
+      "gather_only_ms": 0.0298,
+      "tile_attention_on_materialized_kv_ms": 0.2962,
+      "gather_plus_tile_attention_ms": 0.3262,
+      "direct_block_table_attention_ms": 0.1517,
+      "max_abs_output_diff": 0.0009765625,
+      "allclose_atol_rtol_0_02": true
+    },
+    {
+      "batch": 32,
+      "seq_len": 128,
+      "gather_only_ms": 0.02,
+      "tile_attention_on_materialized_kv_ms": 1.1373,
+      "gather_plus_tile_attention_ms": 1.1658,
+      "direct_block_table_attention_ms": 0.0895,
+      "max_abs_output_diff": 0.00390625,
+      "allclose_atol_rtol_0_02": true
+    },
+    {
+      "batch": 32,
+      "seq_len": 1024,
+      "gather_only_ms": 0.0982,
+      "tile_attention_on_materialized_kv_ms": 1.1367,
+      "gather_plus_tile_attention_ms": 1.1686,
+      "direct_block_table_attention_ms": 0.594,
+      "max_abs_output_diff": 0.0009765625,
+      "allclose_atol_rtol_0_02": true
+    }
+  ]
+}
