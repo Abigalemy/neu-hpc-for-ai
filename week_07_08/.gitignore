@@ -16,3 +16,5 @@ results/**/phases/
 results/**/phase_manifest.json
 results/**/.aiperf_results_ready.json
 results/**/server_metrics_export*
+
+results/**/profile_export_console.txt
