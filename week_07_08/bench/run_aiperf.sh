@@ -25,7 +25,11 @@ mkdir -p "$OUT"
 
 COMMON=(--model "$MODEL" --url "$URL" --endpoint-type chat --streaming --tokenizer "$TOK"
         --extra-inputs '{"ignore_eos": true, "temperature": 0}' --use-server-token-count
-        --warmup-request-count 8 --random-seed 0)
+        --random-seed 0)
+# AIPerf requires a positive warmup count; omit the option to measure with no warmup phase.
+if [[ ${AIPERF_WARMUP_REQUEST_COUNT:-8} != 0 ]]; then
+  COMMON+=(--warmup-request-count "${AIPERF_WARMUP_REQUEST_COUNT:-8}")
+fi
 
 # SCALE_PCT shrinks every request count (e.g. SCALE_PCT=25 for a cheap smoke run); minimum 8 requests.
 scale() { local n=$(( $1 * ${SCALE_PCT:-100} / 100 )); echo $(( n < 8 ? 8 : n )); }

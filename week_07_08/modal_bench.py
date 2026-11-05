@@ -16,6 +16,7 @@ Use `modal run --detach ...` for long runs so the app keeps running if this term
 also saved to the Modal volume `qwen3-results` (fetch with: modal volume get qwen3-results / ./results_modal).
 """
 import io
+import json
 import os
 import subprocess
 import tarfile
@@ -218,6 +219,68 @@ def vllm_h100(*a):
 @app.function(image=vllm_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=15 * 60)
 def vllm_h100_capped(*a):
     return _run(*a)
+
+
+@app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=30 * 60)
+def warmup_sensitivity_h100(model: str):
+    """Run baseline and balanced c16 three times per warmup mode in one server process/container."""
+    os.chdir(APP_DIR)
+    root = "/tmp/results/warmup_sensitivity"
+    os.makedirs(root, exist_ok=True)
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
+    server_log = open(f"{root}/server.log", "w")
+    server = subprocess.Popen(_server_cmd("ours_paged", model, 8.0, 4096),
+                              stdout=server_log, stderr=subprocess.STDOUT)
+    status = {"gpu": "H100", "model": model, "status": "ok", "runs": []}
+    try:
+        _wait_ready(server)
+        # Keep one serving process alive across all profiles to isolate request warmup from restarts.
+        deadline = time.monotonic() + 25 * 60
+        for repetition in range(1, 4):
+            for warmup in (0, 8):
+                tag = f"warmup_sensitivity/repeat{repetition}_warmup{warmup}"
+                remaining = max(1, int(deadline - time.monotonic()))
+                env = dict(os.environ, OUT_DIR="/tmp/results", SCALE_PCT="100",
+                           AIPERF_WARMUP_REQUEST_COUNT=str(warmup))
+                cmd = ["timeout", f"{remaining}s", "bash", "bench/run_aiperf.sh", tag,
+                       f"http://localhost:{PORT}", model, model, "baseline", "balanced:16"]
+                with open(f"{root}/repeat{repetition}_warmup{warmup}.log", "w") as log:
+                    completed = subprocess.run(cmd, env=env, stdout=log,
+                                               stderr=subprocess.STDOUT).returncode
+                status["runs"].append({"repetition": repetition, "warmup_requests": warmup,
+                                       "return_code": completed})
+                if completed == 124 or time.monotonic() >= deadline:
+                    status["status"] = "partial: 25-minute benchmark budget reached"
+                    break
+            if status["status"] != "ok":
+                break
+        try:
+            import urllib.request
+            with open(f"{root}/engine_stats.json", "wb") as f:
+                f.write(urllib.request.urlopen(f"http://localhost:{PORT}/metrics_json", timeout=10).read())
+        except Exception as e:
+            status["engine_stats_error"] = str(e)
+    except Exception as e:
+        status["status"] = f"FAILED: {e}"
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            server.kill()
+        server_log.close()
+    (Path(root) / "run_manifest.json").write_text(json.dumps(status, indent=2))
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(root, arcname="warmup_sensitivity")
+    blob = buf.getvalue()
+    try:
+        with open(f"{RES_DIR}/warmup_sensitivity_{int(time.time())}.tar.gz", "wb") as f:
+            f.write(blob)
+        results_vol.commit()
+    except Exception as e:
+        print(f"could not save warmup-sensitivity results to volume: {e}")
+    return status, blob
 
 
 @app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache}, timeout=900)
@@ -614,7 +677,7 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
          max_len: int = 4096, download_only: bool = False, check_only: bool = False,
          profile_only: bool = False, gap_study_only: bool = False, final_kernel_compare: bool = False,
-         results_group: str = "", model_matrix: bool = False,
+         warmup_sensitivity: bool = False, results_group: str = "", model_matrix: bool = False,
          final: bool = False, with_static: bool = False, ablation_budget_cap: bool = False,
          yes: bool = False):
     output_group = results_group or None
@@ -636,7 +699,6 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         if not yes:
             raise SystemExit("Add --yes to run.")
         import csv
-        import json
         rep = model_performance_matrix.remote(model)
         output = Path(__file__).resolve().parent.parent / "week_04_05" / "real_qwen3_l4_matrix.csv"
         with output.open("w", newline="") as f:
@@ -651,7 +713,6 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         print(f"Plan: same-H100 gather-reference vs block-table decode profile of {model}; 15-minute hard cap (~$0.99 GPU-only).")
         if not yes:
             raise SystemExit("Add --yes to run.")
-        import json
         report = profile_decode.remote(model)
         profile_path = Path(__file__).resolve().parent / "results" / "grade_ablation" / "h100_profile.json"
         profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -665,7 +726,6 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
               f"one H100 container, 45-minute hard cap (~${cap:.2f} GPU-only; CPU/memory extra).")
         if not yes:
             raise SystemExit("Add --yes to run.")
-        import json
         report = gap_study.remote(model if "4B" in model else "Qwen/Qwen3-4B")
         result_dir = Path(__file__).resolve().parent / "results" / "gap_study"
         result_dir.mkdir(parents=True, exist_ok=True)
@@ -674,6 +734,22 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         (result_dir / "run_manifest.json").write_text(json.dumps(report["status"], indent=2))
         print(json.dumps({"microbench": report["microbench"], "status": report["status"]}, indent=2))
         print(f"Saved raw profiles and microbenchmark to {result_dir}")
+        return
+    if warmup_sensitivity:
+        cap = 30 / 60 * PRICE["h100"]
+        print(f"Plan: one H100 container, one persistent paged server, 3 repeats each of baseline/c16 with "
+              f"AIPerf warmup omitted and 8 requests; 30-minute hard cap (~${cap:.2f} GPU-only; CPU/memory extra).")
+        if not yes:
+            raise SystemExit("Add --yes to run.")
+        status, blob = warmup_sensitivity_h100.remote(
+            model if "4B" in model else "Qwen/Qwen3-4B")
+        result_dir = Path(__file__).resolve().parent / "results" / "warmup_sensitivity"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+            tar.extractall(result_dir.parent, filter="data")
+        (result_dir / "remote_status.json").write_text(json.dumps(status, indent=2))
+        print(json.dumps(status, indent=2))
+        print(f"Saved raw AIPerf profiles to {result_dir}")
         return
     if final_kernel_compare:
         hard_cap_min = 15
@@ -686,7 +762,6 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
               f"GPU charge is capped at about ${15 / 60 * PRICE['h100']:.2f}; CPU/memory may add a small amount.")
         if not yes:
             raise SystemExit("Add --yes to run.")
-        import json
         import sqlite3
         rep = check_correctness.remote(model)
         case = rep.pop("e2e_case")

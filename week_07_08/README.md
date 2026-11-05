@@ -333,5 +333,38 @@ smaller on the mixed open-loop workload than on the other tested shapes. This co
 the performance analysis without claiming parity with a production inference engine. The single
 baseline result (26.4 tok/s) is substantially below the separate three-run final-code baseline mean
 (49.66 ± 1.11 tok/s); these are not paired runs, and that variability is a limitation rather than
-something explained by this experiment. Optional GPU telemetry was unavailable. Modal run:
+something explained by this experiment. Likewise, the c16 throughput here (402.4 tok/s) is below the
+separate three-run result (716.8 ± 137.0 tok/s); the runs are not directly paired, and the cause of
+both discrepancies remains to be verified. Optional GPU telemetry was unavailable. Modal run:
 [ap-mmDbuD2n0K0n1kH9iOcdog](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-mmDbuD2n0K0n1kH9iOcdog).
+
+## Same-container warmup and first-use sensitivity
+
+To investigate the low baseline and c16 points, one H100 container ran one persistent `ours_paged`
+server through three repetitions of baseline and balanced c16, with AIPerf warmup omitted and with
+8 warmup requests. The order in each repetition was 0-warmup profiles followed by 8-warmup profiles.
+The first 0-warmup profile is the only true first-use sample; later profiles inherit JIT/kernel caches
+from earlier workloads in the same process. All 12 profiles completed with zero request errors and
+zero output-length mismatch warnings. AIPerf requires omitting `--warmup-request-count` to disable
+warmup; setting it to 0 is invalid ([AIPerf documentation](https://docs.nvidia.com/aiperf/tutorials/load-patterns-scheduling/benchmark-control-hooks)).
+
+| Workload | AIPerf warmup requests | Output tok/s | TTFT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) |
+|---|---:|---:|---:|---:|---:|
+| Baseline c1 | 0 | 63.7 ± 5.2 | 17.9 ± 0.8 | 15.2 ± 0.5 | 1,946.8 ± 62.3 |
+| Baseline c1 | 8 | 66.4 ± 0.5 | 17.9 ± 0.1 | 14.9 ± 0.1 | 1,918.2 ± 11.5 |
+| Balanced c16 | 0 | 945.5 ± 64.5 | 128.4 ± 2.3 | 16.1 ± 0.5 | 4,233.1 ± 119.7 |
+| Balanced c16 | 8 | 977.6 ± 4.2 | 119.8 ± 20.0 | 16.0 ± 0.0 | 4,192.5 ± 25.8 |
+
+Each cell is mean ± sample standard deviation across three sequential runs. In the first no-warmup
+round, baseline reached 57.7 tok/s and c16 reached 871.1 tok/s; later no-warmup runs were faster.
+That pattern is consistent with a first-use or transient startup cost, but does not prove that kernel
+compilation caused it. Warmup-8 results were stable in this container. This effect is too small to
+explain the earlier 26.4 tok/s baseline, 26.7 tok/s smoke result, or 402.4 tok/s c16 point; those
+remain unexplained outliers, and the cause is pending verification. The separate c16 repeat result
+(716.8 ± 137.0 tok/s) also differs from this run's 977.6 ± 4.2 tok/s; these are unpaired runs, so
+container/run-to-run variation remains a limitation.
+
+Raw profiles, per-run logs, and the status manifest are in
+[`results/warmup_sensitivity/`](results/warmup_sensitivity/); the aggregate report is
+[`results/warmup_sensitivity/summary.md`](results/warmup_sensitivity/summary.md). Modal run:
+[ap-Z0vxuuHVX0HC0apwTMMeYb](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-Z0vxuuHVX0HC0apwTMMeYb).
