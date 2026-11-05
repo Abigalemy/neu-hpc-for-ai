@@ -38,13 +38,12 @@ run history. Earlier pre-Tile AIPerf results are not included in the current per
 token). With a cache, prefill writes K/V once and each decode step only processes the newest token.
 
 **PagedAttention.** K/V live in a pool of fixed-size blocks (default 16 tokens). A sequence owns a
-*block table* (logical block -> physical block) that grows one block at a time, so waste is at most
-one partially filled block per sequence instead of `max_model_len` reserved up front. Decode gathers
-K/V through the block tables. If the pool runs out, the most recently admitted sequence is
-preempted (blocks freed, re-queued, recomputed later).
-*Limitation:* the gather is done with PyTorch indexing, which copies K/V for each decode step, unlike
-vLLM's fused kernel that reads blocks in place. Paged vs contiguous therefore differ mainly in
-**memory capacity / concurrency**, not raw kernel speed.
+*block table* (logical block -> physical block) that grows one block at a time. Decode now uses a
+CUDA Tile kernel that reads K/V directly from the physical blocks listed in that table and applies
+online softmax without materializing a gathered K/V tensor. If the pool runs out, the most recently
+admitted sequence is preempted (blocks freed, re-queued, recomputed later). This is an educational
+single-token decode kernel: one CTA handles one sequence/query head and streams blocks serially; it
+does not use split-KV or prefix sharing.
 
 **Continuous batching.** Every engine step (1) admits waiting requests if a slot / enough blocks exist,
 (2) prefills them, (3) decodes one token for *all* running sequences. Finished sequences free their
@@ -196,40 +195,56 @@ lower latency are better. A dash means that workload was not run for that config
 * `ours_static` was not included in this matrix. The full AIPerf matrix does not replace the separate
   correctness tests or prove that every possible workload is correct.
 
-## Supplemental ablation: batching and long decode
+## Final block-table kernel: profile and repeated ablations
 
-After the C++ tokenizer was connected to the request path, a capped H100 run compared
-`ours_paged` (continuous admission) with `ours_static` on the same Qwen3-4B BF16 service,
-8 GB cache budget, AIPerf settings, and workloads. The static policy admits requests only after
-the running batch empties. A fourth profile compared `ours_nocache` with `ours_paged` on
-decode-heavy concurrency 8 (64 input / 1024 output tokens). Each profile used 8 warmup requests;
-profiling counts were 48 for balanced concurrency 16, 60 for mixed Poisson, and 16 for
-decode-heavy. This is a single-run ablation, not a repeated statistical study. Raw AIPerf exports and the generated table
-are in [`results/grade_ablation/`](results/grade_ablation/), and the Modal run is
-[ap-TyyWhI4PWRCQsHV5Vur5zb](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-TyyWhI4PWRCQsHV5Vur5zb).
+The results above are the original CUDA Tile baseline, captured before replacing the paged decode
+K/V gather with the direct block-table kernel. The following measurements use the final code in this
+submission. H100 same-process profiling compares the prior gather + Tile-attention path and the new
+block-table path on identical model weights and inputs; AIPerf ablations compare continuous admission,
+static admission, and no-cache decode. Each AIPerf condition was run three times in separate H100
+containers, with 8 warmups and identical request shapes. Raw exports and per-run summaries are in
+[`results/grade_ablation_repeat1/`](results/grade_ablation_repeat1/),
+[`results/grade_ablation_repeat2/`](results/grade_ablation_repeat2/), and
+[`results/grade_ablation_repeat3/`](results/grade_ablation_repeat3/). The H100 profile is
+[`results/grade_ablation_repeat1/h100_profile.json`](results/grade_ablation_repeat1/h100_profile.json).
 
-| Workload | Policy | Output tok/s | TTFT p50 / p99 (ms) | ITL p50 / p99 (ms) | E2E p50 / p99 (ms) |
-|---|---|---:|---:|---:|---:|
-| Balanced, conc 16 | Paged + continuous | 360.3 | 161.8 / 181.8 | 43.9 / 44.2 | 11,364 / 11,381 |
-| Balanced, conc 16 | Paged + static | 240.9 | 6,113 / 10,906 | 42.4 / 43.6 | 16,913 / 17,286 |
-| Mixed Poisson, 8 req/s | Paged + continuous | 427.1 | 85.0 / 1,147.5 | 90.0 / 124.5 | 21,137.9 / 31,112.0 |
-| Mixed Poisson, 8 req/s | Paged + static | 208.2 | 30,418.5 / 56,665.9 | 38.2 / 41.5 | 34,229.8 / 62,774.2 |
-| Decode-heavy, conc 8, 64 / 1024 | Paged + continuous | 236.7 | 84.6 / 85.4 | 33.8 / 33.8 | 34,604.8 / 34,615.5 |
-| Decode-heavy, conc 8, 64 / 1024 | No KV cache | 74.0 | 71.4 / 177.4 | 108.1 / 108.7 | 110,641.2 / 111,327.3 |
+The block-table kernel removes the intermediate gathered K/V tensors. On the same H100, its
+whole-model forward CUDA-event time versus the gather reference was:
 
-The mixed-arrival result is consistent with head-of-line delay under static admission: p50 TTFT
-was about 30.4 s versus 85 ms for continuous admission, while static had somewhat lower ITL
-among requests once decoding. On balanced concurrency 16, static also had much higher TTFT
-and lower throughput. This supports continuous admission for these arrival patterns; one run
-does not establish general statistical significance. For long decode at concurrency 8, the
-no-cache run delivered about 3.2x lower output throughput and 3.2x higher p50 ITL than paged KV,
-consistent with repeatedly recomputing the growing context.
+| Batch | Gather reference (ms) | Direct block table (ms) | Change | Greedy logits match |
+|---:|---:|---:|---:|:---:|
+| 1 | 20.902 | 18.574 | -11% | yes |
+| 8 | 35.882 | 21.856 | -39% | yes |
+| 32 | 75.333 | 26.110 | -65% | yes |
 
-All seven profiles completed with zero AIPerf request errors. Optional GPU/server telemetry was
-unavailable, so these measurements cannot isolate GPU kernel time or prove a kernel-level cause.
-The run used one repetition and a reduced request count for the matched concurrency profiles;
-the results should be read as a focused ablation. No vLLM run or large-cache-budget comparison
-was included in this capped supplement. It also does not implement direct block-table reads in a
-fused paged-attention kernel: the current paged backend gathers K/V through PyTorch indexing.
-The fused kernel, H100 profiling, repeated trials, and matched-budget vLLM comparison remain
-specific follow-up work rather than results claimed here.
+These are synchronized whole-forward A/B measurements, not isolated attention-kernel latency. The
+H100 profiler recorded about 1,959 kernels per forward. CPU issue time and kernel count show that
+Python/PyTorch launch overhead remains material; missing optional Modal GPU telemetry means this run
+cannot provide a trustworthy GPU-utilization breakdown. The experiment demonstrates that the fused
+path improves this matched decode case, but does not prove that K/V gathering was the sole cause of
+end-to-end latency.
+
+The repeated AIPerf results below are computed from three independent runs (mean and sample standard
+deviation). They cover balanced concurrency 16 (256 input / 256 output), mixed Poisson 8 req/s, and
+decode-heavy concurrency 8 (64 input / 1024 output). Each run had zero request errors. The complete
+per-run metrics are in the linked raw directories above and in the
+[aggregate summary](results/grade_ablation_repeated_summary.md).
+
+| Workload | Policy | Output tok/s (mean ± SD) | TTFT p50 ms (mean ± SD) | ITL p50 ms (mean ± SD) |
+|---|---|---:|---:|---:|
+| Balanced c16 | Paged + continuous | 716.8 ± 137.0 | 149.2 ± 10.5 | 20.0 ± 4.9 |
+| Balanced c16 | Paged + static | 424.8 ± 81.8 | 4,793.6 ± 745.0 | 19.3 ± 4.1 |
+| Mixed Poisson 8 req/s | Paged + continuous | 781.3 ± 35.6 | 54.7 ± 10.5 | 38.9 ± 1.8 |
+| Mixed Poisson 8 req/s | Paged + static | 343.6 ± 62.3 | 17,481.8 ± 4,149.1 | 19.9 ± 3.7 |
+| Decode-heavy c8 | Paged + continuous | 434.5 ± 85.8 | 66.7 ± 15.6 | 18.9 ± 4.1 |
+| Decode-heavy c8 | No KV cache | 74.4 ± 0.5 | 55.0 ± 12.7 | 107.5 ± 0.8 |
+
+The repeated runs show the same qualitative pattern: continuous admission reduces queueing delay
+for these open-loop and concurrent workloads, while KV caching substantially reduces per-token
+decode cost on long outputs. Run-to-run H100 variation is visible, so the table reports mean and
+sample standard deviation; individual results remain available. The implementation is not claimed to
+match vLLM: the original broad matrix remains useful as a baseline, while the new kernel and these
+ablation results document targeted improvements and their limits.
+
+Correctness was checked with the CPU suite (9 tests), and a real Qwen3-4B H100 greedy-generation
+comparison against Hugging Face matched for four prompts in no-cache, contiguous, and paged modes.

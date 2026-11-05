@@ -305,9 +305,9 @@ def check_correctness(model: str):
     return report
 
 
-@app.function(image=ours_image, gpu="L4", volumes={HF_DIR: hf_cache}, timeout=1800)
-def profile_decode(model: str, gpu_label: str = "L4"):
-    """Where does a decode step spend its time? Wall time vs GPU-busy time vs CPU work, per batch size."""
+@app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache}, timeout=15 * 60)
+def profile_decode(model: str, gpu_label: str = "H100"):
+    """Compare the original gather+attention and direct paged-kernel paths on H100."""
     import sys
     import torch
     sys.path.insert(0, APP_DIR)
@@ -315,6 +315,7 @@ def profile_decode(model: str, gpu_label: str = "L4"):
     from torch.profiler import ProfilerActivity, profile
     from engine import EngineConfig, LLMEngine, SamplingParams
     from kv_cache import PagedDecodeBatch
+    from hpc_core.kv_cache import _tile_attention
     from qwen3_model import load_model
 
     dev, dtype = "cuda", torch.bfloat16
@@ -347,16 +348,60 @@ def profile_decode(model: str, gpu_label: str = "L4"):
         sync()
         build = (time.perf_counter() - t0) / n * 1e3
 
+        # Recreate the previous implementation for a same-device, same-input
+        # A/B: gather every sequence's KV and call the ordinary Tile attention.
+        class GatherReferenceBatch:
+            logit_indices = batch.logit_indices
+
+            def attend(self, layer_idx, q, k, v):
+                c = eng.cache
+                c.k[layer_idx].index_copy_(0, batch.slot_mapping, k)
+                c.v[layer_idx].index_copy_(0, batch.slot_mapping, v)
+                gathered_k = c.k[layer_idx][batch.gather_idx].transpose(1, 2)
+                gathered_v = c.v[layer_idx][batch.gather_idx].transpose(1, 2)
+                return torch.cat([
+                    _tile_attention(q[i:i + 1, :, None, :],
+                                    gathered_k[i:i + 1, :, :ctx, :],
+                                    gathered_v[i:i + 1, :, :ctx, :], causal=False)
+                    for i, ctx in enumerate(batch.ctx)
+                ], dim=0)[:, :, 0, :]
+
+        ref_tables = torch.tensor([s.block_table for s in seqs], device=dev)
+        ar_bs = torch.arange(eng.cache.block_size, device=dev)
+        gather_batch = GatherReferenceBatch()
+        batch.gather_idx = (ref_tables[:, :, None] * eng.cache.block_size + ar_bs).reshape(B, -1)
+
         ids = torch.tensor([s.output_ids[-1] for s in seqs], device=dev)
         pos = torch.tensor([s.num_tokens - 1 for s in seqs], device=dev)
         for _ in range(3):
             m(ids, pos, batch)
+            m(ids, pos, gather_batch)
         sync()
+        gather_logits = m(ids, pos, gather_batch)
+        paged_logits = m(ids, pos, batch)
+        sync()
+        max_logit_diff = (gather_logits.float() - paged_logits.float()).abs().max().item()
+        greedy_match = bool(torch.equal(gather_logits.argmax(-1), paged_logits.argmax(-1)))
         t0 = time.perf_counter()
         for _ in range(n):
             logits = m(ids, pos, batch)
         sync()
         fwd = (time.perf_counter() - t0) / n * 1e3  # includes CPU launch overhead, GPU-synchronised
+
+        def cuda_event_ms(fn, repeats=10):
+            for _ in range(3):
+                fn()
+            sync()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(repeats):
+                fn()
+            end.record()
+            sync()
+            return start.elapsed_time(end) / repeats
+
+        gather_fwd_ms = cuda_event_ms(lambda: m(ids, pos, gather_batch))
+        paged_fwd_ms = cuda_event_ms(lambda: m(ids, pos, batch))
 
         # CPU-side time to *issue* a forward without waiting for the GPU.
         sync()
@@ -378,6 +423,10 @@ def profile_decode(model: str, gpu_label: str = "L4"):
         out["batches"][B] = {
             "engine_step_ms": round(wall, 2), "build_batch_ms": round(build, 2),
             "forward_ms": round(fwd, 2), "forward_cpu_issue_ms": round(issue, 2),
+            "gather_reference_forward_cuda_ms": round(gather_fwd_ms, 3),
+            "block_table_forward_cuda_ms": round(paged_fwd_ms, 3),
+            "max_abs_logit_diff_vs_gather": max_logit_diff,
+            "greedy_match_vs_gather": greedy_match,
             "gpu_busy_ms_per_forward": round(gpu_us / 5 / 1e3, 2), "kernels_per_forward": kernels // 5,
         }
     return out
@@ -479,7 +528,6 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
             raise SystemExit("Add --yes to run.")
         import csv
         import json
-        from pathlib import Path
         rep = model_performance_matrix.remote(model)
         output = Path(__file__).resolve().parent.parent / "week_04_05" / "real_qwen3_l4_matrix.csv"
         with output.open("w", newline="") as f:
@@ -491,11 +539,16 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         print(json.dumps(rep["results"], indent=2))
         return
     if profile_only:
-        print(f"Plan: decode-step profile of {model} on 1x L4 (a few minutes, ~cents).")
+        print(f"Plan: same-H100 gather-reference vs block-table decode profile of {model}; 15-minute hard cap (~$0.99 GPU-only).")
         if not yes:
             raise SystemExit("Add --yes to run.")
         import json
-        print(json.dumps(profile_decode.remote(model), indent=2))
+        report = profile_decode.remote(model)
+        profile_path = Path(__file__).resolve().parent / "results" / "grade_ablation" / "h100_profile.json"
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2))
+        print(f"Saved {profile_path}")
         return
     if check_only:
         print(f"Plan: correctness check of {model} vs HuggingFace on 1x H100, max 15 minutes. "
@@ -504,7 +557,6 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
             raise SystemExit("Add --yes to run.")
         import json
         import sqlite3
-        from pathlib import Path
         rep = check_correctness.remote(model)
         case = rep.pop("e2e_case")
         db_path = Path(__file__).resolve().parent.parent / "week_04_05" / "test_cases.db"

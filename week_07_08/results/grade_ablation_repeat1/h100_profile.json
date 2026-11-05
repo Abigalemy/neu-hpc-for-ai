@@ -1,0 +1,42 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "model": "Qwen/Qwen3-4B",
+  "batches": {
+    "1": {
+      "engine_step_ms": 39.45,
+      "build_batch_ms": 0.05,
+      "forward_ms": 18.66,
+      "forward_cpu_issue_ms": 21.88,
+      "gather_reference_forward_cuda_ms": 20.902,
+      "block_table_forward_cuda_ms": 18.574,
+      "max_abs_logit_diff_vs_gather": 0.30859375,
+      "greedy_match_vs_gather": true,
+      "gpu_busy_ms_per_forward": 6.79,
+      "kernels_per_forward": 1959
+    },
+    "8": {
+      "engine_step_ms": 47.19,
+      "build_batch_ms": 0.08,
+      "forward_ms": 22.55,
+      "forward_cpu_issue_ms": 22.48,
+      "gather_reference_forward_cuda_ms": 35.882,
+      "block_table_forward_cuda_ms": 21.856,
+      "max_abs_logit_diff_vs_gather": 0.3125,
+      "greedy_match_vs_gather": true,
+      "gpu_busy_ms_per_forward": 7.98,
+      "kernels_per_forward": 1957
+    },
+    "32": {
+      "engine_step_ms": 45.78,
+      "build_batch_ms": 0.17,
+      "forward_ms": 28.26,
+      "forward_cpu_issue_ms": 25.06,
+      "gather_reference_forward_cuda_ms": 75.333,
+      "block_table_forward_cuda_ms": 26.11,
+      "max_abs_logit_diff_vs_gather": 0.5,
+      "greedy_match_vs_gather": true,
+      "gpu_busy_ms_per_forward": 11.64,
+      "kernels_per_forward": 1958
+    }
+  }
+}

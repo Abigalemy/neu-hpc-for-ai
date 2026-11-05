@@ -14,6 +14,86 @@ import cuda.tile as ct
 
 _TILE_M = 64
 _TILE_N = 64
+_SUPPORTED_PAGED_BLOCKS = (4, 8, 16, 32)
+
+
+@ct.kernel(occupancy=1)
+def _paged_decode_kernel(q, k_pool, v_pool, block_tables, seq_lens, out,
+                        scale_log2: float,
+                        query_group_size: ct.Constant[int],
+                        head_dim: ct.Constant[int],
+                        block_size: ct.Constant[int]):
+    """Single-token decode that follows logical->physical block tables in place.
+
+    One program handles one (sequence, query-head). It streams one KV block at a
+    time and uses online softmax, so it never materializes a gathered KV tensor.
+    """
+    seq = ct.bid(0)
+    q_head = ct.bid(1)
+    kv_head = q_head // query_group_size
+    seq_len = ct.load(seq_lens, index=(seq,), shape=(1,)).reshape(())
+    q_vec = ct.load(q, index=(seq, q_head, 0), shape=(1, 1, head_dim)).reshape((1, head_dim))
+    offsets = ct.arange(block_size, dtype=ct.int32)
+    m = ct.full((1,), -float("inf"), dtype=ct.float32)
+    denom = ct.full((1,), 0.0, dtype=ct.float32)
+    accum = ct.full((head_dim,), 0.0, dtype=ct.float32)
+    num_logical_blocks = ct.cdiv(seq_len, block_size)
+
+    for logical_block in range(num_logical_blocks):
+        physical_block = ct.load(block_tables, index=(seq, logical_block), shape=(1, 1)).reshape(())
+        key_pos = logical_block * block_size + offsets
+        k_tile = ct.load(
+            k_pool, index=(physical_block, 0, kv_head, 0),
+            shape=(1, block_size, 1, head_dim), padding_mode=ct.PaddingMode.ZERO,
+        ).reshape((block_size, head_dim))
+        v_tile = ct.load(
+            v_pool, index=(physical_block, 0, kv_head, 0),
+            shape=(1, block_size, 1, head_dim), padding_mode=ct.PaddingMode.ZERO,
+        ).reshape((block_size, head_dim))
+
+        scores = ct.sum(k_tile.astype(ct.float32) * q_vec.astype(ct.float32), axis=1)
+        scores = scores * scale_log2
+        valid = key_pos < seq_len
+        scores = ct.where(valid, scores, -float("inf"))
+        block_max = ct.max(scores, axis=0, keepdims=True)
+        next_m = ct.maximum(m, block_max)
+        old_scale = ct.exp2(m - next_m)
+        weights = ct.exp2(scores - next_m)
+        weights = ct.where(valid, weights, 0.0)
+        block_denom = ct.sum(weights, axis=0, keepdims=True)
+        block_accum = ct.sum(weights[:, None] * v_tile.astype(ct.float32), axis=0)
+        accum = accum * old_scale + block_accum
+        denom = denom * old_scale + block_denom
+        m = next_m
+
+    result = (accum / denom).astype(out.dtype)
+    ct.store(out, index=(seq, q_head, 0), tile=result.reshape((1, 1, head_dim)))
+
+
+def paged_decode_attention(q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor,
+                           block_tables: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+    """Block-table-aware single-token GQA decode; K/V are read directly from the pool."""
+    if q.ndim != 3 or k_pool.ndim != 4 or v_pool.shape != k_pool.shape:
+        raise ValueError("expected q [B,Hq,D] and K/V pool [blocks,block_size,Hkv,D]")
+    if block_tables.ndim != 2 or seq_lens.shape != (q.shape[0],):
+        raise ValueError("block tables and sequence lengths have incompatible shapes")
+    if q.shape[0] != block_tables.shape[0] or q.shape[-1] != k_pool.shape[-1]:
+        raise ValueError("query, block table, and KV pool shapes do not match")
+    if q.shape[1] % k_pool.shape[2] or q.dtype != k_pool.dtype or q.dtype != v_pool.dtype:
+        raise ValueError("GQA heads or Q/K/V dtypes are incompatible")
+    if q.device.type != "cuda" or any(t.device != q.device for t in (k_pool, v_pool, block_tables, seq_lens)):
+        raise ValueError("paged CUDA Tile attention inputs must share one CUDA device")
+    block_size = k_pool.shape[1]
+    if block_size not in _SUPPORTED_PAGED_BLOCKS:
+        raise ValueError(f"paged decode supports block sizes {_SUPPORTED_PAGED_BLOCKS}")
+    out = torch.empty_like(q)
+    ct.launch(
+        torch.cuda.current_stream(), (q.shape[0], q.shape[1]), _paged_decode_kernel,
+        (q, k_pool, v_pool, block_tables, seq_lens, out,
+         (1.0 / math.sqrt(q.shape[-1])) * (1.0 / math.log(2.0)),
+         q.shape[1] // k_pool.shape[2], q.shape[-1], block_size),
+    )
+    return out
 
 
 @ct.kernel(occupancy=1)

@@ -230,25 +230,27 @@ class PagedDecodeBatch(ForwardBatch):
         self.ctx = ctx
         max_blocks = max(len(s.block_table) for s in seqs)
         tables = torch.tensor([s.block_table + [0] * (max_blocks - len(s.block_table)) for s in seqs], device=device)
-        ar_bs = torch.arange(bs, device=device)
-        self.gather_idx = (tables[:, :, None] * bs + ar_bs).reshape(B, -1)  # [B, max_blocks*bs]
-        S = self.gather_idx.shape[1]
-        self.mask = (torch.arange(S, device=device)[None] < torch.tensor(ctx, device=device)[:, None])[:, None, None, :]
+        self.block_tables = tables
+        self.seq_lens = torch.tensor(ctx, device=device, dtype=torch.int32)
         self.slot_mapping = torch.tensor(
             [s.block_table[(c - 1) // bs] * bs + (c - 1) % bs for s, c in zip(seqs, ctx)], device=device)
+        if not str(device).startswith("cuda") or bs not in (4, 8, 16, 32):
+            ar_bs = torch.arange(bs, device=device)
+            self.gather_idx = (tables[:, :, None] * bs + ar_bs).reshape(B, -1)
+            S = self.gather_idx.shape[1]
+            self.mask = (torch.arange(S, device=device)[None] < self.seq_lens[:, None])[:, None, None, :]
 
     def attend(self, layer_idx, q, k, v):
         c = self.cache
         c.k[layer_idx].index_copy_(0, self.slot_mapping, k)
         c.v[layer_idx].index_copy_(0, self.slot_mapping, v)
+        if q.is_cuda and self.cache.block_size in (4, 8, 16, 32):
+            from .kernels.cutile_attention import paged_decode_attention
+            pool_shape = (c.num_blocks, c.block_size, c.k[layer_idx].shape[1], c.k[layer_idx].shape[2])
+            return paged_decode_attention(q, c.k[layer_idx].view(pool_shape),
+                                          c.v[layer_idx].view(pool_shape),
+                                          self.block_tables, self.seq_lens)
         K = c.k[layer_idx][self.gather_idx].transpose(1, 2)  # [B, nkv, S, d]
         V = c.v[layer_idx][self.gather_idx].transpose(1, 2)
-        if q.is_cuda:
-            outs = [
-                _tile_attention(q[i:i + 1, :, None, :], K[i:i + 1, :, :ctx, :],
-                                V[i:i + 1, :, :ctx, :], causal=False)
-                for i, ctx in enumerate(self.ctx)
-            ]
-            return torch.cat(outs, dim=0)[:, :, 0, :]
         o = sdpa(q[:, :, None, :], K, V, mask=self.mask)
         return o[:, :, 0, :]
