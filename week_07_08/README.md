@@ -1,15 +1,20 @@
 # Week 07 & 08: Qwen3 Inference Server with KV Cache, PagedAttention and Continuous Batching
 
-A from-scratch (pure PyTorch) Qwen3 inference server with an OpenAI-compatible API, benchmarked with
-AIPerf against vLLM on Qwen3-4B / H100.
+A from-scratch Qwen3 inference server with an OpenAI-compatible API, intended for AIPerf comparison
+against vLLM on Qwen3-4B / H100. The model, engine and cache implementations are shared from
+`../hpc_core/`. CUDA inference uses shared cuTile SwiGLU and causal/GQA FlashAttention kernels; the
+remaining model operations use PyTorch.
 
 ## Layout
 
 | File | What it does |
 |---|---|
-| `qwen3_model.py` | Qwen3 decoder (GQA, per-head Q/K RMSNorm, RoPE, SwiGLU), HF safetensors loader. Cache-agnostic. |
-| `kv_cache.py` | Three KV backends: **none**, **contiguous** (per-sequence slab), **paged** (block pool + block tables). |
-| `engine.py` | Scheduler: continuous (or static) batching, prefill + batched decode, preemption by recompute. |
+| `qwen3_model.py` | Compatibility import for the shared Qwen3 decoder and HF safetensors loader. |
+| `kv_cache.py` | Compatibility import for three shared KV backends: **none**, **contiguous**, **paged**. |
+| `engine.py` | Compatibility import for the shared scheduler and inference engine. |
+| `../hpc_core/kernels/cutile_ops.py` | CUDA Tile fused SwiGLU invoked by the CUDA model path. |
+| `../hpc_core/kernels/cutile_attention.py` | CUDA Tile causal/GQA attention used for prefill and cache decode. |
+| `_qwen3_cpp_tokenizer` | C++ `tokenizers-cpp` extension used to encode completion prompts and rendered chat prompts. |
 | `server.py` | FastAPI server: `/v1/completions`, `/v1/chat/completions` (SSE streaming), `/health`, `/metrics_json`. |
 | `test_correctness.py` | Tiny random Qwen3 vs HuggingFace: logits, greedy generation, preemption, no leaked blocks. |
 | `bench/` | AIPerf workload suite, experiment orchestrator, Slurm script, results summarizer. |
@@ -19,6 +24,15 @@ AIPerf against vLLM on Qwen3-4B / H100.
 **Model.** Tokens are passed as one flat varlen tensor, so prefill of several sequences and batched
 decode use the same code. The model calls `batch.attend(layer, q, k, v)`; the batch object decides
 how K/V are stored and read.
+
+**CUDA Tile.** CUDA inference uses online-softmax FlashAttention with causal masking and GQA, plus a
+fused SwiGLU kernel. L4 checks passed against PyTorch for FP16/BF16 attention and for a small model
+using none, contiguous, and paged cache modes. Real Qwen3-4B greedy outputs matched Hugging Face for
+four prompts under no-cache, contiguous, and paged modes in a capped H100 correctness run. The full
+H100 AIPerf run below measures this CUDA Tile path.
+
+The L4 kernel and small-model checks used the shared Modal workspace and are recorded in the app's
+run history. Earlier pre-Tile AIPerf results are not included in the current performance tables.
 
 **KV cache.** Without a cache each step recomputes the entire context (O(n) work per generated
 token). With a cache, prefill writes K/V once and each decode step only processes the newest token.
@@ -41,11 +55,18 @@ batch is empty) is provided as the ablation baseline.
 
 ```bash
 pip install -r requirements.txt
+# Build the C++ tokenizer extension into this directory; see ../week_04_05/README.md for prerequisites.
+cmake -S ../week_04_05/tokenizer_cpp -B build/tokenizer_cpp -DCMAKE_BUILD_TYPE=Release \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+  -DQWEN3_TOKENIZER_PYTHON_OUTPUT_DIR="$PWD"
+cmake --build build/tokenizer_cpp --target _qwen3_cpp_tokenizer --parallel
 python test_correctness.py                       # CPU, no model download needed
 python server.py --model Qwen/Qwen3-0.6B --cache-mode paged --batching continuous --port 8000
 curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
+
+The server uses Hugging Face's Python tokenizer to render the Qwen3 chat template and decode generated tokens. Actual text-to-token encoding for both endpoints goes through the C++ extension. The full H100 AIPerf matrix was collected before this extension was connected to the request path; the extension separately passed exact ID parity against Hugging Face on five representative probes, including a rendered chat-template string. No H100 performance rerun was done after this integration.
 
 Server flags: `--cache-mode {none,contiguous,paged}`, `--batching {continuous,static}`, `--max-num-seqs`,
 `--max-model-len`, `--block-size`, `--kv-cache-gb` (same KV budget for contiguous and paged),
@@ -57,7 +78,7 @@ The results below were produced on **Modal** (1x H100 80GB per config, Qwen3-4B,
 
 ```bash
 modal run --detach modal_bench.py --final --yes         # vllm + ours_{paged,contiguous,nocache}, trimmed sweeps
-modal run modal_bench.py --check-only --yes             # real-weights correctness vs HuggingFace (L4)
+modal run modal_bench.py --check-only --model Qwen/Qwen3-4B --yes  # real-weights correctness (H100, 15-min cap)
 modal run modal_bench.py --profile-only --yes           # decode-step profile (L4)
 ```
 
@@ -76,95 +97,101 @@ Workloads (all use `ignore_eos` so output lengths are exact):
 | mixed_poisson | Poisson 2-16 req/s, variable lengths | Realistic open-loop traffic and queueing |
 | pressure | conc 128, 1024 / 512 | KV memory pressure: contiguous vs paged, preemption |
 
-## Results
+### Corrected Tile path smoke check
 
-Setup: Qwen3-4B, bf16, 1x H100 80GB (Modal), AIPerf 'chat' endpoint with streaming. Raw AIPerf exports are in
-`results/<config>/<workload>_<param>/profile_export_aiperf.json`; `results/summary.md` has the full table (p50/p99).
-Tables show **output tokens/s** (higher is better) and **p50 inter-token latency, ITL, in ms** (lower is better).
-Every run below had 0% request errors.
+A short AIPerf smoke run was completed after the CUDA Tile integration: Qwen3-4B on H100, one
+baseline workload (128 input / 128 output tokens, concurrency 1, 8 measured requests), comparing
+`ours_paged` with vLLM. Both returned zero request errors. The current Tile service measured 26.7
+output tokens/s and vLLM 228.2 output tokens/s in this small run. Raw outputs are in
+`results/cutile_smoke/`; this is a pipeline smoke check, not a complete performance sweep or a
+stable performance claim. The current full-matrix results are reported in the Results section below.
+Raw AIPerf exports and this run's two-row summary are in `results/cutile_smoke/summary.md`.
 
-### 1. With vs without KV cache + PagedAttention (ours)
+A decode profile of Qwen3-4B on L4 measured about 1,994 CUDA kernels and 35.4 ms of GPU time per
+batch-1 forward (36.9 ms synchronized wall time). At batch sizes 8 and 32, GPU time rose to 42.1 ms
+and 60.2 ms per forward. This points to the eager per-layer inference path and its many launches as
+a performance bottleneck; the profile is diagnostic, not an H100 performance result. Raw measurements
+are in `results/cutile_smoke/decode_profile_l4.json`.
 
-| Workload | no cache: tok/s / ITL | contiguous KV: tok/s / ITL | **paged KV: tok/s / ITL** |
-|---|---|---|---|
-| conc 1, 128 in / 128 out | 47 / 21.4 | 39 / 25.7 | 43 / 23.5 |
-| conc 4, 256 / 256 | 105 / 38.2 | 148 / 26.7 | **159** / 24.9 |
-| conc 16, 256 / 256 | 115 / **139.2** | 335 / 28.1 | **616** / 25.0 |
-| conc 8, 2048 in / 32 out | 22 / 355.1 | 202 / 32.9 | **208** / 30.2 |
-| conc 64, 256 / 256 | not run | 467 / 27.2 | **2112** / 28.6 |
-| conc 64, 64 in / 1024 out | not run | 473 / 26.7 | **1845** / 30.0 |
+## Results: CUDA Tile H100 matrix
 
-* **KV cache:** without a cache every step re-runs the whole context of every running sequence. Over its whole run the no-cache
-  engine pushed 24.3M tokens through the model for 297 requests, versus 1.4M prefill tokens for the paged engine's 1849
-  requests (engine counters in `engine_stats.json`). At conc 16 this shows up as ITL of 139 ms (5.6x worse) and 5.4x lower throughput. At conc 1 the three are equal because the engine is CPU-bound (below), so
-  the cache's compute saving does not show up until the GPU has real work. The no-cache engine was only run on short,
-  low-concurrency workloads because it would not finish the others in reasonable time.
-* **PagedAttention vs contiguous:** with the same 8 GB KV budget, contiguous slabs reserve 4096 tokens per sequence, so only
-  **14 sequences** fit (average decode batch 11.3), versus a paged pool of 3640 blocks (58k tokens, average decode batch 22.3).
-  At conc 64 the paged server is **4.5x** faster (2112 vs 467 tok/s) and contiguous has TTFT p50 of 22.8 s because requests
-  queue for a slot. Under a 128-request flood (`pressure`) paged completes; contiguous did not finish within its 40-minute cap
-  (no `pressure` result, other workloads were completed).
-* Paged pays for its flexibility under memory pressure: in `pressure_c128` (conc 128, 1024 in / 512 out) the pool ran out and
-  **121 sequences were preempted and recomputed**, giving TTFT p50 of 27.8 s.
+This run used Qwen3-4B BF16 on one Modal H100 per configuration, the AIPerf streaming chat endpoint,
+and `ignore_eos` with temperature 0. Each listed point is one run (no repeats). The full raw exports
+are in [`results/cutile_final/`](results/cutile_final/); the generated full metrics table is
+[`results/cutile_final/summary.md`](results/cutile_final/summary.md), and the profile-by-profile
+completion/error audit is [`results/cutile_final/validation.md`](results/cutile_final/validation.md).
+Modal run:
+[ap-v9yhmH32icaaC7X65dKUQj](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-v9yhmH32icaaC7X65dKUQj).
 
-### 2. Ours (paged, continuous batching) vs vLLM
+The completed matrix contains 13 AIPerf profiles for `vllm`, 13 for `ours_paged`, 13 for
+`ours_contiguous` (12 in the initial run, plus a targeted `pressure_c128` follow-up), and 5 for
+`ours_nocache`. The initial all-config run reached the contiguous 40-minute cap before pressure; the
+follow-up completed that missing comparison in 331.67 seconds of profiling time. The no-cache sweep
+was intentionally trimmed to baseline, balanced concurrency 4/16, and prefill-heavy concurrency 1/8.
+Every profile with an AIPerf JSON export reported 0% request errors. One request in
+`ours_paged/decode_heavy_c64` has an AIPerf token-count discrepancy among 256 requests: AIPerf's
+text-side count is 898 tokens while server-reported completion usage is 1024. The server counter
+indicates that generation reached the requested length; the available evidence points to
+detokenization/re-tokenization accounting, not a confirmed early stop. The text-side count is 12.3%
+lower for that request, while the profile-wide mean is 0.4% below the server-reported total. All other
+exported profiles reported zero AIPerf output-length mismatch warnings.
 
-| Workload | vLLM: tok/s / ITL / TTFT | ours: tok/s / ITL / TTFT | vLLM / ours throughput |
-|---|---|---|---|
-| conc 1, 128 / 128 | 223 / 4.3 / 27 | 42 / 23.5 / 25 | 5.3x |
-| conc 4, 256 / 256 | 870 / 4.4 / 47 | 159 / 24.9 / 74 | 5.5x |
-| conc 16, 256 / 256 | 3115 / 4.8 / 95 | 616 / 25.0 / 157 | 5.1x |
-| conc 64, 256 / 256 | 8833 / 6.2 / 269 | 2112 / 28.6 / 343 | 4.2x |
-| conc 64, 64 / 1024 | 9390 / 6.7 / 126 | 1845 / 30.0 / 458 | 5.1x |
-| conc 32, 2048 / 32 | 877 / 22.3 / 460 | 373 / 63.5 / 478 | 2.4x |
-| Poisson 8 req/s, variable lengths | 1783 / 5.4 / 34 | 1053 / 38.4 / 74 | 1.7x |
-| pressure, conc 128 | 6064 / 10.1 / 5580 | 1354 / 31.3 / 27849 | 4.5x |
+Selected metrics below are p50 TTFT and p50 ITL in milliseconds; output throughput is the AIPerf
+average in tokens/second. In this run, throughput uses AIPerf's text-side token count; the benchmark
+command now asks AIPerf to use server-reported token counts on future runs. Higher throughput and
+lower latency are better. A dash means that workload was not run for that configuration.
 
-(TTFT = p50 time to first token in ms.) vLLM is 4 to 5x faster on decode-dominated workloads and much closer (1.7x to 2.4x)
-on prefill-heavy and open-loop variable-length traffic, where prefill compute (not launch overhead) dominates.
+| Workload | vLLM tok/s / TTFT / ITL | Paged tok/s / TTFT / ITL | Contiguous tok/s / TTFT / ITL | No-cache tok/s / TTFT / ITL |
+|---|---:|---:|---:|---:|
+| Baseline, conc 1, 128 in / 128 out | 223.9 / 26.4 / 4.3 | 62.1 / 17.3 / 16.1 | 43.1 / 24.1 / 23.2 | 51.3 / 20.4 / 19.7 |
+| Balanced, conc 4, 256 / 256 | 868.6 / 48.4 / 4.4 | 202.6 / 56.0 / 19.6 | 176.1 / 60.9 / 22.1 | 102.8 / 53.4 / 39.0 |
+| Balanced, conc 16, 256 / 256 | 3131.8 / 93.2 / 4.7 | 494.1 / 140.4 / 31.8 | 425.7 / 84.8 / 32.2 | 113.1 / 130.0 / 141.5 |
+| Balanced, conc 64, 256 / 256 | 8868.1 / 263.2 / 6.1 | 817.4 / 290.0 / 77.2 | 373.0 / 32208.6 / 41.1 | — |
+| Prefill-heavy, conc 32, 2048 / 32 | 883.3 / 463.1 / 22.1 | 291.2 / 541.4 / 88.7 | 250.6 / 2107.6 / 50.1 | — |
+| Decode-heavy, conc 32, 64 / 1024 | 5584.2 / 79.1 / 5.6 | 677.9 / 102.2 / 47.2 | 367.8 / 40690.2 / 32.9 | — |
+| Decode-heavy, conc 64, 64 / 1024 | 9399.0 / 142.2 / 6.6 | 781.8 / 336.0 / 78.1* | 418.4 / 102061.6 / 32.5 | — |
+| Mixed Poisson, 8 req/s | 1781.2 / 36.5 / 5.4 | 649.8 / 105.1 / 78.7 | 393.2 / 24827.7 / 33.7 | — |
+| Pressure, conc 128, 1024 / 512 | 6062.2 / 5534.0 / 10.0 | 675.0 / 56390.8 / 65.0 | 395.2 / 142332.4 / 34.4 | — |
 
-### 3. Root cause of the remaining gap: CPU launch overhead
+*The paged decode-heavy conc 64 point contains the single 898-vs-1024 token-count discrepancy noted above.*
 
-`profile_decode` (L4, Qwen3-0.6B, paged) shows decode is **launch-bound, not compute-bound**:
+### Interpretation
 
-| decode batch | engine step | GPU actually busy | kernels per forward |
-|---|---|---|---|
-| 1 | 36.8 ms | 7.8 ms (21%) | 1694 |
-| 8 | 47.6 ms | 9.6 ms | 1694 |
-| 32 | 52.1 ms | 15.8 ms | 1694 |
+* The in-house CUDA Tile server is slower than vLLM on every selected throughput comparison. At
+  balanced concurrency 4/16/64, vLLM delivers about 4.4x/6.3x/10.9x the paged-server output
+  throughput. This is a useful baseline and shows optimization work remains; it should not be
+  presented as matching vLLM performance.
+* The KV-cache ablation shows its benefit more clearly at higher concurrency: at balanced concurrency
+  16, paged KV reaches 494.1 output tokens/s and 31.8 ms p50 ITL, compared with 113.1 tokens/s and
+  141.5 ms for no cache. These are single-run measurements.
+* The pressure workload completed for all three cache-enabled configurations. Under concurrency 128,
+  contiguous KV had 14 slots and no preemptions, but p50 TTFT reached 142.3 seconds. Paged KV reached
+  56.4 seconds p50 TTFT and 675 output tokens/s, versus 142.3 seconds and 395.2 tokens/s for
+  contiguous. vLLM was much faster in this workload. The queueing result is consistent with the fixed
+  contiguous-cache capacity limiting admission.
+* The decode profile is diagnostic rather than a benchmark result: the L4 Qwen3-4B profile recorded
+  about 1,994 CUDA kernels and 35.4 ms GPU busy time per batch-1 forward. This supports investigating
+  Python/PyTorch launch overhead, CUDA graphs, and a block-table-aware attention kernel. It does not
+  by itself prove the cause of every H100 latency result.
 
-Evidence: the time to merely *issue* a forward without waiting (36.4 ms) equals the synchronized forward time (35.1 ms), and
-batch-building costs only 0.25 to 0.5 ms. Each step launches about 1700 small kernels from Python; on a fast GPU the GPU idles waiting
-for the CPU. Consistent with this, on the H100 our ITL is almost constant (23.5 to 30 ms) from conc 1 to 64 while vLLM,
-which captures decode into CUDA graphs, is at 4.3 to 6.7 ms. This is also why batching helps us so much: the fixed per-step
-cost is amortised over more sequences (throughput 42 -> 2112 tok/s from conc 1 to 64 at nearly constant ITL).
+### Correctness and measurement caveats
 
-**Not implemented (would be the next optimisation):** CUDA-graph capture of the decode step (static buffers, batch-size buckets),
-fused RMSNorm/RoPE kernels to cut the kernel count, and a block-table-aware attention kernel instead of the PyTorch gather
-(which copies K/V each step).
-
-### 4. Other bottlenecks seen
-
-* **Queueing, not compute, dominates TTFT at high load.** Contiguous at conc 64 and paged at conc 128 have 20+ s TTFT because
-  admission is limited by KV memory (slots / blocks), not GPU speed.
-* **Prefill is serialized with decode.** Each step prefills newly admitted sequences before decoding, so ITL p99 spikes when many
-  requests arrive (mixed Poisson 8 req/s: ITL p50 38 ms vs 25 ms at steady state; `prefill_heavy_c32` ITL 63 ms). Chunked prefill
-  would smooth this.
-* **Preemption by recompute is expensive** (121 in `pressure`); swapping or a smarter victim policy would help.
-
-### Correctness
-
-`test_correctness.py` (tiny random Qwen3 vs HuggingFace, CPU, 9 tests incl. preemption and block-leak checks) and
-`test_server.py` (HTTP + streaming) pass. With the real Qwen3-0.6B weights on a GPU, greedy output of 4 concurrent requests is
-token-for-token identical to HuggingFace in float32 for all three cache modes (`modal_bench.py --check-only`).
-
-### Caveats (please read before comparing numbers)
-
-* Single run per point, no repeats, so small differences (a few %) are within noise. Each point is 8 to 384 requests.
-* `ours_contiguous` hit its 40-minute cap (no `pressure_c128` point) and `ours_nocache` was run only on low-concurrency workloads.
-* vLLM runs in a different container with its own CUDA-graphs/torch-compile; it used `--no-enable-prefix-caching`, bf16, and its
-  FlashInfer sampler disabled (no `nvcc` in the image). Its chat template had thinking enabled by default, ours disables thinking,
-  so prompts differ by a few tokens (outputs are length-forced with `ignore_eos`, so throughput is comparable).
-* Our server is far simpler than vLLM: PyTorch ops only, no CUDA graphs, no prefix caching, no chunked prefill.
-* `ours_static` (static-batching ablation) is implemented (`--batching static`) and unit-tested but was **not benchmarked**, to save
-  shared GPU credit.
+* CPU correctness suite: 10 tests passed (including the HTTP endpoint smoke test). L4 CUDA Tile attention and small-model checks passed against
+  PyTorch; the real Qwen3-4B H100 greedy check matched Hugging Face for four prompts in no-cache,
+  contiguous, and paged modes.
+* AIPerf marked all exported profiles complete with zero request errors. A single output-length
+  warning in paged `decode_heavy_c64` was a discrepancy between text re-tokenization (898) and
+  server usage (1024), not evidence that the engine stopped early. The benchmark command now asks
+  AIPerf to use server-reported token counts for future runs.
+* Optional GPU/server telemetry missed heartbeats during the run, so telemetry summaries are
+  incomplete. AIPerf request metrics remain available, but do not make claims based on missing GPU
+  telemetry.
+* These are single runs, so small differences may be noise. vLLM and the in-house server use different
+  runtime stacks and chat templates; prompt lengths can differ slightly. Both use BF16, forced output
+  lengths, and the same AIPerf workload shapes.
+* The current implementation uses PyTorch for model operations other than the integrated CUDA Tile
+  attention and SwiGLU kernels. It does not implement CUDA graphs, chunked prefill, or a fused paged-KV
+  gather, so the vLLM comparison is a baseline for this educational implementation, not an optimized
+  production server comparison.
+* `ours_static` was not included in this matrix. The full AIPerf matrix does not replace the separate
+  correctness tests or prove that every possible workload is correct.

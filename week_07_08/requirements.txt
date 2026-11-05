@@ -7,3 +7,5 @@ uvicorn
 pydantic
 pytest
 aiperf
+cuda-tile[tileiras]==1.8.0
+pybind11==2.13.6

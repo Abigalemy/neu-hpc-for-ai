@@ -21,6 +21,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from transformers import AutoTokenizer
 
+try:
+    from _qwen3_cpp_tokenizer import Qwen3Tokenizer as CppQwen3Tokenizer
+except ImportError:
+    CppQwen3Tokenizer = None
+
 from engine import EngineConfig, LLMEngine, SamplingParams
 from qwen3_model import load_model
 
@@ -109,11 +114,11 @@ def _sse(obj) -> str:
 
 
 def _prompt_to_ids(prompt) -> List[int]:
-    tok = STATE["tok"]
+    tok = STATE["cpp_tok"]
     if isinstance(prompt, str):
-        return tok.encode(prompt, add_special_tokens=False)
+        return tok.encode(prompt)
     if prompt and isinstance(prompt[0], str):
-        return tok.encode(prompt[0], add_special_tokens=False)
+        return tok.encode(prompt[0])
     if prompt and isinstance(prompt[0], list):
         return list(prompt[0])
     return list(prompt)
@@ -190,7 +195,7 @@ async def chat_completions(req: ChatRequest):
         text = STATE["tok"].apply_chat_template(req.messages, tokenize=False, add_generation_prompt=True, **kwargs)
     except Exception:  # tokenizer without a chat template
         text = "\n".join(f"{m['role']}: {m['content']}" for m in req.messages) + "\nassistant:"
-    ids = STATE["tok"].encode(text, add_special_tokens=False)
+    ids = STATE["cpp_tok"].encode(text)
     params = _params(req, req.max_completion_tokens or req.max_tokens or 256)
     inc = bool((req.stream_options or {}).get("include_usage"))
     return await _run("chatcmpl-" + uuid.uuid4().hex[:12], "chat.completion.chunk", ids, params, req.stream,
@@ -213,6 +218,10 @@ async def metrics():
 
 
 def build_engine(args):
+    if CppQwen3Tokenizer is None:
+        raise RuntimeError(
+            "The C++ Qwen3 tokenizer extension is missing; build week_04_05/tokenizer_cpp first"
+        )
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     model, cfg, model_dir = load_model(args.model, args.device, dtype, max_positions=args.max_model_len)
     eos = {151645, 151643}
@@ -228,7 +237,8 @@ def build_engine(args):
                         max_num_batched_tokens=args.max_num_batched_tokens)
     engine = LLMEngine(model, cfg, ecfg, eos, args.device, dtype)
     tok = AutoTokenizer.from_pretrained(model_dir)
-    return engine, tok
+    cpp_tok = CppQwen3Tokenizer(os.path.join(model_dir, "tokenizer.json"))
+    return engine, tok, cpp_tok
 
 
 def main():
@@ -250,8 +260,9 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
-    engine, tok = build_engine(args)
-    STATE.update(engine=engine, tok=tok, name=args.served_model_name or args.model)
+    engine, tok, cpp_tok = build_engine(args)
+    STATE.update(engine=engine, tok=tok, cpp_tok=cpp_tok,
+                 name=args.served_model_name or args.model)
     threading.Thread(target=engine.run_forever, daemon=True).start()
     print("engine ready:", json.dumps(engine.snapshot()), flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

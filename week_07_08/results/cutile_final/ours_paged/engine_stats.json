@@ -1,0 +1,1 @@
+{"steps":39455,"prefill_tokens":1370252,"decode_tokens":803262,"decode_steps":36076,"batch_size_sum":803262,"preemptions":118,"finished":1849,"rejected":0,"avg_decode_batch":22.265827697083935,"waiting":0,"running":0,"cache_mode":"paged","batching":"continuous","kv_usage":0.0,"num_blocks":3640}

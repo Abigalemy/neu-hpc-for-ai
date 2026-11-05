@@ -1,0 +1,21 @@
+{
+  "modal_run": "https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-fgf0AZv0NEpjw5zO3EOgYo",
+  "gpu": "NVIDIA L4",
+  "model": "Qwen/Qwen3-4B",
+  "model_revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "dtype": "bfloat16",
+  "operation": "causal prefill; compare final-position logits",
+  "batch_sizes": [1, 2, 4],
+  "sequence_lengths": [32, 64, 128],
+  "measurement": "3 trials per implementation, 15 synchronized wall-time repeats per trial, alternating implementation order; report the median trial",
+  "reference": "Hugging Face AutoModelForCausalLM with logits_to_keep=1",
+  "cutile_path": "Shared Qwen3 implementation with CUDA Tile FlashAttention and SwiGLU",
+  "summary": {
+    "all_greedy_tokens_match": true,
+    "max_abs_logit_difference": 0.296875,
+    "cutile_faster_shapes": 7,
+    "cutile_slower_shapes": 2,
+    "geometric_mean_hf_over_cutile_latency_ratio": 1.0099230174
+  },
+  "csv": "real_qwen3_l4_matrix.csv"
+}

@@ -1,56 +1,49 @@
 #pragma once
-#include <iostream>
+
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <sstream>
 
-class SimpleQwenTokenizer {
-public:
-    std::unordered_map<std::string, int> vocab;
-    std::unordered_map<int, std::string> inv_vocab;
-    int eos_token_id = 151643;
-    int pad_token_id = 151643;
+#include <tokenizers_cpp.h>
 
-    SimpleQwenTokenizer() {
-        vocab["<|endoftext|>"] = 151643;
-        vocab["<|im_start|>"] = 151644;
-        vocab["<|im_end|>"] = 151645;
-        inv_vocab[151643] = "<|endoftext|>";
-        inv_vocab[151644] = "<|im_start|>";
-        inv_vocab[151645] = "<|im_end|>";
-
-        for (int i = 0; i < 256; ++i) {
-            std::string s(1, (char)i);
-            vocab[s] = i;
-            inv_vocab[i] = s;
-        }
+// Thin Qwen3 adapter around MLC's C++ binding for Hugging Face tokenizers.
+// Load the tokenizer.json shipped with the exact Qwen3 model revision; a byte
+// to integer mapping is not equivalent to Qwen3's BPE tokenizer.
+class Qwen3Tokenizer {
+ public:
+  explicit Qwen3Tokenizer(const std::string& tokenizer_json_path) {
+    std::ifstream input(tokenizer_json_path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("Cannot open tokenizer JSON: " + tokenizer_json_path);
     }
-
-    std::vector<int> encode(const std::string& text) const {
-        std::vector<int> tokens;
-        for (size_t i = 0; i < text.size(); ++i) {
-            std::string ch(1, text[i]);
-            auto it = vocab.find(ch);
-            if (it != vocab.end()) {
-                tokens.push_back(it->second);
-            } else {
-                tokens.push_back((unsigned char)text[i]);
-            }
-        }
-        return tokens;
+    const std::string json((std::istreambuf_iterator<char>(input)),
+                           std::istreambuf_iterator<char>());
+    tokenizer_ = tokenizers::Tokenizer::FromBlobJSON(json);
+    if (!tokenizer_) {
+      throw std::runtime_error("Failed to load Hugging Face tokenizer JSON");
     }
+  }
 
-    std::string decode(const std::vector<int>& tokens) const {
-        std::string text = "";
-        for (int token : tokens) {
-            auto it = inv_vocab.find(token);
-            if (it != inv_vocab.end()) {
-                text += it->second;
-            } else if (token >= 0 && token < 256) {
-                text += (char)token;
-            }
-        }
-        return text;
-    }
+  std::vector<int32_t> encode(const std::string& text) {
+    return tokenizer_->Encode(text);
+  }
+
+  std::vector<std::vector<int32_t>> encode_batch(
+      const std::vector<std::string>& texts) {
+    return tokenizer_->EncodeBatch(texts);
+  }
+
+  std::string decode(const std::vector<int32_t>& ids) {
+    return tokenizer_->Decode(ids);
+  }
+
+  size_t vocab_size() { return tokenizer_->GetVocabSize(); }
+
+ private:
+  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
 };

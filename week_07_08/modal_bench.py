@@ -20,6 +20,7 @@ import os
 import subprocess
 import tarfile
 import time
+from pathlib import Path
 
 import modal
 
@@ -37,14 +38,32 @@ RES_DIR = "/results_store"
 
 _ignore = [".venv", "**/__pycache__", ".pytest_cache", "results", "logs", "artifacts", ".git"]
 _here = os.path.dirname(os.path.abspath(__file__))
+_repo_dir = os.path.dirname(_here)
+_core_dir = os.path.join(_repo_dir, "hpc_core")
+_tokenizer_cpp_dir = os.path.join(_repo_dir, "week_04_05", "tokenizer_cpp")
+_tokenizer_header = os.path.join(_repo_dir, "week_04_05", "tokenizer.h")
 
 # Our server: PyTorch ships its own CUDA runtime, so a slim Python image is enough.
 ours_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("torch", "transformers", "safetensors", "huggingface_hub", "fastapi", "uvicorn",
-                 "pydantic", "aiperf", "numpy")
-    .env({"HF_HOME": HF_DIR})
+    .apt_install("build-essential", "cmake", "curl", "git", "pkg-config", "libssl-dev")
+    .pip_install("torch==2.10.0", "transformers", "safetensors", "huggingface_hub", "fastapi", "uvicorn",
+                 "pydantic", "aiperf", "numpy", "cuda-tile==1.8.0",
+                 "cuda-toolkit[tileiras,nvvm,nvcc]>=13.3,<13.6", "pybind11==2.13.6")
+    .env({"HF_HOME": HF_DIR,
+          "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"})
     .add_local_dir(_here, APP_DIR, ignore=_ignore)
+    .add_local_dir(_core_dir, "/root/hpc_core")
+    .add_local_dir(_tokenizer_cpp_dir, "/root/tokenizer_cpp")
+    .add_local_file(_tokenizer_header, "/root/tokenizer.h")
+    .run_commands(
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
+        "cmake -S /root/tokenizer_cpp -B /tmp/qwen3-tokenizer-build "
+        "-DCMAKE_BUILD_TYPE=Release "
+        "-Dpybind11_DIR=$(python -m pybind11 --cmakedir) "
+        "-DQWEN3_TOKENIZER_PYTHON_OUTPUT_DIR=/root/app && "
+        "cmake --build /tmp/qwen3-tokenizer-build --target _qwen3_cpp_tokenizer --parallel 4",
+    )
 )
 # vLLM pins its own torch, so it gets a separate image.
 vllm_image = (
@@ -189,7 +208,7 @@ def vllm_h100(*a):
     return _run(*a)
 
 
-@app.function(image=ours_image, gpu="L4", volumes={HF_DIR: hf_cache}, timeout=1800)
+@app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache}, timeout=900)
 def check_correctness(model: str):
     """Real weights + real tokenizer: our engine (every cache mode, concurrent requests) vs HuggingFace.
 
@@ -197,11 +216,14 @@ def check_correctness(model: str):
     """
     import sys
     import torch
+    import transformers
+    import importlib.metadata
     sys.path.insert(0, APP_DIR)
     os.chdir(APP_DIR)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from engine import EngineConfig, LLMEngine, SamplingParams
     from qwen3_model import load_model
+    from kv_cache import NoCacheBatch
 
     dev, n_new = "cuda", 24
     mine, cfg, d = load_model(model, dev, torch.float32, max_positions=1024)
@@ -210,6 +232,40 @@ def check_correctness(model: str):
     prompts = ["The capital of France is", "def fibonacci(n):\n    ", "中国的首都是",
                "Once upon a time, in a small village by the sea, there lived an old fisherman who"]
     ids = [tok.encode(p) for p in prompts]
+
+    # Persist a real-weight prefill computation as a SQLite test case from the
+    # local entrypoint. Keep all prompt-position logits so the CUDA implementation
+    # can be compared with the exact Hugging Face reference later.
+    case_ids = torch.tensor(ids[0], dtype=torch.long, device=dev)
+    case_positions = torch.arange(len(ids[0]), dtype=torch.long, device=dev)
+    with torch.no_grad():
+        hf_case_logits = hf(case_ids[None, :], use_cache=False).logits[0].float()
+        case_batch = NoCacheBatch([0, len(ids[0])], dev)
+        case_batch.logit_indices = torch.arange(len(ids[0]), device=dev)
+        ours_case_logits = mine(case_ids, case_positions, case_batch).float()
+    case_max_diff = (ours_case_logits - hf_case_logits).abs().max().item()
+    case_match = torch.allclose(ours_case_logits, hf_case_logits, atol=2e-4, rtol=2e-4)
+    import json
+    import numpy as np
+    e2e_case = {
+        "model_id": model,
+        "model_revision": os.path.basename(d.rstrip("/")),
+        "model_config_json": hf.config.to_json_string(),
+        "runtime_json": json.dumps({
+            "torch": torch.__version__,
+            "transformers": transformers.__version__,
+            "cuda_tile": importlib.metadata.version("cuda-tile"),
+        }, sort_keys=True),
+        "input_ids": ids[0],
+        "positions": list(range(len(ids[0]))),
+        "dtype": "float32",
+        "causal": True,
+        "expected_logits": np.asarray(hf_case_logits.cpu(), dtype=np.float32).tobytes(),
+        "logits_rows": int(hf_case_logits.shape[0]),
+        "vocab_size": int(hf_case_logits.shape[1]),
+        "max_abs_diff": case_max_diff,
+        "match": case_match,
+    }
 
     ref = []
     for p in ids:
@@ -237,7 +293,8 @@ def check_correctness(model: str):
                         "ours": tok.decode(outs[i])[:120], "hf": tok.decode(ref[i])[:120]})
             ok &= same
         report[mode] = res
-    report["all_match"] = ok
+    report["all_match"] = ok and case_match
+    report["e2e_case"] = e2e_case
     return report
 
 
@@ -319,6 +376,72 @@ def profile_decode(model: str, gpu_label: str = "L4"):
     return out
 
 
+@app.function(image=ours_image, gpu="L4", volumes={HF_DIR: hf_cache}, timeout=300)
+def model_performance_matrix(model: str):
+    """Compare real Qwen3 HF and CUDA Tile prefill over batch/sequence shapes on L4."""
+    import sys
+    import time
+    import torch
+    sys.path.insert(0, APP_DIR)
+    os.chdir(APP_DIR)
+    from transformers import AutoModelForCausalLM
+    from kv_cache import NoCacheBatch
+    from qwen3_model import load_model
+
+    dev, dtype = "cuda", torch.bfloat16
+    ours, cfg, model_dir = load_model(model, dev, dtype, max_positions=256)
+    hf = AutoModelForCausalLM.from_pretrained(model_dir, dtype=dtype).to(dev).eval()
+    torch.manual_seed(7411)
+    results = []
+
+    def timed(fn, repeats=15):
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(repeats):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - start) * 1e3 / repeats
+
+    for batch in (1, 2, 4):
+        for seq in (32, 64, 128):
+            ids = torch.randint(0, cfg.vocab_size, (batch, seq), device=dev)
+            flat = ids.reshape(-1)
+            pos = torch.arange(seq, device=dev).repeat(batch)
+            cu = [i * seq for i in range(batch + 1)]
+            forward_batch = NoCacheBatch(cu, dev)
+
+            def hf_forward():
+                return hf(ids, use_cache=False, logits_to_keep=1).logits[:, -1, :]
+
+            def ours_forward():
+                return ours(flat, pos, forward_batch)
+
+            with torch.inference_mode():
+                ref = hf_forward().float()
+                actual = ours_forward().float()
+                diff = (actual - ref).abs().max().item()
+                greedy_match = bool(torch.equal(actual.argmax(-1), ref.argmax(-1)))
+                hf_trials, tile_trials = [], []
+                for trial in range(3):
+                    if trial % 2 == 0:
+                        hf_trials.append(timed(hf_forward))
+                        tile_trials.append(timed(ours_forward))
+                    else:
+                        tile_trials.append(timed(ours_forward))
+                        hf_trials.append(timed(hf_forward))
+                ref_ms = sorted(hf_trials)[1]
+                tile_ms = sorted(tile_trials)[1]
+            results.append({
+                "batch": batch, "seq": seq, "hf_ms": ref_ms, "cutile_ms": tile_ms,
+                "speedup_hf_over_cutile": ref_ms / tile_ms,
+                "max_abs_diff": diff, "greedy_match": greedy_match,
+                "hf_ms_trials": hf_trials, "cutile_ms_trials": tile_trials,
+            })
+    return {"gpu": torch.cuda.get_device_name(0), "model": model, "dtype": str(dtype), "results": results}
+
+
 @app.function(image=ours_image, volumes={HF_DIR: hf_cache}, timeout=3600)
 def download(models: list):
     from huggingface_hub import snapshot_download
@@ -332,8 +455,27 @@ def download(models: list):
 def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str = "l4",
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
          max_len: int = 4096, download_only: bool = False, check_only: bool = False,
-         profile_only: bool = False, final: bool = False, with_static: bool = False,
+         profile_only: bool = False, model_matrix: bool = False,
+         final: bool = False, with_static: bool = False,
          yes: bool = False):
+    if model_matrix:
+        print(f"Plan: Qwen3 HF vs CUDA Tile prefill matrix on 1x L4, 9 shapes, 5-minute cap; "
+              f"GPU charge capped near ${5 / 60 * PRICE['l4']:.2f}.")
+        if not yes:
+            raise SystemExit("Add --yes to run.")
+        import csv
+        import json
+        from pathlib import Path
+        rep = model_performance_matrix.remote(model)
+        output = Path(__file__).resolve().parent.parent / "week_04_05" / "real_qwen3_l4_matrix.csv"
+        with output.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rep["results"][0].keys())
+            writer.writeheader()
+            writer.writerows(rep["results"])
+        print(json.dumps({k: v for k, v in rep.items() if k != "results"}, indent=2))
+        print(f"Saved {len(rep['results'])} rows to {output}")
+        print(json.dumps(rep["results"], indent=2))
+        return
     if profile_only:
         print(f"Plan: decode-step profile of {model} on 1x L4 (a few minutes, ~cents).")
         if not yes:
@@ -342,11 +484,44 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         print(json.dumps(profile_decode.remote(model), indent=2))
         return
     if check_only:
-        print(f"Plan: correctness check of {model} vs HuggingFace on 1x L4 (a few minutes, ~cents).")
+        print(f"Plan: correctness check of {model} vs HuggingFace on 1x H100, max 15 minutes. "
+              f"GPU charge is capped at about ${15 / 60 * PRICE['h100']:.2f}; CPU/memory may add a small amount.")
         if not yes:
             raise SystemExit("Add --yes to run.")
         import json
+        import sqlite3
+        from pathlib import Path
         rep = check_correctness.remote(model)
+        case = rep.pop("e2e_case")
+        db_path = Path(__file__).resolve().parent.parent / "week_04_05" / "test_cases.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS qwen3_4b_prefill_cases")
+            conn.execute("""CREATE TABLE qwen3_4b_prefill_cases (
+                id INTEGER PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                model_config_json TEXT NOT NULL,
+                runtime_json TEXT NOT NULL,
+                input_ids_json TEXT NOT NULL,
+                positions_json TEXT NOT NULL,
+                dtype TEXT NOT NULL,
+                causal INTEGER NOT NULL,
+                expected_logits BLOB NOT NULL,
+                logits_rows INTEGER NOT NULL,
+                vocab_size INTEGER NOT NULL,
+                max_abs_diff REAL NOT NULL,
+                matches_huggingface INTEGER NOT NULL
+            )""")
+            conn.execute(
+                "INSERT INTO qwen3_4b_prefill_cases VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (case["model_id"], case["model_revision"], case["model_config_json"],
+                 case["runtime_json"], json.dumps(case["input_ids"]),
+                 json.dumps(case["positions"]), case["dtype"],
+                 int(case["causal"]), case["expected_logits"], case["logits_rows"],
+                 case["vocab_size"], case["max_abs_diff"], int(case["match"])),
+            )
+        print(f"Saved real Qwen3-4B HF logits to {db_path} (revision {case['model_revision']}, "
+              f"max diff {case['max_abs_diff']:.3e}, match={case['match']})")
         print(json.dumps(rep, indent=2, ensure_ascii=False))
         print("ALL MATCH" if rep["all_match"] else "MISMATCH FOUND")
         return

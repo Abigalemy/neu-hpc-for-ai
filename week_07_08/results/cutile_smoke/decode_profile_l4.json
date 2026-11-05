@@ -1,0 +1,31 @@
+{
+  "modal_run": "https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-gpQOuy28yoM4bhrZlTAOcM",
+  "gpu": "NVIDIA L4",
+  "model": "Qwen/Qwen3-4B",
+  "batches": {
+    "1": {
+      "engine_step_ms": 60.85,
+      "build_batch_ms": 0.19,
+      "forward_ms": 36.86,
+      "forward_cpu_issue_ms": 36.21,
+      "gpu_busy_ms_per_forward": 35.41,
+      "kernels_per_forward": 1994
+    },
+    "8": {
+      "engine_step_ms": 62.3,
+      "build_batch_ms": 0.26,
+      "forward_ms": 58.3,
+      "forward_cpu_issue_ms": 58.33,
+      "gpu_busy_ms_per_forward": 42.12,
+      "kernels_per_forward": 2245
+    },
+    "32": {
+      "engine_step_ms": 118.54,
+      "build_batch_ms": 0.32,
+      "forward_ms": 112.87,
+      "forward_cpu_issue_ms": 114.15,
+      "gpu_busy_ms_per_forward": 60.19,
+      "kernels_per_forward": 3109
+    }
+  }
+}

@@ -24,7 +24,8 @@ OUT=${OUT_DIR:-results}/$TAG
 mkdir -p "$OUT"
 
 COMMON=(--model "$MODEL" --url "$URL" --endpoint-type chat --streaming --tokenizer "$TOK"
-        --extra-inputs '{"ignore_eos": true, "temperature": 0}' --warmup-request-count 8 --random-seed 0)
+        --extra-inputs '{"ignore_eos": true, "temperature": 0}' --use-server-token-count
+        --warmup-request-count 8 --random-seed 0)
 
 # SCALE_PCT shrinks every request count (e.g. SCALE_PCT=25 for a cheap smoke run); minimum 8 requests.
 scale() { local n=$(( $1 * ${SCALE_PCT:-100} / 100 )); echo $(( n < 8 ? 8 : n )); }

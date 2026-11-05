@@ -24,6 +24,15 @@ class StubTok:
         return "".join(m["content"] for m in messages)
 
 
+class StubCppTok(StubTok):
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, add_special_tokens=False):
+        self.encoded.append(text)
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
 def make_client():
     hf = HFModel(HFConfig(vocab_size=200, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
                           num_attention_heads=4, num_key_value_heads=2, head_dim=16,
@@ -33,13 +42,14 @@ def make_client():
     model, cfg, _ = load_model(d, "cpu", torch.float32, max_positions=256)
     eng = LLMEngine(model, cfg, EngineConfig(cache_mode="paged", max_model_len=128, num_blocks=64),
                     eos_token_ids=[], device="cpu", dtype=torch.float32)
-    server.STATE.update(engine=eng, tok=StubTok(), name="tiny")
+    cpp_tok = StubCppTok()
+    server.STATE.update(engine=eng, tok=StubTok(), cpp_tok=cpp_tok, name="tiny")
     threading.Thread(target=eng.run_forever, daemon=True).start()
-    return TestClient(server.app), eng
+    return TestClient(server.app), eng, cpp_tok
 
 
 def test_endpoints():
-    c, eng = make_client()
+    c, eng, cpp_tok = make_client()
     try:
         r = c.post("/v1/completions", json={"prompt": "hello", "max_tokens": 6, "ignore_eos": True}).json()
         assert r["usage"]["completion_tokens"] == 6 and r["choices"][0]["finish_reason"] == "length"
@@ -64,5 +74,6 @@ def test_endpoints():
         r = c.post("/v1/completions", json={"prompt": "x" * 500, "max_tokens": 4}).json()
         assert r["choices"][0]["finish_reason"] == "error"
         assert c.get("/metrics_json").json()["finished"] >= 3
+        assert cpp_tok.encoded == ["hello", "hi", "hi", "x" * 500]
     finally:
         eng.stop()
