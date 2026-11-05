@@ -195,3 +195,41 @@ lower latency are better. A dash means that workload was not run for that config
   production server comparison.
 * `ours_static` was not included in this matrix. The full AIPerf matrix does not replace the separate
   correctness tests or prove that every possible workload is correct.
+
+## Supplemental ablation: batching and long decode
+
+After the C++ tokenizer was connected to the request path, a capped H100 run compared
+`ours_paged` (continuous admission) with `ours_static` on the same Qwen3-4B BF16 service,
+8 GB cache budget, AIPerf settings, and workloads. The static policy admits requests only after
+the running batch empties. A fourth profile compared `ours_nocache` with `ours_paged` on
+decode-heavy concurrency 8 (64 input / 1024 output tokens). Each profile used 8 warmup requests;
+profiling counts were 48 for balanced concurrency 16, 60 for mixed Poisson, and 16 for
+decode-heavy. This is a single-run ablation, not a repeated statistical study. Raw AIPerf exports and the generated table
+are in [`results/grade_ablation/`](results/grade_ablation/), and the Modal run is
+[ap-TyyWhI4PWRCQsHV5Vur5zb](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-TyyWhI4PWRCQsHV5Vur5zb).
+
+| Workload | Policy | Output tok/s | TTFT p50 / p99 (ms) | ITL p50 / p99 (ms) | E2E p50 / p99 (ms) |
+|---|---|---:|---:|---:|---:|
+| Balanced, conc 16 | Paged + continuous | 360.3 | 161.8 / 181.8 | 43.9 / 44.2 | 11,364 / 11,381 |
+| Balanced, conc 16 | Paged + static | 240.9 | 6,113 / 10,906 | 42.4 / 43.6 | 16,913 / 17,286 |
+| Mixed Poisson, 8 req/s | Paged + continuous | 427.1 | 85.0 / 1,147.5 | 90.0 / 124.5 | 21,137.9 / 31,112.0 |
+| Mixed Poisson, 8 req/s | Paged + static | 208.2 | 30,418.5 / 56,665.9 | 38.2 / 41.5 | 34,229.8 / 62,774.2 |
+| Decode-heavy, conc 8, 64 / 1024 | Paged + continuous | 236.7 | 84.6 / 85.4 | 33.8 / 33.8 | 34,604.8 / 34,615.5 |
+| Decode-heavy, conc 8, 64 / 1024 | No KV cache | 74.0 | 71.4 / 177.4 | 108.1 / 108.7 | 110,641.2 / 111,327.3 |
+
+The mixed-arrival result is consistent with head-of-line delay under static admission: p50 TTFT
+was about 30.4 s versus 85 ms for continuous admission, while static had somewhat lower ITL
+among requests once decoding. On balanced concurrency 16, static also had much higher TTFT
+and lower throughput. This supports continuous admission for these arrival patterns; one run
+does not establish general statistical significance. For long decode at concurrency 8, the
+no-cache run delivered about 3.2x lower output throughput and 3.2x higher p50 ITL than paged KV,
+consistent with repeatedly recomputing the growing context.
+
+All seven profiles completed with zero AIPerf request errors. Optional GPU/server telemetry was
+unavailable, so these measurements cannot isolate GPU kernel time or prove a kernel-level cause.
+The run used one repetition and a reduced request count for the matched concurrency profiles;
+the results should be read as a focused ablation. No vLLM run or large-cache-budget comparison
+was included in this capped supplement. It also does not implement direct block-table reads in a
+fused paged-attention kernel: the current paged backend gathers K/V through PyTorch indexing.
+The fused kernel, H100 profiling, repeated trials, and matched-budget vLLM comparison remain
+specific follow-up work rather than results claimed here.

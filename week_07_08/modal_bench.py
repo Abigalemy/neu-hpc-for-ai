@@ -52,10 +52,10 @@ ours_image = (
                  "cuda-toolkit[tileiras,nvvm,nvcc]>=13.3,<13.6", "pybind11==2.13.6")
     .env({"HF_HOME": HF_DIR,
           "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"})
-    .add_local_dir(_here, APP_DIR, ignore=_ignore)
-    .add_local_dir(_core_dir, "/root/hpc_core")
-    .add_local_dir(_tokenizer_cpp_dir, "/root/tokenizer_cpp")
-    .add_local_file(_tokenizer_header, "/root/tokenizer.h")
+    .add_local_dir(_here, APP_DIR, ignore=_ignore, copy=True)
+    .add_local_dir(_core_dir, "/root/hpc_core", copy=True)
+    .add_local_dir(_tokenizer_cpp_dir, "/root/tokenizer_cpp", copy=True)
+    .add_local_file(_tokenizer_header, "/root/tokenizer.h", copy=True)
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
         "cmake -S /root/tokenizer_cpp -B /tmp/qwen3-tokenizer-build "
@@ -132,9 +132,10 @@ def _sanity(out, model):
         open(f"{out}/sanity.json", "w").write(f"sanity request failed: {e}")
 
 
-def _run(config, model, kv_gb, workloads, scale_pct, max_minutes, max_len):
+def _run(config, model, kv_gb, workloads, scale_pct, max_minutes, max_len, output_group=None):
     os.chdir(APP_DIR)
-    out = f"/tmp/results/{config}"
+    tag = f"{output_group}/{config}" if output_group else config
+    out = f"/tmp/results/{tag}"
     os.makedirs(out, exist_ok=True)
     subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
     log = open(f"{out}/server.log", "w")
@@ -144,7 +145,7 @@ def _run(config, model, kv_gb, workloads, scale_pct, max_minutes, max_len):
         _wait_ready(server)
         _sanity(out, model)
         env = dict(os.environ, OUT_DIR="/tmp/results", SCALE_PCT=str(scale_pct))
-        cmd = ["timeout", str(max_minutes * 60), "bash", "bench/run_aiperf.sh", config,
+        cmd = ["timeout", str(max_minutes * 60), "bash", "bench/run_aiperf.sh", tag,
                f"http://localhost:{PORT}", model, model] + workloads
         rc = subprocess.run(cmd, env=env).returncode
         if rc == 124:
@@ -195,6 +196,12 @@ def ours_dev(*a):
 
 @app.function(image=ours_image, gpu="H100", **_common)
 def ours_h100(*a):
+    return _run(*a)
+
+
+# Supplemental grading ablation: the function-level deadline bounds GPU allocation, including model load.
+@app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=15 * 60)
+def ours_h100_capped(*a):
     return _run(*a)
 
 
@@ -456,8 +463,15 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
          max_len: int = 4096, download_only: bool = False, check_only: bool = False,
          profile_only: bool = False, model_matrix: bool = False,
-         final: bool = False, with_static: bool = False,
+         final: bool = False, with_static: bool = False, ablation_budget_cap: bool = False,
          yes: bool = False):
+    output_group = None
+    if ablation_budget_cap:
+        configs = "ours_paged,ours_static,ours_nocache"
+        model, gpu, kv_gb, scale_pct, max_len = "Qwen/Qwen3-4B", "h100", 8.0, 50, 4096
+        workloads = "balanced:16,mixed_poisson:8,decode_heavy:8"
+        max_minutes = 7
+        output_group = "grade_ablation"
     if model_matrix:
         print(f"Plan: Qwen3 HF vs CUDA Tile prefill matrix on 1x L4, 9 shapes, 5-minute cap; "
               f"GPU charge capped near ${5 / 60 * PRICE['l4']:.2f}.")
@@ -537,7 +551,14 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
     if gpu not in ("l4", "h100"):
         raise SystemExit("--gpu must be l4 (dev) or h100 (final)")
     wl = [w for w in workloads.split(",") if w]
-    plan = {c: (FINAL_PLAN[c][0], FINAL_PLAN[c][1]) if final else (wl, max_minutes) for c in cfgs}
+    if ablation_budget_cap:
+        plan = {
+            "ours_paged": (["balanced:16", "mixed_poisson:8", "decode_heavy:8"], max_minutes),
+            "ours_static": (["balanced:16", "mixed_poisson:8", "decode_heavy:8"], max_minutes),
+            "ours_nocache": (["decode_heavy:8"], max_minutes),
+        }
+    else:
+        plan = {c: (FINAL_PLAN[c][0], FINAL_PLAN[c][1]) if final else (wl, max_minutes) for c in cfgs}
 
     if download_only:
         print(f"Plan: download {model} into the Modal volume (CPU only, a few minutes).")
@@ -547,18 +568,28 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         return
 
     startup_min = 8  # image start + model load (+ vLLM compile) per container, rough
-    worst = sum(plan[c][1] + startup_min for c in cfgs) / 60 * PRICE[gpu]
+    if ablation_budget_cap:
+        hard_cap_min = 15
+        worst = len(cfgs) * hard_cap_min / 60 * PRICE[gpu]
+        print(f"Hard cap: {hard_cap_min} minutes per H100 function, {len(cfgs) * hard_cap_min} GPU-minutes total; "
+              f"GPU-only upper estimate ~${worst:.2f}. CPU and memory are additional.")
+    else:
+        worst = sum(plan[c][1] + startup_min for c in cfgs) / 60 * PRICE[gpu]
     print(f"Plan: {len(cfgs)} config(s) on 1x {gpu.upper()} each, model={model}, scale={scale_pct}%, kv_gb={kv_gb}")
     for c in cfgs:
         print(f"  - {c}: cap {plan[c][1]} min; workloads {plan[c][0]}")
-    print(f"      worst-case GPU cost ~ ${worst:.2f} (caps + ~{startup_min} min startup each, ~${PRICE[gpu]:.2f}/h). SHARED class credit!")
+    if ablation_budget_cap:
+        print(f"      H100 GPU-only hard upper estimate ~${worst:.2f}; CPU/memory are additional.")
+    else:
+        print(f"      worst-case GPU cost ~ ${worst:.2f} (caps + ~{startup_min} min startup each, ~${PRICE[gpu]:.2f}/h). SHARED class credit!")
     if not yes:
         raise SystemExit("Dry run only. Add --yes to start.")
 
-    args = [(c, model, kv_gb, plan[c][0], scale_pct, plan[c][1], max_len) for c in cfgs]
+    args = [((c, model, kv_gb, plan[c][0], scale_pct, plan[c][1], max_len, output_group)
+             if output_group else (c, model, kv_gb, plan[c][0], scale_pct, plan[c][1], max_len)) for c in cfgs]
     ours = [a for a in args if a[0] != "vllm"]
     vl = [a for a in args if a[0] == "vllm"]
-    ours_fn = ours_h100 if gpu == "h100" else ours_dev
+    ours_fn = ours_h100_capped if ablation_budget_cap else (ours_h100 if gpu == "h100" else ours_dev)
     vllm_fn = vllm_h100 if gpu == "h100" else vllm_dev
     handles = [ours_fn.spawn(*a) for a in ours] + [vllm_fn.spawn(*a) for a in vl]
     os.makedirs("results", exist_ok=True)
@@ -571,5 +602,8 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         print(f"{config}: {status}")
         with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
             tar.extractall("results", filter="data")
-    subprocess.run(["python3", "bench/summarize.py", "results"], stdout=open("results/summary.md", "w"))
-    print("wrote results/summary.md")
+    summary_root = os.path.join("results", output_group) if output_group else "results"
+    os.makedirs(summary_root, exist_ok=True)
+    summary_path = os.path.join(summary_root, "summary.md")
+    subprocess.run(["python3", "bench/summarize.py", summary_root], stdout=open(summary_path, "w"))
+    print(f"wrote {summary_path}")
