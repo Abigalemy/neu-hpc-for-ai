@@ -28,8 +28,9 @@ how K/V are stored and read.
 **CUDA Tile.** CUDA inference uses online-softmax FlashAttention with causal masking and GQA, plus a
 fused SwiGLU kernel. L4 checks passed against PyTorch for FP16/BF16 attention and for a small model
 using none, contiguous, and paged cache modes. Real Qwen3-4B greedy outputs matched Hugging Face for
-four prompts under no-cache, contiguous, and paged modes in a capped H100 correctness run. The full
-H100 AIPerf run below measures this CUDA Tile path.
+four prompts under no-cache, contiguous, and paged modes in a capped H100 correctness run. The original
+H100 AIPerf matrix below measures this CUDA Tile path before the direct block-table decode kernel was added;
+final-code measurements are reported in the follow-up sections.
 
 The L4 kernel and small-model checks used the shared Modal workspace and are recorded in the app's
 run history. Earlier pre-Tile AIPerf results are not included in the current performance tables.
@@ -65,7 +66,7 @@ curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
 
-The server uses Hugging Face's Python tokenizer to render the Qwen3 chat template and decode generated tokens. Actual text-to-token encoding for both endpoints goes through the C++ extension. The full H100 AIPerf matrix was collected before this extension was connected to the request path; the extension separately passed exact ID parity against Hugging Face on five representative probes, including a rendered chat-template string. No H100 performance rerun was done after this integration.
+The server uses Hugging Face's Python tokenizer to render the Qwen3 chat template and decode generated tokens. Actual text-to-token encoding for both endpoints goes through the C++ extension. The broad H100 AIPerf matrix below predates both C++ tokenizer integration and the fused block-table decode kernel. The tokenizer separately passed exact ID parity against Hugging Face on five representative probes, including a rendered chat-template string. The targeted H100 ablations later in this README use the final request path and kernel; the broad vLLM matrix was not rerun on that final code.
 
 Server flags: `--cache-mode {none,contiguous,paged}`, `--batching {continuous,static}`, `--max-num-seqs`,
 `--max-model-len`, `--block-size`, `--kv-cache-gb` (same KV budget for contiguous and paged),
@@ -78,7 +79,7 @@ The results below were produced on **Modal** (1x H100 80GB per config, Qwen3-4B,
 ```bash
 modal run --detach modal_bench.py --final --yes         # vllm + ours_{paged,contiguous,nocache}, trimmed sweeps
 modal run modal_bench.py --check-only --model Qwen/Qwen3-4B --yes  # real-weights correctness (H100, 15-min cap)
-modal run modal_bench.py --profile-only --yes           # decode-step profile (L4)
+modal run modal_bench.py --profile-only --yes           # matched gather vs block-table profile (H100)
 ```
 
 `bench/run_experiments.sh` + `bench/slurm_run.sbatch` are an equivalent path for a Slurm cluster (not used for
@@ -100,10 +101,10 @@ Workloads (all use `ignore_eos` so output lengths are exact):
 
 A short AIPerf smoke run was completed after the CUDA Tile integration: Qwen3-4B on H100, one
 baseline workload (128 input / 128 output tokens, concurrency 1, 8 measured requests), comparing
-`ours_paged` with vLLM. Both returned zero request errors. The current Tile service measured 26.7
+`ours_paged` with vLLM. Both returned zero request errors. At the time, the Tile service measured 26.7
 output tokens/s and vLLM 228.2 output tokens/s in this small run. Raw outputs are in
 `results/cutile_smoke/`; this is a pipeline smoke check, not a complete performance sweep or a
-stable performance claim. The current full-matrix results are reported in the Results section below.
+stable performance claim. The original full matrix, before the direct block-table decode kernel, is reported in the historical Results section below.
 Raw AIPerf exports and this run's two-row summary are in `results/cutile_smoke/summary.md`.
 
 A decode profile of Qwen3-4B on L4 measured about 1,994 CUDA kernels and 35.4 ms of GPU time per
@@ -112,7 +113,7 @@ and 60.2 ms per forward. This points to the eager per-layer inference path and i
 a performance bottleneck; the profile is diagnostic, not an H100 performance result. Raw measurements
 are in `results/cutile_smoke/decode_profile_l4.json`.
 
-## Results: CUDA Tile H100 matrix
+## Results: original CUDA Tile H100 matrix (before direct block-table kernel, single run)
 
 This run used Qwen3-4B BF16 on one Modal H100 per configuration, the AIPerf streaming chat endpoint,
 and `ignore_eos` with temperature 0. Each listed point is one run (no repeats). The full raw exports
@@ -134,6 +135,9 @@ indicates that generation reached the requested length; the available evidence p
 detokenization/re-tokenization accounting, not a confirmed early stop. The text-side count is 12.3%
 lower for that request, while the profile-wide mean is 0.4% below the server-reported total. All other
 exported profiles reported zero AIPerf output-length mismatch warnings.
+
+This is the original one-run matrix, collected before the direct block-table decode kernel. Its paged
+column uses the old PyTorch K/V gather path; its vLLM comparison has not been rerun against the final kernel.
 
 Selected metrics below are p50 TTFT and p50 ITL in milliseconds; output throughput is the AIPerf
 average in tokens/second. In this run, throughput uses AIPerf's text-side token count; the benchmark
@@ -158,8 +162,8 @@ lower latency are better. A dash means that workload was not run for that config
 
 * The in-house CUDA Tile server is slower than vLLM on every selected throughput comparison. At
   balanced concurrency 4/16/64, vLLM delivers about 4.4x/6.3x/10.9x the paged-server output
-  throughput. This is a useful baseline and shows optimization work remains; it should not be
-  presented as matching vLLM performance.
+  throughput. This is a historical baseline and does not measure the final fused kernel against vLLM; it
+  should not be presented as a current head-to-head comparison or as matching vLLM performance.
 * The KV-cache ablation shows its benefit more clearly at higher concurrency: at balanced concurrency
   16, paged KV reaches 494.1 output tokens/s and 31.8 ms p50 ITL, compared with 113.1 tokens/s and
   141.5 ms for no cache. These are single-run measurements.
@@ -169,15 +173,17 @@ lower latency are better. A dash means that workload was not run for that config
   contiguous. vLLM was much faster in this workload. The queueing result is consistent with the fixed
   contiguous-cache capacity limiting admission.
 * The decode profile is diagnostic rather than a benchmark result: the L4 Qwen3-4B profile recorded
-  about 1,994 CUDA kernels and 35.4 ms GPU busy time per batch-1 forward. This supports investigating
-  Python/PyTorch launch overhead, CUDA graphs, and a block-table-aware attention kernel. It does not
-  by itself prove the cause of every H100 latency result.
+  about 1,994 CUDA kernels and 35.4 ms GPU busy time per batch-1 forward. This older L4 profile motivated
+  investigating launch overhead and block-table-aware attention. The later H100 matched A/B profile and
+  isolated attention microbenchmark below test parts of that hypothesis, but do not separate GEMM, attention,
+  and launch time across a full model step.
 
 ### Correctness and measurement caveats
 
-* CPU correctness suite: 10 tests passed (including the HTTP endpoint smoke test). L4 CUDA Tile attention and small-model checks passed against
-  PyTorch; the real Qwen3-4B H100 greedy check matched Hugging Face for four prompts in no-cache,
-  contiguous, and paged modes.
+* At the time of the original matrix, 10 CPU checks passed, including an HTTP endpoint smoke test. On the
+  final code, `pytest week_07_08/test_correctness.py` passed 9 tests (logits, six generation-mode combinations,
+  preemption, and slot release). L4 CUDA Tile checks passed against PyTorch; the real Qwen3-4B H100 greedy
+  check matched Hugging Face for four prompts in no-cache, contiguous, and paged modes.
 * AIPerf marked all exported profiles complete with zero request errors. A single output-length
   warning in paged `decode_heavy_c64` was a discrepancy between text re-tokenization (898) and
   server usage (1024), not evidence that the engine stopped early. The benchmark command now asks
@@ -185,15 +191,16 @@ lower latency are better. A dash means that workload was not run for that config
 * Optional GPU/server telemetry missed heartbeats during the run, so telemetry summaries are
   incomplete. AIPerf request metrics remain available, but do not make claims based on missing GPU
   telemetry.
-* These are single runs, so small differences may be noise. vLLM and the in-house server use different
-  runtime stacks and chat templates; prompt lengths can differ slightly. Both use BF16, forced output
-  lengths, and the same AIPerf workload shapes.
-* The current implementation uses PyTorch for model operations other than the integrated CUDA Tile
-  attention and SwiGLU kernels. It does not implement CUDA graphs, chunked prefill, or a fused paged-KV
-  gather, so the vLLM comparison is a baseline for this educational implementation, not an optimized
-  production server comparison.
-* `ours_static` was not included in this matrix. The full AIPerf matrix does not replace the separate
-  correctness tests or prove that every possible workload is correct.
+* Every point in this historical broad matrix is a single run, so small differences may be noise. The
+  targeted final-code comparisons later have three runs each, but do not replace the broad matrix. vLLM and
+  the in-house server use different runtime stacks and chat templates; prompt lengths can differ slightly.
+  Both use BF16, forced output lengths, and the same AIPerf workload shapes.
+* The final implementation uses CUDA Tile for attention/SwiGLU and PyTorch for the remaining model
+  operations. Paged decode now uses the direct block-table kernel documented below. CUDA graphs and chunked
+  prefill are not implemented. This original vLLM matrix predates the direct kernel; there is no final-code
+  broad vLLM comparison.
+* `ours_static` was not included in this historical broad matrix; it appears in the repeated final-code
+  batching ablation below. These measurements do not prove correctness for every possible workload.
 
 ## Final block-table kernel: profile and repeated ablations
 
@@ -241,9 +248,10 @@ per-run metrics are in the linked raw directories above and in the
 
 The repeated runs show the same qualitative pattern: continuous admission reduces queueing delay
 for these open-loop and concurrent workloads, while KV caching substantially reduces per-token
-decode cost on long outputs. Run-to-run H100 variation is visible, so the table reports mean and
-sample standard deviation; individual results remain available. The implementation is not claimed to
-match vLLM: the original broad matrix remains useful as a baseline, while the new kernel and these
+decode cost on long outputs. Run-to-run H100 variation is visible, including larger relative spread for
+balanced c16 throughput and decode-heavy ITL; treat those means as directional rather than precise rankings.
+The table reports mean and sample standard deviation, and individual results remain available. The
+implementation is not claimed to match vLLM: the original broad matrix remains useful as a baseline, while the new kernel and these
 ablation results document targeted improvements and their limits.
 
 Correctness was checked with the CPU suite (9 tests), and a real Qwen3-4B H100 greedy-generation
@@ -264,10 +272,16 @@ mean ± sample standard deviation across the three runs.
 | No cache | 49.91 ± 1.76 | 22.01 ± 0.83 | 19.99 ± 0.69 | 2,560.2 ± 89.0 |
 | Paged + direct block-table kernel | 49.66 ± 1.11 | 23.08 ± 0.57 | 20.08 ± 0.42 | 2,573.5 ± 54.0 |
 
-The earlier single run showed 43.1 tok/s for contiguous and 51.3 tok/s for no-cache. The contiguous
-shortfall recurred at about 8.2% in this targeted run, while paged with the fused kernel was nearly
-tied with no-cache. This is a short-context, single-request observation; it does not show that KV
-caching generally reduces performance.
+The earlier single run showed 43.1 tok/s for contiguous, 51.3 tok/s for no-cache, and 62.1 tok/s for
+paged. In the final-code repeat, contiguous was about 8.2% slower than no-cache, while fused paged and
+no-cache were nearly tied. This points more specifically to the contiguous path (or measurement variation)
+than to a general penalty from cached decode: contiguous still invokes Tile attention per sequence, while
+paged uses the fused kernel. The synthetic microbenchmark supports the cost of the old per-sequence Tile
+path, but does not directly profile contiguous model steps. The old paged point (62.1 tok/s) and final-code
+mean (49.7 tok/s) are not a matched before/after AIPerf experiment: the old result is one run and the new
+result is a three-run mean. The same-H100 whole-forward A/B found the fused path faster than its gather
+reference, but it does not explain that cross-run difference. The contiguous-path cause remains unproven;
+this short-context, single-request result does not show that KV caching generally reduces performance.
 
 A separate H100 attention microbenchmark used synthetic BF16 Qwen3-shaped Q/K/V tensors (32 query
 heads, 8 KV heads, head dimension 128, block size 16), shuffled physical block IDs, and contexts of
@@ -287,11 +301,10 @@ uses the fused block-table kernel. All six cases passed output comparison (`atol
 At batch 8–32, gather accounts for roughly 2–9% of the old combined time; repeated per-sequence Tile
 attention calls cost more. The direct kernel is 2.0–13.3× faster in those tested cases, but is slightly
 slower at batch 1 / context 1024. The data points to attention execution and launch structure as a
-larger high-batch cost than copying K/V alone. A plausible explanation for the short baseline anomaly
-is that no-cache recomputes a full query sequence and exposes more query tiles, while cached decode
-handles one query token at a time; better GPU parallelism can offset some redundant work at short
-contexts. This remains a hypothesis: this run did not profile a no-cache full-model step against a
-contiguous full-model step, and optional GPU telemetry was unavailable.
+larger high-batch cost than copying K/V alone. Because fused paged is nearly tied with no-cache while
+contiguous is slower, the short-context anomaly is more consistent with a contiguous-path issue or
+measurement variation than a general cached-decode utilization problem. The benchmark does not isolate
+the contiguous cache path, so this remains a hypothesis; optional GPU telemetry was unavailable.
 
 Raw AIPerf exports, the full microbenchmark data, and the per-run audit are in
 [`results/gap_study/`](results/gap_study/); the detailed report is
