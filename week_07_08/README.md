@@ -310,3 +310,28 @@ Raw AIPerf exports, the full microbenchmark data, and the per-run audit are in
 [`results/gap_study/`](results/gap_study/); the detailed report is
 [`results/gap_study/summary.md`](results/gap_study/summary.md). Modal run:
 [ap-hYtLK44pCoN3y5eA8QQEPD](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-hYtLK44pCoN3y5eA8QQEPD).
+
+## Final-code comparison against vLLM
+
+To close the version gap in the historical matrix, the final fused paged implementation and vLLM
+were measured on separate H100 80 GB containers with the same Qwen3-4B BF16 model, AIPerf settings,
+and workload shapes. This is a targeted, single-run comparison (not a replacement for the repeated
+ablations above). All ten profiles completed with zero request errors and zero output-length mismatch
+warnings. The values below are output tokens/s, p50 TTFT (ms), and p50 ITL (ms); full raw exports and
+the generated table are in [`results/final_kernel_compare/`](results/final_kernel_compare/).
+
+| Workload | Final paged tok/s / TTFT / ITL | vLLM tok/s / TTFT / ITL | vLLM throughput ratio |
+|---|---:|---:|---:|
+| Baseline, c1, 128 in / 128 out | 26.4 / 40.5 / 35.9 | 228.7 / 28.6 / 4.2 | 8.7× |
+| Balanced, c16, 256 / 256 | 402.4 / 202.8 / 37.7 | 3,212.5 / 94.7 / 4.6 | 8.0× |
+| Balanced, c64, 256 / 256 | 1,467.2 / 410.9 / 42.1 | 9,111.1 / 220.8 / 6.0 | 6.2× |
+| Mixed Poisson, 8 req/s | 735.5 / 168.2 / 60.8 | 1,787.5 / 36.2 / 5.3 | 2.4× |
+| Pressure, c128, 1024 in / 512 out | 780.6 / 49,532.8 / 55.7 | 6,253.6 / 5,417.1 / 9.7 | 8.0× |
+
+The final paged server remains slower than vLLM on every tested workload, while its relative gap is
+smaller on the mixed open-loop workload than on the other tested shapes. This comparison supports
+the performance analysis without claiming parity with a production inference engine. The single
+baseline result (26.4 tok/s) is substantially below the separate three-run final-code baseline mean
+(49.66 ± 1.11 tok/s); these are not paired runs, and that variability is a limitation rather than
+something explained by this experiment. Optional GPU telemetry was unavailable. Modal run:
+[ap-mmDbuD2n0K0n1kH9iOcdog](https://modal.com/apps/neu-info5100-oak-spr-2025/main/ap-mmDbuD2n0K0n1kH9iOcdog).

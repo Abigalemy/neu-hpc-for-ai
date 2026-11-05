@@ -215,6 +215,11 @@ def vllm_h100(*a):
     return _run(*a)
 
 
+@app.function(image=vllm_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=15 * 60)
+def vllm_h100_capped(*a):
+    return _run(*a)
+
+
 @app.function(image=ours_image, gpu="H100", volumes={HF_DIR: hf_cache}, timeout=900)
 def check_correctness(model: str):
     """Real weights + real tokenizer: our engine (every cache mode, concurrent requests) vs HuggingFace.
@@ -608,10 +613,17 @@ def download(models: list):
 def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str = "l4",
          workloads: str = "baseline", kv_gb: float = 2.0, scale_pct: int = 100, max_minutes: int = 40,
          max_len: int = 4096, download_only: bool = False, check_only: bool = False,
-         profile_only: bool = False, gap_study_only: bool = False, model_matrix: bool = False,
+         profile_only: bool = False, gap_study_only: bool = False, final_kernel_compare: bool = False,
+         results_group: str = "", model_matrix: bool = False,
          final: bool = False, with_static: bool = False, ablation_budget_cap: bool = False,
          yes: bool = False):
-    output_group = None
+    output_group = results_group or None
+    if final_kernel_compare:
+        configs = "ours_paged,vllm"
+        model, gpu, kv_gb, scale_pct, max_len = "Qwen/Qwen3-4B", "h100", 8.0, 100, 4096
+        workloads = "baseline,balanced:16+64,mixed_poisson:8,pressure"
+        max_minutes = 10
+        output_group = "final_kernel_compare"
     if ablation_budget_cap:
         configs = "ours_paged,ours_static,ours_nocache"
         model, gpu, kv_gb, scale_pct, max_len = "Qwen/Qwen3-4B", "h100", 8.0, 50, 4096
@@ -663,6 +675,12 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         print(json.dumps({"microbench": report["microbench"], "status": report["status"]}, indent=2))
         print(f"Saved raw profiles and microbenchmark to {result_dir}")
         return
+    if final_kernel_compare:
+        hard_cap_min = 15
+        worst_gpu = len(configs.split(",")) * hard_cap_min / 60 * PRICE["h100"]
+        print(f"Plan: final paged kernel vs vLLM on baseline, balanced c16/c64, mixed Poisson r8, and pressure; "
+              f"each H100 container has a {hard_cap_min}-minute hard cap. "
+              f"GPU-only maximum ~${worst_gpu:.2f}; CPU/memory extra.")
     if check_only:
         print(f"Plan: correctness check of {model} vs HuggingFace on 1x H100, max 15 minutes. "
               f"GPU charge is capped at about ${15 / 60 * PRICE['h100']:.2f}; CPU/memory may add a small amount.")
@@ -733,7 +751,7 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
         return
 
     startup_min = 8  # image start + model load (+ vLLM compile) per container, rough
-    if ablation_budget_cap:
+    if ablation_budget_cap or final_kernel_compare:
         hard_cap_min = 15
         worst = len(cfgs) * hard_cap_min / 60 * PRICE[gpu]
         print(f"Hard cap: {hard_cap_min} minutes per H100 function, {len(cfgs) * hard_cap_min} GPU-minutes total; "
@@ -743,7 +761,7 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
     print(f"Plan: {len(cfgs)} config(s) on 1x {gpu.upper()} each, model={model}, scale={scale_pct}%, kv_gb={kv_gb}")
     for c in cfgs:
         print(f"  - {c}: cap {plan[c][1]} min; workloads {plan[c][0]}")
-    if ablation_budget_cap:
+    if ablation_budget_cap or final_kernel_compare:
         print(f"      H100 GPU-only hard upper estimate ~${worst:.2f}; CPU/memory are additional.")
     else:
         print(f"      worst-case GPU cost ~ ${worst:.2f} (caps + ~{startup_min} min startup each, ~${PRICE[gpu]:.2f}/h). SHARED class credit!")
@@ -754,8 +772,8 @@ def main(configs: str = "ours_paged", model: str = "Qwen/Qwen3-0.6B", gpu: str =
              if output_group else (c, model, kv_gb, plan[c][0], scale_pct, plan[c][1], max_len)) for c in cfgs]
     ours = [a for a in args if a[0] != "vllm"]
     vl = [a for a in args if a[0] == "vllm"]
-    ours_fn = ours_h100_capped if ablation_budget_cap else (ours_h100 if gpu == "h100" else ours_dev)
-    vllm_fn = vllm_h100 if gpu == "h100" else vllm_dev
+    ours_fn = ours_h100_capped if (ablation_budget_cap or final_kernel_compare) else (ours_h100 if gpu == "h100" else ours_dev)
+    vllm_fn = vllm_h100_capped if final_kernel_compare else (vllm_h100 if gpu == "h100" else vllm_dev)
     handles = [ours_fn.spawn(*a) for a in ours] + [vllm_fn.spawn(*a) for a in vl]
     os.makedirs("results", exist_ok=True)
     for h in handles:  # configs run in parallel on separate GPUs: same cost, less wall-clock
