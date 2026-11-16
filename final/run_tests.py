@@ -52,6 +52,22 @@ def compare_matmul(dtype, y, e):
     return bool(ok.all()), strict, float(d.max())
 
 
+def compare_attention(dtype, y, e, vmax):
+    """Attention tolerance, derived from the arithmetic rather than tuned on observed errors.
+    float32 : same as compare_matmul.
+    bfloat16: the fused kernel rounds P = exp(s - m) to bf16 before P@V. bf16 has 8 significant bits, so one rounding
+              has relative error <= u = 2**-8 (NOT 2**-9: an earlier version of this comment had that off by one bit).
+              Each weight then has relative error <= u, so |dO| <= u * sum_j p_j |v_j| / l <= u * max|V|. The output and
+              the reference are each rounded to bf16 as well (<= u |e| each).  =>  |y - e| <= 2**-8 * (max|V| + 2|e|).
+    """
+    if dtype == "float32":
+        return compare_matmul(dtype, y, e)
+    d = np.abs(y.astype(np.float64) - e.astype(np.float64))
+    ok = d <= 2.0 ** -8 * (vmax + 2.0 * np.abs(e))
+    strict = np.array_equal(y.view(np.uint32), e.view(np.uint32))
+    return bool(ok.all()), strict, float(d.max())
+
+
 def param(db, mid, name):
     return db.execute("SELECT COALESCE(int_value, real_value) FROM module_param WHERE module_id=? AND name=?",
                       (mid, name)).fetchone()[0]
@@ -234,10 +250,39 @@ def run_argmax(db, binary):
     return report("Greedy argmax (exact ids required)", out)
 
 
+def run_attention(db, binary):
+    out = []
+    for mid, dtype in db.execute("SELECT id, dtype FROM module WHERE kind='attention'").fetchall():
+        hq, hkv = param(db, mid, "num_heads"), param(db, mid, "num_kv_heads")
+        n = n_ok = n_strict = 0
+        worst = 0.0
+        for cid, label in db.execute("SELECT id, label FROM test_case WHERE module_id=?", (mid,)).fetchall():
+            qd, qs, _ = case_tensor(db, cid, "input", "q")
+            kd, ks, _ = case_tensor(db, cid, "input", "k")
+            vd, vs, _ = case_tensor(db, cid, "input", "v")
+            ed, es, _ = case_tensor(db, cid, "expected", "o")
+            write("/tmp/q.bin", qd); write("/tmp/k.bin", kd); write("/tmp/v.bin", vd)
+            n_q, n_kv = qs.split("x")[0], ks.split("x")[0]
+            r = subprocess.run([binary, dtype, str(hq), str(hkv), n_q, n_kv, "/tmp/q.bin", "/tmp/k.bin", "/tmp/v.bin", "/tmp/o.bin"],
+                               capture_output=True, text=True)
+            n += 1
+            if r.returncode != 0:
+                print(f"  ! attention {dtype} {hq}/{hkv} {label}: binary failed: {r.stderr.strip()[:300]}")
+                continue
+            e = load(ed, dtype, es)
+            vmax = float(np.abs(load(vd, dtype, vs)).max())
+            ok, strict, maxabs = compare_attention(dtype, load(open("/tmp/o.bin", "rb").read(), dtype, es), e, vmax)
+            n_ok += ok; n_strict += strict; worst = max(worst, maxabs / float(np.abs(e).max()))
+            if not ok:
+                print(f"  FAIL attention {dtype} {hq}/{hkv} {label}: max abs err {maxabs:.3e} (max|e| {float(np.abs(e).max()):.3e}, max|V| {vmax:.2f}, bound at max|e| {2.0 ** -8 * (vmax + 2 * float(np.abs(e).max())):.3e})")
+        out.append((f"attention {dtype} heads={hq}/{hkv} (worst = rel. to max|e|)", n, n_ok, n_strict, worst))
+    return report("Flash attention (causal GQA over KV cache)", out)
+
+
 if __name__ == "__main__":
     db = sqlite3.connect(sys.argv[1])
     build = sys.argv[2]
-    which = sys.argv[3:] or ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax"]
+    which = sys.argv[3:] or ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention"]
     results = []
     if "rmsnorm" in which:
         results.append(run_rmsnorm(db, f"{build}/rmsnorm_test"))
@@ -251,6 +296,8 @@ if __name__ == "__main__":
         results.append(run_linear(db, f"{build}/linear_test"))
     if "argmax" in which:
         results.append(run_argmax(db, f"{build}/argmax_test"))
+    if "attention" in which:
+        results.append(run_attention(db, f"{build}/attention_test"))
     ok = all(results)
     print("\nALL PASS (tolerance)" if ok else "\nSOME CASES FAILED")
     sys.exit(0 if ok else 1)

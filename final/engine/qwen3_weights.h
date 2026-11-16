@@ -1,0 +1,157 @@
+// Weight loading without PyTorch: parse safetensors files and config.json, copy every tensor to the GPU ONCE.
+//
+// safetensors layout: 8-byte little-endian header size N, then N bytes of JSON
+//   {"name": {"dtype": "BF16", "shape": [..], "data_offsets": [begin, end]}, ..., "__metadata__": {...}},
+// then the raw tensor bytes (offsets are relative to the end of the header).
+#pragma once
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+// ---- a minimal JSON reader (objects, arrays, strings, numbers, true/false/null), enough for the two file types ----
+struct JV {
+    enum Kind { NUL, NUM, STR, ARR, OBJ } t = NUL;
+    double num = 0;
+    std::string str;
+    std::vector<JV> arr;
+    std::vector<std::pair<std::string, JV>> obj;
+    const JV* get(const char* k) const {
+        for (auto& p : obj) if (p.first == k) return &p.second;
+        return nullptr;
+    }
+};
+
+static void json_ws(const char*& p) { while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') ++p; }
+
+static JV json_parse(const char*& p) {
+    json_ws(p);
+    JV v;
+    if (*p == '{') {
+        v.t = JV::OBJ; ++p; json_ws(p);
+        if (*p == '}') { ++p; return v; }
+        while (true) {
+            json_ws(p); JV k = json_parse(p); json_ws(p); ++p;  // ':'
+            JV val = json_parse(p);
+            v.obj.emplace_back(k.str, std::move(val));
+            json_ws(p);
+            if (*p == ',') { ++p; continue; }
+            ++p; break;  // '}'
+        }
+    } else if (*p == '[') {
+        v.t = JV::ARR; ++p; json_ws(p);
+        if (*p == ']') { ++p; return v; }
+        while (true) {
+            v.arr.push_back(json_parse(p)); json_ws(p);
+            if (*p == ',') { ++p; continue; }
+            ++p; break;  // ']'
+        }
+    } else if (*p == '"') {
+        v.t = JV::STR; ++p;
+        while (*p != '"') { if (*p == '\\') ++p; v.str += *p++; }
+        ++p;
+    } else if (!std::strncmp(p, "true", 4)) { v.t = JV::NUM; v.num = 1; p += 4; }
+    else if (!std::strncmp(p, "false", 5)) { v.t = JV::NUM; v.num = 0; p += 5; }
+    else if (!std::strncmp(p, "null", 4)) { v.t = JV::NUL; p += 4; }
+    else { char* end; v.t = JV::NUM; v.num = std::strtod(p, &end); p = end; }
+    return v;
+}
+
+struct DevTensor {
+    void* ptr = nullptr;
+    std::vector<int64_t> shape;
+    size_t bytes = 0;
+};
+
+struct Qwen3Config {
+    int hidden = 0, inter = 0, layers = 0, hq = 0, hkv = 0, head_dim = 128, vocab = 0;
+    float eps = 1e-6f;
+    double rope_theta = 1e6;
+    bool tie_embeddings = true;
+    bool has_rope_scaling = false;   // YaRN etc.: not supported yet, the engine refuses to run with it
+};
+
+static std::string slurp(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); std::exit(2); }
+    std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    std::string s(n, '\0');
+    if (std::fread(&s[0], 1, n, f) != (size_t)n) std::exit(2);
+    std::fclose(f);
+    return s;
+}
+
+static Qwen3Config load_config(const std::string& dir) {
+    std::string text = slurp(dir + "/config.json");
+    const char* p = text.c_str();
+    JV j = json_parse(p);
+    auto num = [&](const char* k, double dflt) { const JV* v = j.get(k); return v && v->t == JV::NUM ? v->num : dflt; };
+    Qwen3Config c;
+    c.hidden = (int)num("hidden_size", 0);
+    c.inter = (int)num("intermediate_size", 0);
+    c.layers = (int)num("num_hidden_layers", 0);
+    c.hq = (int)num("num_attention_heads", 0);
+    c.hkv = (int)num("num_key_value_heads", 0);
+    c.head_dim = (int)num("head_dim", c.hidden / c.hq);
+    c.vocab = (int)num("vocab_size", 0);
+    c.eps = (float)num("rms_norm_eps", 1e-6);
+    c.rope_theta = num("rope_theta", 1e6);
+    c.tie_embeddings = num("tie_word_embeddings", 1) != 0;
+    const JV* rs = j.get("rope_scaling");
+    c.has_rope_scaling = rs && rs->t == JV::OBJ;
+    return c;
+}
+
+// Loads every *.safetensors file in `dir` to the GPU (BF16 only). Called once at start-up.
+static std::map<std::string, DevTensor> load_weights_to_gpu(const std::string& dir) {
+    std::vector<std::string> files;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d)) {
+            std::string n = e->d_name;
+            if (n.size() > 12 && n.compare(n.size() - 12, 12, ".safetensors") == 0) files.push_back(dir + "/" + n);
+        }
+        closedir(d);
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) { std::fprintf(stderr, "no .safetensors files in %s\n", dir.c_str()); std::exit(2); }
+
+    std::map<std::string, DevTensor> out;
+    for (auto& path : files) {
+        int fd = open(path.c_str(), O_RDONLY);
+        struct stat st; fstat(fd, &st);
+        const uint8_t* base = (const uint8_t*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        uint64_t hlen; std::memcpy(&hlen, base, 8);
+        std::string header((const char*)base + 8, hlen);
+        const char* p = header.c_str();
+        JV j = json_parse(p);
+        const uint8_t* data = base + 8 + hlen;
+        for (auto& kv : j.obj) {
+            if (kv.first == "__metadata__") continue;
+            const JV& t = kv.second;
+            if (t.get("dtype")->str != "BF16") { std::fprintf(stderr, "%s: only BF16 supported\n", kv.first.c_str()); std::exit(2); }
+            size_t b = (size_t)t.get("data_offsets")->arr[0].num, e = (size_t)t.get("data_offsets")->arr[1].num;
+            DevTensor dt;
+            for (auto& s : t.get("shape")->arr) dt.shape.push_back((int64_t)s.num);
+            dt.bytes = e - b;
+            if (cudaMalloc(&dt.ptr, dt.bytes) != cudaSuccess) { std::fprintf(stderr, "out of GPU memory loading %s\n", kv.first.c_str()); std::exit(2); }
+            if (cudaMemcpy(dt.ptr, data + b, dt.bytes, cudaMemcpyHostToDevice) != cudaSuccess) std::exit(2);
+            out[kv.first] = dt;
+        }
+        munmap((void*)base, st.st_size);
+        close(fd);
+    }
+    return out;
+}

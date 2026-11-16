@@ -213,6 +213,38 @@ def gen_argmax(db):
             add_case(db, mid, "ties_and_negative", {"logits": tie}, {"ids": torch.argmax(tie, dim=-1).to(torch.int32)})
 
 
+def gen_attention(db):
+    """Causal GQA attention over a KV cache. Reference = HF eager_attention_forward run in fp32 on the stored
+    (bf16-valued) inputs, then cast to the activation dtype: the closest thing to the mathematical truth, so a fused
+    kernel that keeps its softmax in fp32 is not penalised for HF's bf16 intermediate rounding.
+
+    Q: [n_q, Hq, 128]; K, V: [n_kv, Hkv, 128] (the cache); the n_q queries are the last n_q positions.
+    """
+    import types
+
+    import torch
+    from transformers.models.qwen3.modeling_qwen3 import eager_attention_forward
+    g = torch.Generator().manual_seed(6)
+    D = 128
+    shapes = [(1, 1), (1, 17), (1, 500), (3, 3), (17, 17), (33, 33), (16, 300), (5, 1000), (1, 1100)]
+    combos = [("float32", torch.float32, 32, 8), ("bfloat16", torch.bfloat16, 32, 8),
+              ("bfloat16", torch.bfloat16, 32, 4), ("bfloat16", torch.bfloat16, 16, 8)]
+    for dtype_name, dtype, hq, hkv in combos:
+        mid = add_module(db, "attention", dtype_name, {"num_heads": hq, "num_kv_heads": hkv, "head_dim": D})
+        for n_q, n_kv in shapes:
+            # scores ~ N(0, 1) * scale-ish: unit-variance q, k give a realistic, not-too-peaked softmax
+            q = torch.randn(n_q, hq, D, generator=g).to(dtype)
+            k = torch.randn(n_kv, hkv, D, generator=g).to(dtype)
+            v = torch.randn(n_kv, hkv, D, generator=g).to(dtype)
+            module = types.SimpleNamespace(num_key_value_groups=hq // hkv, training=False)
+            mask = torch.full((n_q, n_kv), float("-inf")).triu(diagonal=n_kv - n_q + 1)[None, None]
+            out, _ = eager_attention_forward(module, q.float().permute(1, 0, 2)[None], k.float().permute(1, 0, 2)[None],
+                                             v.float().permute(1, 0, 2)[None], mask, scaling=D ** -0.5, dropout=0.0)
+            o = out[0].to(dtype).contiguous()          # HF returns [B, n_q, Hq, D]
+            assert o.shape == (n_q, hq, D), o.shape
+            add_case(db, mid, f"q{n_q}_kv{n_kv}", {"q": q, "k": k, "v": v}, {"o": o})
+
+
 @app.function(image=image, timeout=900)
 def generate() -> bytes:
     path = "/tmp/test_cases.db"
@@ -226,6 +258,7 @@ def generate() -> bytes:
     gen_embedding(db)
     gen_linear(db)
     gen_argmax(db)
+    gen_attention(db)
     db.commit()
     for t in ("module", "test_case", "case_tensor"):
         print(t, db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])

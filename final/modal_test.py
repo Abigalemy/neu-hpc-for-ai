@@ -20,14 +20,18 @@ image = (
 )
 PRICE_L4 = 0.80  # $/hour approx.
 
-TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax"]
-BUILD = "cd /root/final && mkdir -p build && " + " && ".join(
-    f"nvcc --enable-tile -std=c++20 -arch=sm_80 -O2 tests/{t}_test.cu -o build/{t}_test" for t in TESTS)
+TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention", "engine", "engine_bench", "gemm_sweep", "attn_sweep"]
+def build_cmd(arch):
+    return "cd /root/final && mkdir -p build && " + " && ".join(
+        f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{t}_test.cu -o build/{t}_test" for t in TESTS)
 
 
-def _compile():
+BUILD = build_cmd("sm_80")
+
+
+def _compile(arch="sm_80"):
     import subprocess
-    r = subprocess.run(BUILD, shell=True, capture_output=True, text=True)
+    r = subprocess.run(build_cmd(arch), shell=True, capture_output=True, text=True)
     print(f"compile exit code: {r.returncode}")
     print((r.stdout + r.stderr)[-6000:])
     return r.returncode
