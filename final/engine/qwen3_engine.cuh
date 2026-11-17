@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include "qwen3_weights.h"
+#include "qwen3_rope_table.h"
 #include "../tests/common.h"
 #include "../kernels/qwen3_add_tile.cuh"
 #include "../kernels/qwen3_argmax_tile.cuh"
@@ -59,10 +60,10 @@ static cudaError_t rope_dispatch(bf16* q, bf16* k, const bf16* c, const bf16* s,
 }
 
 static cudaError_t attention_dispatch(const bf16* q, const bf16* k, const bf16* v, bf16* o, int n_q, int n_kv, int hq,
-                                      int hkv) {
-    if (hq == 16 && hkv == 8) return launch_flash_attention<bf16, 16, 8>(q, k, v, o, n_q, n_kv);
-    if (hq == 32 && hkv == 8) return launch_flash_attention<bf16, 32, 8>(q, k, v, o, n_q, n_kv);
-    if (hq == 32 && hkv == 4) return launch_flash_attention<bf16, 32, 4>(q, k, v, o, n_q, n_kv);
+                                      int hkv, const DecodeWorkspace* ws) {
+    if (hq == 16 && hkv == 8) return launch_attention_auto<bf16, 16, 8>(q, k, v, o, n_q, n_kv, ws);
+    if (hq == 32 && hkv == 8) return launch_attention_auto<bf16, 32, 8>(q, k, v, o, n_q, n_kv, ws);
+    if (hq == 32 && hkv == 4) return launch_attention_auto<bf16, 32, 4>(q, k, v, o, n_q, n_kv, ws);
     std::fprintf(stderr, "attention: unsupported heads %d/%d\n", hq, hkv);
     return cudaErrorInvalidValue;
 }
@@ -77,11 +78,15 @@ public:
     int max_len, max_chunk, max_logit_rows;
     bool profile = false;   // when true, forward() times every stage with CUDA events (see prof_report)
 
-    Qwen3Engine(const std::string& dir, int max_len_, int max_chunk_, int max_logit_rows_ = 1)
+    // yarn_factor > 0 turns YaRN on (original context 32768) even if the checkpoint's config has no rope_scaling, as
+    // needed for Qwen3-4B at 128K (factor 4). If it is <= 0 the environment variable QWEN3_YARN is used the same way.
+    Qwen3Engine(const std::string& dir, int max_len_, int max_chunk_, int max_logit_rows_ = 1, double yarn_factor = 0)
         : max_len(max_len_), max_chunk(max_chunk_), max_logit_rows(max_logit_rows_) {
         cfg = load_config(dir);
         if (cfg.head_dim != FA_D) { std::fprintf(stderr, "head_dim must be 128\n"); std::exit(2); }
-        if (cfg.has_rope_scaling) { std::fprintf(stderr, "rope_scaling (YaRN) is not supported yet\n"); std::exit(2); }
+        if (cfg.unsupported_rope_scaling) { std::fprintf(stderr, "this rope_scaling type is not supported (only default and YaRN)\n"); std::exit(2); }
+        if (yarn_factor <= 0 && std::getenv("QWEN3_YARN")) yarn_factor = std::atof(std::getenv("QWEN3_YARN"));
+        if (yarn_factor > 0) { cfg.yarn = true; cfg.yarn_factor = yarn_factor; }
 
         // 1) weights to the GPU, once
         weights_ = load_weights_to_gpu(dir);
@@ -112,6 +117,10 @@ public:
         kraw_ = alloc<bf16>(N * KD); kn_ = alloc<bf16>(N * KD); v_ = alloc<bf16>(N * KD);
         mlp_h_ = alloc<bf16>(N * cfg.inter);
         logits_ = alloc<bf16>((size_t)max_logit_rows * cfg.vocab);
+        // split-KV decode workspace (fp32 partial softmax states)
+        dec_ws_.o = alloc<float>((size_t)cfg.hq * FD_SMAX * FD_BR * FA_D);
+        dec_ws_.m = alloc<float>((size_t)cfg.hq * FD_SMAX * FD_BR);
+        dec_ws_.l = alloc<float>((size_t)cfg.hq * FD_SMAX * FD_BR);
 
         // 4) RoPE tables [max_len, 64] (cos, sin), built like HF: fp32 inverse frequencies, rounded to bf16
         build_rope_tables();
@@ -154,7 +163,7 @@ public:
                 CK(cudaMemcpyAsync(vcache_[l] + (size_t)start_pos * KD, v_, (size_t)n * KD * sizeof(bf16), cudaMemcpyDeviceToDevice));
             });
             stage("attention", 2.0 * (start_pos + nn) * KD * 2, 4.0 * HQ * FA_D * pairs,
-                  [&] { CKL(attention_dispatch(qn_, kcache_[l], vcache_[l], attn_, n, start_pos + n, HQ, HKV)); });
+                  [&] { CKL(attention_dispatch(qn_, kcache_[l], vcache_[l], attn_, n, start_pos + n, HQ, HKV, &dec_ws_)); });
             stage("o_proj", lin_bytes(H, QD), lin_flops(H, QD), [&] { CKL(launch_linear<bf16>(attn_, L.wo, o_, n, QD, H)); });
             stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H)); });
             std::swap(x, other);
@@ -257,6 +266,7 @@ private:
     int *d_tokens_ = nullptr, *d_pos_ = nullptr, *d_argmax_ = nullptr;
     bf16 *xa_, *xb_, *h_, *o_, *qraw_, *qn_, *attn_, *kraw_, *kn_, *v_, *mlp_h_, *logits_;
     bf16 *d_cos_ = nullptr, *d_sin_ = nullptr;
+    DecodeWorkspace dec_ws_;
 
     template <typename X>
     X* alloc(size_t n) {
@@ -272,19 +282,20 @@ private:
     }
 
     void build_rope_tables() {
-        const int half = FA_D / 2;
-        std::vector<float> inv(half);
-        for (int i = 0; i < half; ++i)
-            inv[i] = 1.0f / std::pow((float)cfg.rope_theta, (float)(2 * i) / (float)FA_D);
-        std::vector<bf16> c((size_t)max_len * half), s((size_t)max_len * half);
-        for (int p = 0; p < max_len; ++p)
-            for (int i = 0; i < half; ++i) {
-                float f = (float)p * inv[i];
-                c[(size_t)p * half + i] = __float2bfloat16(std::cos(f));
-                s[(size_t)p * half + i] = __float2bfloat16(std::sin(f));
-            }
-        d_cos_ = alloc<bf16>(c.size()); d_sin_ = alloc<bf16>(s.size());
-        CK(cudaMemcpy(d_cos_, c.data(), c.size() * sizeof(bf16), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(d_sin_, s.data(), s.size() * sizeof(bf16), cudaMemcpyHostToDevice));
+        RopeParams rp;
+        rp.head_dim = FA_D;
+        rp.theta = cfg.rope_theta;
+        rp.yarn = cfg.yarn;
+        rp.factor = cfg.yarn_factor;
+        rp.orig_max = cfg.yarn_orig_max;
+        rp.beta_fast = cfg.yarn_beta_fast;
+        rp.beta_slow = cfg.yarn_beta_slow;
+        rp.attention_factor = cfg.yarn_attention_factor;
+        std::vector<bf16> t = rope_tables_bf16(rp, max_len);          // cos then sin, [max_len, 64] each
+        const size_t n = (size_t)max_len * (FA_D / 2);
+        d_cos_ = alloc<bf16>(n); d_sin_ = alloc<bf16>(n);
+        CK(cudaMemcpy(d_cos_, t.data(), n * sizeof(bf16), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_sin_, t.data() + n, n * sizeof(bf16), cudaMemcpyHostToDevice));
+        if (cfg.yarn) std::printf("RoPE: YaRN factor %g, original context %d\n", cfg.yarn_factor, cfg.yarn_orig_max);
     }
 };

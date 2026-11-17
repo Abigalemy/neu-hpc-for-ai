@@ -3,7 +3,8 @@
   modal run e2e_test.py                         # prints the plan only
   modal run e2e_test.py --yes                   # Qwen3-0.6B on 1x L4, hard cap 25 min
   modal run e2e_test.py --yes --model Qwen/Qwen3-4B
-  modal run e2e_test.py --yes --model Qwen/Qwen3-4B --gpu h100     # big tiles + bf16-P attention
+  modal run e2e_test.py --yes --model Qwen/Qwen3-4B --gpu h100     # big tiles + split-P attention
+  modal run e2e_test.py --yes --model Qwen/Qwen3-0.6B --gpu h100 --long 8192 --yarn 4 --ab   # 8K prompt, YaRN factor 4
 
 What is checked:
   * teacher forcing: prefill the prompt in one chunk, then feed HF's own continuation one token at a time
@@ -35,7 +36,7 @@ PROMPT = ("Explain in two sentences why tiling a matrix multiplication in GPU sh
           "Then name one limit of the technique.")
 
 
-def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False):
+def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int = 0, yarn: float = 0.0):
     import glob
     import re
     import subprocess
@@ -54,22 +55,45 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False):
 
     snap = glob.glob(f"/hf_cache/hub/models--{model_name.replace('/', '--')}/snapshots/*")[0]
     tok = AutoTokenizer.from_pretrained(snap)
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(snap)
+    if yarn > 0:   # same override the engine gets through QWEN3_YARN: static YaRN, original context 32768
+        rp = dict(getattr(cfg, "rope_parameters", None) or {})
+        rp.update({"rope_type": "yarn", "factor": yarn, "original_max_position_embeddings": 32768})
+        rp.setdefault("rope_theta", getattr(cfg, "rope_theta", 1000000.0))
+        try:
+            cfg.rope_parameters = rp
+        except Exception:
+            cfg.rope_scaling = rp
     try:
-        model = AutoModelForCausalLM.from_pretrained(snap, dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(snap, config=cfg, dtype=torch.bfloat16)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(snap, torch_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(snap, config=cfg, torch_dtype=torch.bfloat16)
     model.eval()
 
-    prompt_ids = tok(PROMPT, return_tensors="pt")["input_ids"]
+    if long_n:   # deterministic pseudo-text: random common words, truncated to exactly long_n tokens
+        import random
+        words = ("the of and to in is that for it as was with be by on not he this are or his from at which but have an had "
+                 "they you were their one all we can her has there been if more when will would who so no she other its may "
+                 "these two like him into time has look more write go see number way could people my than first water been "
+                 "call who oil now find long down day did get come made may part matrix memory tile kernel thread block warp "
+                 "register cache bandwidth latency throughput tensor attention softmax gradient token model layer").split()
+        rng = random.Random(0)
+        text = " ".join(rng.choice(words) for _ in range(long_n))
+        prompt_ids = tok(text, return_tensors="pt")["input_ids"][:, :long_n]
+    else:
+        prompt_ids = tok(PROMPT, return_tensors="pt")["input_ids"]
     with torch.no_grad():
         full = model.generate(prompt_ids, max_new_tokens=n_gen, do_sample=False)
     full = full[0]
     n_prompt, n_total = prompt_ids.shape[1], full.shape[0]
     n_gen_real = n_total - n_prompt
-    print(f"model {model_name}: prompt {n_prompt} tokens, HF generated {n_gen_real}")
+    print(f"model {model_name}: prompt {n_prompt} tokens, HF generated {n_gen_real}, YaRN {yarn or 'off'}")
     print("HF text:", repr(tok.decode(full[n_prompt:])))
+    keep = min(n_total, 64)           # the engine writes only the last `keep` logits rows (see engine_test.cu)
+    first_keep = n_total - keep
     with torch.no_grad():
-        ref = model(full[None]).logits[0].float()                      # [n_total, vocab]
+        ref = model(full[None], logits_to_keep=keep).logits[0].float()      # [keep, vocab]
     open("/tmp/tokens.bin", "wb").write(full.to(torch.int32).numpy().tobytes())
 
     V = ref.shape[1]
@@ -78,14 +102,17 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False):
     margin = top2[:, 0] - top2[:, 1]
     scale = ref.abs().max().item()
     exp = full[n_prompt:].numpy()
-    variants = [("default (what the engine picks on this device)", {})]
-    if ab:   # same HF reference, three engine configurations: isolates what changed the numbers
-        variants += [("big GEMM tiles + SMALL attention (QWEN3_ATTN=small)", {"QWEN3_ATTN": "small"}),
+    variants = [("default (big tiles; decode = split-KV kernel on Hopper)", {})]
+    if ab:   # same HF reference, several engine configurations: isolates what changed the numbers
+        variants += [("default but decode with the 64x128 kernel (QWEN3_DECODE_SPLIT=0)", {"QWEN3_DECODE_SPLIT": "0"}),
+                     ("big GEMM tiles + SMALL attention (QWEN3_ATTN=small)", {"QWEN3_ATTN": "small"}),
                      ("all small tiles (QWEN3_TILES=small): the configuration verified on the L4", {"QWEN3_TILES": "small"})]
     summary = []
     for vi, (tag, extra) in enumerate(variants):
         env = dict(os.environ)
         env.update(extra)
+        if yarn > 0:
+            env["QWEN3_YARN"] = str(yarn)
         r = subprocess.run(["build/engine_test", snap, "/tmp/tokens.bin", str(n_total), str(n_prompt), "/tmp/logits.bin",
                             "/tmp/rope.bin", "/tmp/gen.bin", str(n_gen_real)], capture_output=True, text=True, env=env)
         if vi == 0:
@@ -94,20 +121,23 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False):
             print("engine_test failed:", r.stderr[-2000:])
             return 1
         raw = np.frombuffer(open("/tmp/logits.bin", "rb").read(), dtype=np.uint16).astype(np.uint32) << 16
-        mine = torch.from_numpy(raw.view(np.float32).reshape(n_total, V).copy())
+        mine = torch.from_numpy(raw.view(np.float32).reshape(keep, V).copy())
         cos = torch.nn.functional.cosine_similarity(ref, mine, dim=-1)
         maxabs = (ref - mine).abs().max(-1).values
         mism = (top_ref != mine.argmax(-1)).nonzero().flatten().tolist()
-        pre_cos, dec_cos = cos[:n_prompt].min().item(), (cos[n_prompt:].min().item() if n_total > n_prompt else 1.0)
+        b = n_prompt - first_keep      # rows before b are prefill positions, rows from b on are KV-cache decode positions
+        pre_cos = cos[:b].min().item() if b > 0 else 1.0
+        dec_cos = cos[b:].min().item() if n_total > n_prompt else 1.0
         gen = np.frombuffer(open("/tmp/gen.bin", "rb").read(), dtype=np.int32)
         first_bad = next((i for i in range(len(exp)) if gen[i] != exp[i]), None)
         print(f"--- engine configuration: {tag}")
-        print(f"teacher-forced positions: {n_total} (prefill path 0..{n_prompt - 1}, KV-cache decode path {n_prompt}..{n_total - 1})")
-        print(f"  top-1 agreement: {n_total - len(mism)}/{n_total}")
+        print(f"compared positions: {keep} (the last ones: {first_keep}..{n_total - 1}; prefill path up to {n_prompt - 1} of a "
+              f"{n_prompt}-token prompt, KV-cache decode path {n_prompt}..{n_total - 1})")
+        print(f"  top-1 agreement: {keep - len(mism)}/{keep}")
         for i in mism:
-            print(f"    mismatch at position {i} ({'prefill' if i < n_prompt else 'decode'}): HF margin top1-top2 = {margin[i]:.3f}")
+            print(f"    mismatch at position {first_keep + i} ({'prefill' if first_keep + i < n_prompt else 'decode'}): HF margin top1-top2 = {margin[i]:.3f}")
         worst = int(torch.argmin(cos))
-        print(f"  cosine similarity per position: min {cos.min():.6f} (position {worst}, HF margin {margin[worst]:.3f}), mean {cos.mean():.6f}")
+        print(f"  cosine similarity per position: min {cos.min():.6f} (position {first_keep + worst}, HF margin {margin[worst]:.3f}), mean {cos.mean():.6f}")
         print(f"  max abs logit error {maxabs.max():.3f}  (largest |logit| {scale:.1f}; relative {maxabs.max() / scale:.2e})")
         print(f"  min cosine: prefill {pre_cos:.6f}  decode {dec_cos:.6f}")
         print(f"  greedy generation: engine matches HF for {len(exp) if first_bad is None else first_bad}/{len(exp)} tokens"
@@ -115,12 +145,12 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False):
         if vi == 0:
             print("  engine text:", repr(tok.decode(gen.tolist())))
             first = (mism, pre_cos, dec_cos)
-        summary.append((tag, n_total - len(mism), pre_cos, dec_cos))
+        summary.append((tag, keep - len(mism), pre_cos, dec_cos))
     mism, pre_cos, dec_cos = first
     if ab:
         print("\nA/B summary (same HF reference): configuration | top-1 | min cosine prefill | min cosine decode")
         for tag, ok_n, pc, dc in summary:
-            print(f"  {tag[:62]:<62} {ok_n}/{n_total}  {pc:.6f}  {dc:.6f}")
+            print(f"  {tag[:62]:<62} {ok_n}/{keep}  {pc:.6f}  {dc:.6f}")
 
     # RoPE tables vs HF
     rot = model.model.rotary_emb
@@ -140,21 +170,21 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False):
 
 
 @app.function(image=image, gpu="L4", volumes={"/hf_cache": hf_cache}, timeout=2400)
-def run_l4(model_name: str, n_gen: int, ab: bool = False):
-    return _impl(model_name, n_gen, "sm_80", ab)
+def run_l4(model_name: str, n_gen: int, ab: bool = False, long_n: int = 0, yarn: float = 0.0):
+    return _impl(model_name, n_gen, "sm_80", ab, long_n, yarn)
 
 
 @app.function(image=image, gpu="H100", volumes={"/hf_cache": hf_cache}, timeout=900)   # hard cap 15 min (~$1)
-def run_h100(model_name: str, n_gen: int, ab: bool = False):
-    return _impl(model_name, n_gen, "sm_90", ab)
+def run_h100(model_name: str, n_gen: int, ab: bool = False, long_n: int = 0, yarn: float = 0.0):
+    return _impl(model_name, n_gen, "sm_90", ab, long_n, yarn)
 
 
 @app.local_entrypoint()
-def main(model: str = "Qwen/Qwen3-0.6B", n_gen: int = 16, gpu: str = "l4", ab: bool = False, yes: bool = False):
+def main(model: str = "Qwen/Qwen3-0.6B", n_gen: int = 16, gpu: str = "l4", ab: bool = False, long: int = 0, yarn: float = 0.0, yes: bool = False):
     price, cap = (3.95, 15) if gpu == "h100" else (PRICE_L4, 40)
     print(f"PLAN: {model} from volume qwen3-hf-cache (read-only, no download), HF on CPU as reference, engine on 1x {gpu.upper()}, "
-          f"hard cap {cap} min -> at most ~${cap / 60 * price:.2f} of shared credit")
+          f"prompt {long or 27} tokens, YaRN={yarn or 'off'}, hard cap {cap} min -> at most ~${cap / 60 * price:.2f} of shared credit")
     if not yes:
         print("Dry run only. Pass --yes to start.")
         return
-    raise SystemExit((run_h100 if gpu == "h100" else run_l4).remote(model, n_gen, ab))
+    raise SystemExit((run_h100 if gpu == "h100" else run_l4).remote(model, n_gen, ab, long, yarn))

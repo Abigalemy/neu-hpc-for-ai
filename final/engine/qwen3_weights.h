@@ -81,7 +81,10 @@ struct Qwen3Config {
     float eps = 1e-6f;
     double rope_theta = 1e6;
     bool tie_embeddings = true;
-    bool has_rope_scaling = false;   // YaRN etc.: not supported yet, the engine refuses to run with it
+    bool unsupported_rope_scaling = false;   // a rope_scaling type other than YaRN: the engine refuses to run
+    bool yarn = false;                       // YaRN from the config (or the QWEN3_YARN override, see the engine)
+    double yarn_factor = 0, yarn_beta_fast = 32, yarn_beta_slow = 1, yarn_attention_factor = -1;
+    int yarn_orig_max = 32768;
 };
 
 static std::string slurp(const std::string& path) {
@@ -111,7 +114,22 @@ static Qwen3Config load_config(const std::string& dir) {
     c.rope_theta = num("rope_theta", 1e6);
     c.tie_embeddings = num("tie_word_embeddings", 1) != 0;
     const JV* rs = j.get("rope_scaling");
-    c.has_rope_scaling = rs && rs->t == JV::OBJ;
+    if (!rs || rs->t != JV::OBJ) rs = j.get("rope_parameters");   // newer config layout
+    if (rs && rs->t == JV::OBJ) {
+        const JV* ty = rs->get("rope_type") ? rs->get("rope_type") : rs->get("type");
+        std::string type = ty && ty->t == JV::STR ? ty->str : "default";
+        if (type == "yarn") {
+            c.yarn = true;
+            auto rnum = [&](const char* k, double d) { const JV* v = rs->get(k); return v && v->t == JV::NUM ? v->num : d; };
+            c.yarn_factor = rnum("factor", 1.0);
+            c.yarn_orig_max = (int)rnum("original_max_position_embeddings", 32768);
+            c.yarn_beta_fast = rnum("beta_fast", 32);
+            c.yarn_beta_slow = rnum("beta_slow", 1);
+            c.yarn_attention_factor = rnum("attention_factor", -1);
+        } else if (type != "default") {
+            c.unsupported_rope_scaling = true;
+        }
+    }
     return c;
 }
 

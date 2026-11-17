@@ -8,7 +8,11 @@ static int run(int n_q, int n_kv, char** a) {
     T* q = (T*)to_dev(read_file(a[0])); T* k = (T*)to_dev(read_file(a[1])); T* v = (T*)to_dev(read_file(a[2]));
     size_t bytes = (size_t)n_q * HQ * FA_D * sizeof(T);
     T* o; CK(cudaMalloc(&o, bytes));
-    CK((launch_flash_attention<T, HQ, HKV>(q, k, v, o, n_q, n_kv)));
+    DecodeWorkspace ws;   // the split-KV decode path is taken for n_q == 1 on Hopper (see launch_attention_auto)
+    CK(cudaMalloc(&ws.o, (size_t)HQ * FD_SMAX * FD_BR * FA_D * sizeof(float)));
+    CK(cudaMalloc(&ws.m, (size_t)HQ * FD_SMAX * FD_BR * sizeof(float)));
+    CK(cudaMalloc(&ws.l, (size_t)HQ * FD_SMAX * FD_BR * sizeof(float)));
+    CK((launch_attention_auto<T, HQ, HKV>(q, k, v, o, n_q, n_kv, &ws)));
     CK(cudaDeviceSynchronize());
     std::vector<char> h(bytes);
     CK(cudaMemcpy(h.data(), o, bytes, cudaMemcpyDeviceToHost));

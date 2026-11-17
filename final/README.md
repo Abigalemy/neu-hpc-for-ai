@@ -37,7 +37,7 @@ vLLM, Qwen3-4B, bf16, 1x H100, single sequence (concurrency 1), 3072 input / 102
 | ITL avg (ms) | 4.46 | <= ~44.6 | <= ~13.4 |
 | Request latency (ms) | 4618.8 | | |
 
-Our engine (Qwen3-4B bf16, 1x H100, same workload: 1 sequence, 3072 in / 1024 out, greedy, EOS ignored; `bench_modal.py`, 3 requests after a warm-up, 2026-11-17; raw output on volume `final-results`):
+Our engine (Qwen3-4B bf16, 1x H100, same workload: 1 sequence, 3072 in / 1024 out, greedy, EOS ignored; `bench_modal.py`, 3 requests after a warm-up, 2026-11-16; raw output on volume `final-results`):
 
 | Metric | vLLM | ours | ratio (ours / vLLM) | Part 0 limit (10x) | Part 4 limit (3x) |
 |---|---|---|---|---|---|
@@ -46,7 +46,7 @@ Our engine (Qwen3-4B bf16, 1x H100, same workload: 1 sequence, 3072 in / 1024 ou
 
 Caveats: ours is engine-only (no HTTP server, no tokenizer; timing around forward + argmax with a host sync every step), vLLM was measured with AIPerf through its server. Numbers are very stable across the 3 requests (TTFT 1042.5-1042.7 ms, ITL 21.12 ms). The prefill runs at roughly 24 TFLOP/s effective (2 * 4B * 3072 tokens in 1.04 s), a few percent of the H100's bf16 peak, so there is a lot of room; where the time goes has NOT been profiled yet.
 
-### Profile of our engine (Qwen3-4B, H100, context ~3072; CUDA events around every stage; 2026-11-17)
+### Profile of our engine (Qwen3-4B, H100, context ~3072; CUDA events around every stage; 2026-11-16)
 
 Prefill of 3072 tokens, 1035 ms in total (stage sum 1035.3 ms):
 
@@ -70,7 +70,7 @@ Decode step at context ~3072, 20.4 ms (stage sum):
 
 Reading: the dense GEMMs run at ~2-4% of the H100's bf16 peak because the tiles are tiny (16x32x32, chosen only to get launches to work; 64x64 and 128x128 tiles failed to launch on bf16). Decode attention launches only 32 blocks (one per query head, each walking ~194 key tiles of 16 one after another) on a 132-SM GPU. These are the biggest levers; they are hypotheses to test, not yet changes.
 
-### After the GEMM tile change (2026-11-17)
+### After the GEMM tile change (2026-11-16)
 
 Cause found: the earlier launch failures of big bf16 tiles were specific to the L4 (99 KB shared memory per block); on the H100 all 27 swept plain-GEMM configurations and all 9 fused gate/up configurations launch and give bit-identical results to the 16x32x32 baseline (`gemm_sweep_modal.py`). Measured on a 3072x2560 @ 2560x9728 bf16 GEMM: 16x32x32 21 TFLOP/s -> 128x128x64 630 TFLOP/s. The fused gate/up kernel (two accumulators) must NOT use 128x128 (95-166 TFLOP/s, registers spill); 128x64x64 gives 601 TFLOP/s. The engine now picks tiles by device (>= 200 KB opt-in shared memory -> big tiles) and by token count; `QWEN3_TILES=small` forces the old tiles.
 
@@ -86,7 +86,7 @@ Profile after the change (H100, context ~3072):
 - decode step 17.3 ms: **attention 10.56 ms = 61%** (43 GB/s of the cache); MLP 2.6 ms, projections 2.0 ms, small kernels ~2 ms, lm_head 0.23 ms (3.4 TB/s).
 Attention is now the bottleneck of both phases. 128K is still not measured (needs YaRN).
 
-### Attention tile sweep (H100, Hq 32 / Hkv 8, 3072 keys, 2026-11-17; `attn_sweep_modal.py`)
+### Attention tile sweep (H100, Hq 32 / Hkv 8, 3072 keys, 2026-11-16; `attn_sweep_modal.py`)
 
 All 13 configurations launch on the H100. What matters is the precision of P in the second matmul: with P kept in fp32 every configuration is slow (2.4-11 TFLOP/s) because the fp32 mma has no tensor-core fast path; with P cast to bf16 (what FlashAttention-2 does) the same kernel runs at up to 260 TFLOP/s.
 
@@ -119,7 +119,7 @@ Accuracy cost of bf16 P: max difference to the fp32-P kernel ~4.6e-3 of the larg
 
   The split costs ~18-21% over bf16 P and is still ~19x (prefill) / ~5x (decode) faster than fp32 P. It is now the default on Hopper (64x128, mode 2). NOT yet verified: unit tests, the end-to-end A/B with this default (the criterion min cosine > 0.999 must be met, not re-defined), and the real TTFT/ITL.
 
-### After the attention change (2026-11-17): split-P, 64x128 tiles on Hopper
+### After the attention change (2026-11-16): split-P, 64x128 tiles on Hopper
 
 Verification of this default on the H100: attention unit tests 36/36 (worst error back to ~2.5e-3, as with the original fp32-P kernel); 4B end-to-end vs HF (`e2e_test.py --gpu h100 --ab`): top-1 41/43 (both mismatches are exact HF ties, margin 0.000), min cosine prefill 0.999623 / decode 0.999130 (criterion > 0.999 met, not changed), greedy 16/16 identical to HF, RoPE tables bit-identical. Caveat: HF's own CPU bf16 reference moves by ~5e-4 in this metric between containers (the identical all-small-tile engine configuration scored 0.999399 against one HF run and 0.999766 against another), which is as large as the differences between our attention variants, so 0.999 cannot separate bf16-P, split-P and fp32-P; a cleaner reference (HF in fp32) would be needed for that.
 
@@ -137,6 +137,52 @@ Profile now (H100, context ~3072):
 Last-position logits of the 3072-token prompt, default vs all-small tiles: cosine 0.999960, max |logit diff| 0.113 (max |logit| 11.1). The reported "top-1 differs" (55 vs 11) is a tie artefact: the small-tile run itself has a first-place margin of 0.000 on this random-token prompt, so the argmax is arbitrary.
 
 Not covered by these numbers: 128K input (needs YaRN, the weekly report asks for it), concurrency / batching, "any workload".
+
+### 128K input (2026-11-16): YaRN + first measurement
+
+YaRN is implemented following HF `_compute_yarn_parameters` (`engine/qwen3_rope_table.h`; enabled by `rope_scaling` in the config or `QWEN3_YARN=<factor>`, original context 32768, like vLLM's `--rope-scaling` for Qwen3). The tables were compared with HF's `Qwen3RotaryEmbedding` on a CPU container (`rope_table_check.py`, positions 0..131079): HF's attention_scaling 1.138629 matches 0.1 ln 4 + 1; 125 of 8.39M cos entries and 136 of 8.39M sin entries differ, each by exactly one bf16 step (likely fp32 cos/sin implementation differences on values next to a bf16 rounding boundary; that explanation is not separately verified). Default RoPE: 1 of 262,656 entries differs by one bf16 step.
+
+**The 128K workload is 130816 input + 128 output tokens.** With YaRN factor 4 the context is 32768 x 4 = 131072 tokens for input and output together, and the chat endpoint adds role tokens, so 128 tokens are kept free. (A first run used 131072 + 128, which exceeds the context; corrected.)
+
+| Metric (1 sequence, 130816 in / 128 out, YaRN factor 4, 1x H100, 2 requests) | vLLM | ours | ratio | Part 0 (10x) | Part 4 (3x) |
+|---|---|---|---|---|---|
+| TTFT avg | 10,446.8 ms | **23,338.7 ms** | **2.23x** | met | met |
+| ITL avg | 10.43 ms | **28.80 ms** | **2.76x** | met | met (small margin) |
+
+vLLM: `modal_vllm_aipref.py --isl 130816 --osl 128 --yarn`, AIPerf through its server (input length 130,816 for both requests, error rate 0%, output length 127.5 on average). Ours: `bench_modal.py --prompt-len 130816 --gen-len 128 --yarn 4`, engine only. Our earlier ITL at 128K was 79.3 ms with the old decode path; the split-KV decode brought it to 28.8 ms.
+
+How YaRN was enabled in vLLM (this took five attempts; recorded so nobody repeats them): `--rope-scaling` is not a valid flag in the current vLLM; `--hf-overrides` with `rope_scaling` or with `rope_parameters` was accepted but the max length stayed at 40960; a config.json with only `rope_scaling` made transformers apply YaRN but warn that 40960/32768 implies factor 1.25, and vLLM still derived 40960. What works: a model directory (weights symlinked) whose config.json has `rope_scaling` = {yarn, factor 4, original 32768} AND `max_position_embeddings` = 131072. Evidence: inside the container, transformers parses the config as {rope_type: yarn, factor 4.0, original_max_position_embeddings 32768, rope_theta 1e6} with no factor-mismatch warning, and the script refuses to start vLLM otherwise. This vLLM derives its max length from `max_position_embeddings` only, so "vLLM accepted 131072" alone does not prove YaRN; we did not verify which rotary class vLLM instantiated. For timing this barely matters (RoPE is a lookup in a precomputed cos/sin table either way). `VLLM_ALLOW_LONG_MAX_MODEL_LEN` was never set.
+
+Earlier measurement with the old decode path and the over-long workload (131072 in / 128 out), kept for the record:
+
+| Metric | ours (old decode) |
+|---|---|
+| TTFT avg | 22.99 s |
+| ITL avg | 79.3 ms |
+
+Profile at 128K: prefill 23.0 s = **attention 19.8 s (86%) at 256 TFLOP/s** (quadratic in the length), MLP 1.9 s, projections ~0.7 s, q/k norm 0.44 s. Decode step 81.6 ms = **attention 74.0 ms (91%) at 261 GB/s**: the step reads ~19.3 GB of KV cache, which takes ~5.8 ms at HBM speed, so decode attention is ~13x above its floor. Cause: one block per query head (32 blocks on a 132-SM GPU), each walking ~1024 key tiles one after another. Next: split the KV length across blocks (flash-decoding) and combine.
+
+Correctness at long context (128K itself cannot be compared with HF on a CPU): Qwen3-0.6B, 8192-token prompt, YaRN factor 4 on both sides, 16 HF greedy tokens, last 64 positions compared, same HF reference for all rows (`e2e_test.py --gpu h100 --long 8192 --yarn 4 --ab`):
+
+| Engine configuration | top-1 | min cosine, prefill | min cosine, decode | max abs logit error |
+|---|---|---|---|---|
+| default: big GEMM tiles + 64x128 split-P attention | 60/64 | 0.999789 | **0.998630** | 0.562 |
+| big GEMM tiles + small attention (fp32 P) | 60/64 | 0.999559 | 0.999810 | 0.319 |
+| all small tiles | 60/64 | 0.999559 | 0.999810 | 0.319 |
+
+- YaRN end to end is correct: RoPE tables identical to HF on all 8232 positions; every top-1 mismatch is an HF near-tie (margin 0.000 or 0.062); greedy tokens 16/16 identical.
+- The default configuration FAILS the pre-set criterion on the decode path (0.998630 < 0.999; worst position has an HF margin of 2.6). The same direction showed up in all three A/B runs (decode, default vs small attention in the same run: 0.998993 vs 0.999399, 0.999130 vs 0.999766, 0.998630 vs 0.999810), while the prefill path of the big attention is as good or better. The within-run gaps (6e-4 to 1.2e-3) are larger than the HF noise seen so far (~5e-4), so this is a real accuracy deficit of the 64x128 attention kernel when n_q = 1, and calling these differences "HF noise" earlier was not accurate. Split P did not fix it, so it is not the rounding of P. Cause: unknown so far.
+- Split-KV decode (new default decode path on Hopper; `QWEN3_DECODE_SPLIT=0` switches it off): before running it on a GPU, its split rule, index math and combine were simulated in numpy (`tools/split_kv_sim.py`, runs locally: 13 lengths incl. tile boundaries and 131072, exact in float64, worst float32 error 1.3e-6). On the H100: attention unit tests 36/36; the same 8K A/B with four configurations:
+
+| Engine configuration (same HF reference) | top-1 | min cosine, prefill | min cosine, decode | max abs logit error |
+|---|---|---|---|---|
+| **default: decode = split-KV kernel** | 60/64 | 0.999789 | **0.999687** | **0.312** |
+| default but decode with the 64x128 kernel | 60/64 | 0.999789 | 0.998630 | 0.562 |
+| big GEMM tiles + small attention | 60/64 | 0.999559 | 0.999810 | 0.319 |
+| all small tiles | 60/64 | 0.999559 | 0.999810 | 0.319 |
+
+  The default now passes (criterion unchanged) and its decode accuracy matches the small fp32-P attention (max error 0.312 vs 0.319). The old 64x128 decode reproduced its deficit to the digit (0.998630, 0.562, same as the previous run), confirming it is a property of that kernel with a single query. Root cause still not identified; a hypothesis consistent with the data is the long serial accumulation (64 key tiles into one accumulator inside the mma) that the split kernel avoids (4 tiles per block, fp32 combine). Not verified.
+- Decode at 128K with the split-KV kernel: attention 23.8 ms of a 31.5 ms step (810 GB/s of cache; floor ~5.8 ms). Each query head reads its KV head separately (4 query heads per KV head), relying on L2; packing the 4 heads into one block is the next lever (hypothesis).
 
 Not yet measured: 128K input (needs YaRN), and the same workload for the Qwen3-30B-A3B on H200.
 

@@ -20,7 +20,7 @@ image = (
 )
 PRICE_L4 = 0.80  # $/hour approx.
 
-TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention", "engine", "engine_bench", "gemm_sweep", "attn_sweep"]
+TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention", "engine", "engine_bench", "gemm_sweep", "attn_sweep", "rope_table"]
 def build_cmd(arch):
     return "cd /root/final && mkdir -p build && " + " && ".join(
         f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{t}_test.cu -o build/{t}_test" for t in TESTS)

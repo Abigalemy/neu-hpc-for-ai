@@ -4,7 +4,7 @@ The Modal workspace credit is shared by the whole class, so nothing starts witho
 
   modal run modal_vllm_aipref.py                       # prints the plan only (no GPU, no cost)
   modal run modal_vllm_aipref.py --yes                 # 3072 in / 1024 out, 1 sequence, Qwen3-4B, H100
-  modal run modal_vllm_aipref.py --yes --isl 131072 --osl 128 --yarn   # 128K input (needs YaRN for Qwen3-4B)
+  modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn   # 128K context (YaRN): 130816 in + 128 out + chat template <= 131072
 
 The result table is printed, and the raw AIPerf output is saved on the Modal volume `final-results`.
 """
@@ -30,6 +30,40 @@ vllm_image = (
 
 PRICE_H100 = 3.95  # $/hour, approximate; check modal.com/pricing
 
+YARN_CONTEXT = 32768 * 4         # Qwen3 static YaRN, factor 4: input + output must fit in 131072 tokens
+CHAT_TEMPLATE_MARGIN = 128       # the chat endpoint wraps the prompt in role tokens; keep room for them
+
+
+def check_yarn_lengths(isl: int, osl: int):
+    """Raises before any GPU is started if the request cannot fit the YaRN context together with the chat template."""
+    if isl + osl + CHAT_TEMPLATE_MARGIN > YARN_CONTEXT:
+        raise ValueError(f"isl + osl + {CHAT_TEMPLATE_MARGIN} (chat template margin) = {isl + osl + CHAT_TEMPLATE_MARGIN} "
+                         f"exceeds the YaRN context of {YARN_CONTEXT} tokens; e.g. use --isl {YARN_CONTEXT - osl - CHAT_TEMPLATE_MARGIN}")
+
+
+def make_yarn_model_dir(src: str, dst: str) -> dict:
+    """A copy of the model directory `src` in `dst` whose config.json adds static YaRN (Qwen3 model card); every other
+    file is a symlink (no weight copy). Returns the new config."""
+    import json
+    os.makedirs(dst, exist_ok=True)
+    cfg = None
+    for f in sorted(os.listdir(src)):
+        target = os.path.join(dst, f)
+        if f == "config.json":
+            cfg = json.load(open(os.path.join(src, f)))
+            cfg["rope_scaling"] = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}
+            # transformers (v5) expects max_position_embeddings to be the post-YaRN length (it warns that 40960/32768
+            # implies factor 1.25 otherwise), and this vLLM derives its max_model_len from max_position_embeddings only.
+            cfg["max_position_embeddings"] = YARN_CONTEXT
+            with open(target, "w") as fh:
+                json.dump(cfg, fh, indent=2)
+        elif not os.path.lexists(target):
+            os.symlink(os.path.join(src, f), target)
+    if cfg is None:
+        raise FileNotFoundError(f"no config.json in {src}")
+    return cfg
+
+
 
 def _wait_ready(proc, timeout_s=1200):
     import urllib.request
@@ -45,21 +79,59 @@ def _wait_ready(proc, timeout_s=1200):
     raise TimeoutError("vllm never became ready")
 
 
-@app.function(image=vllm_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=2 * 3600)
+@app.function(image=vllm_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=25 * 60)   # hard cap 25 min
 def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: int):
-    max_len = isl + osl + 16
-    cmd = ["vllm", "serve", model, "--dtype", "bfloat16", "--max-model-len", str(max_len),
-           "--max-num-seqs", "1", "--no-enable-prefix-caching", "--port", str(PORT)]
-    if yarn:  # Qwen3 native context is 32K; YaRN extends it (factor 4 -> 128K). Not yet verified on this vLLM version.
-        cmd += ["--rope-scaling", '{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}']
-    server = subprocess.Popen(cmd)
+    # Static YaRN, factor 4, original context 32768 (Qwen3 model card). The context limit is then 32768 * 4 = 131072
+    # tokens for input + output together, so a "128K" run is 130944 in + 128 out.
+    # Tried 2026-11-16 on the current vLLM, all rejected or not recognised as YaRN:
+    #   --rope-scaling '{...}'                                  -> "unrecognized arguments"
+    #   --hf-overrides '{"rope_scaling": {...}}'                -> max_model_len still derived from 40960
+    #   --hf-overrides '{"rope_parameters": {...}}'             -> same
+    #   ... + "max_position_embeddings": 131072                 -> derived exactly 131072 (no YaRN factor applied)
+    #   config.json with rope_scaling only                      -> transformers applies YaRN (warns 40960/32768 = 1.25
+    #                                                              != 4), vLLM still derives max_model_len = 40960
+    # This vLLM derives the length from max_position_embeddings only, so "accepting 131072" no longer proves YaRN.
+    # Now: config.json with rope_scaling AND max_position_embeddings = 131072 (the consistent form transformers asks
+    # for); evidence = the config as transformers parses it (printed and checked below, before vLLM starts).
+    # For timing it hardly matters: RoPE is a lookup in a precomputed cos/sin table either way.
+    serve_path = model
+    if yarn:
+        if os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN"):
+            raise RuntimeError("VLLM_ALLOW_LONG_MAX_MODEL_LEN must not be set: it would hide a missing YaRN")
+        check_yarn_lengths(isl, osl)
+        from huggingface_hub import snapshot_download
+        serve_path = "/tmp/qwen3-yarn"
+        cfg = make_yarn_model_dir(snapshot_download(model, local_files_only=True), serve_path)
+        print("config.json: max_position_embeddings", cfg.get("max_position_embeddings"), "rope_scaling", cfg["rope_scaling"], flush=True)
+        # Evidence that the YaRN config is what the model code will see: parse it the way vLLM does (transformers).
+        from transformers import AutoConfig
+        parsed = AutoConfig.from_pretrained(serve_path)
+        rp = getattr(parsed, "rope_parameters", None) or getattr(parsed, "rope_scaling", None)
+        print("transformers parses rope parameters as:", rp, "| max_position_embeddings", parsed.max_position_embeddings, flush=True)
+        if not rp or rp.get("rope_type", rp.get("type")) != "yarn" or float(rp.get("factor", 0)) != 4.0:
+            raise RuntimeError("YaRN not recognised in the parsed config; not starting vLLM")
+    max_len = YARN_CONTEXT if yarn else isl + osl + 16
+    base = ["vllm", "serve", serve_path, "--served-model-name", model, "--dtype", "bfloat16", "--max-model-len", str(max_len),
+            "--max-num-seqs", "1", "--no-enable-prefix-caching", "--port", str(PORT)]
+    variants = [base]
     out = f"/tmp/aiperf_isl{isl}_osl{osl}"
+    server = None
+    for cmd in variants:
+        print("starting:", " ".join(cmd), flush=True)
+        server = subprocess.Popen(cmd)
+        try:
+            _wait_ready(server)
+            break
+        except RuntimeError as e:   # the server exited early: the flag may be unsupported, try the next variant
+            print(f"{e}")
+            server = None
+    if server is None:
+        raise RuntimeError("vllm did not start with any of the YaRN flag variants")
     try:
-        _wait_ready(server)
         aiperf = ["aiperf", "profile", "--model", model, "--url", f"http://localhost:{PORT}",
                   "--endpoint-type", "chat", "--streaming", "--tokenizer", model,
                   "--extra-inputs", '{"ignore_eos": true, "temperature": 0}',
-                  "--concurrency", "1", "--request-count", str(requests), "--warmup-request-count", "2",
+                  "--concurrency", "1", "--request-count", str(requests), "--warmup-request-count", "1" if isl > 32768 else "2",
                   "--synthetic-input-tokens-mean", str(isl), "--synthetic-input-tokens-stddev", "0",
                   "--output-tokens-mean", str(osl), "--output-tokens-stddev", "0",
                   "--random-seed", "0", "--artifact-dir", out]
@@ -80,9 +152,11 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False,
          requests: int = 5, max_minutes: int = 25, yes: bool = False):
-    est = max_minutes / 60 * PRICE_H100
+    if yarn:
+        check_yarn_lengths(isl, osl)   # fails here, locally, before any GPU is started
+    est = 25 / 60 * PRICE_H100
     print(f"PLAN: vLLM {model}, 1 H100, single sequence {isl} in / {osl} out, {requests} requests, "
-          f"YaRN={yarn}, hard cap {max_minutes} min -> at most ~${est:.2f} of shared credit")
+          f"YaRN={yarn}, benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${est:.2f} of shared credit")
     if not yes:
         print("Dry run only. Pass --yes to start.")
         return

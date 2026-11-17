@@ -24,27 +24,29 @@ int main(int argc, char** argv) {
                 eng.cfg.hidden, eng.cfg.inter, eng.cfg.layers, eng.cfg.hq, eng.cfg.hkv, ms_since(t0) / 1000.0);
     std::fflush(stdout);
 
-    std::printf("tile profile: %s (QWEN3_TILES=%s)\n", tile_profile() == TileProfile::BIG ? "BIG" : "SMALL",
-                std::getenv("QWEN3_TILES") ? std::getenv("QWEN3_TILES") : "unset");
+    auto env = [](const char* k) { return std::getenv(k) ? std::getenv(k) : "unset"; };
+    std::printf("tile profile: %s (QWEN3_TILES=%s, QWEN3_ATTN=%s, QWEN3_DECODE_SPLIT=%s, QWEN3_YARN=%s)\n",
+                tile_profile() == TileProfile::BIG ? "BIG" : "SMALL", env("QWEN3_TILES"), env("QWEN3_ATTN"),
+                env("QWEN3_DECODE_SPLIT"), env("QWEN3_YARN"));
     std::vector<int> prompt(prompt_len);
     unsigned s = 12345;
     for (auto& t : prompt) { s = s * 1664525u + 1013904223u; t = 1000 + (s >> 8) % 100000; }
 
-    auto request = [&](int gen, std::vector<double>* steps) {
+    auto request = [&](int gen, std::vector<double>* steps, int plen) {
         auto ts = clk::now();
-        const bf16* lg = eng.forward(prompt.data(), prompt_len, 0, false);
+        const bf16* lg = eng.forward(prompt.data(), plen, 0, false);
         int next = eng.argmax_row(lg);
         double ttft = ms_since(ts);
         for (int i = 1; i < gen; ++i) {
             auto t = clk::now();
-            lg = eng.forward(&next, 1, prompt_len + i - 1, false);
+            lg = eng.forward(&next, 1, plen + i - 1, false);
             next = eng.argmax_row(lg);
             if (steps) steps->push_back(ms_since(t));
         }
         return ttft;
     };
 
-    request(warm, nullptr);   // warm-up: first use of every kernel shape
+    request(warm, nullptr, std::min(prompt_len, 4096));   // warm-up with a short prompt: kernels are not specialised on n
     std::printf("warm-up done (%d tokens generated)\n", warm);
     std::fflush(stdout);
 
@@ -52,7 +54,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < repeats; ++r) {
         std::vector<double> steps;
         auto t = clk::now();
-        double ttft = request(gen_len, &steps);
+        double ttft = request(gen_len, &steps, prompt_len);
         double e2e = ms_since(t);
         std::vector<double> sorted = steps;
         std::sort(sorted.begin(), sorted.end());
