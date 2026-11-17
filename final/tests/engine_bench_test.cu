@@ -25,9 +25,9 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     auto env = [](const char* k) { return std::getenv(k) ? std::getenv(k) : "unset"; };
-    std::printf("tile profile: %s (QWEN3_TILES=%s, QWEN3_ATTN=%s, QWEN3_DECODE_SPLIT=%s, QWEN3_YARN=%s)\n",
+    std::printf("tile profile: %s (QWEN3_TILES=%s, QWEN3_ATTN=%s, QWEN3_DECODE_SPLITS=%s, QWEN3_YARN=%s)\n",
                 tile_profile() == TileProfile::BIG ? "BIG" : "SMALL", env("QWEN3_TILES"), env("QWEN3_ATTN"),
-                env("QWEN3_DECODE_SPLIT"), env("QWEN3_YARN"));
+                env("QWEN3_DECODE_SPLITS"), env("QWEN3_YARN"));
     std::vector<int> prompt(prompt_len);
     unsigned s = 12345;
     for (auto& t : prompt) { s = s * 1664525u + 1013904223u; t = 1000 + (s >> 8) % 100000; }

@@ -129,30 +129,43 @@ cudaError_t launch_flash_attention(const T* q, const T* k, const T* v, T* o, int
     return launch_flash_attention_tiled<T, HQ, HKV, 16, 16, 0>(q, k, v, o, n_q, n_kv, stream);
 }
 
-// ---- decode (n_q == 1): split the KV length across blocks, then combine (flash-decoding) ---------------------------
+// ---- decode: split the KV length across blocks, then combine (flash-decoding) -----------------------------------------
 //
 // The kernel above gives a single query only HQ blocks (32 on Qwen3-4B), each walking every key tile of the cache one
-// after another: at 128K that is ~74 ms per decode step for 19 GB of cache (~261 GB/s). Here block (h, s) handles query
-// head h and the key tiles [s*tps, (s+1)*tps); it writes its partial softmax state (m, l, unnormalised output) to an
-// fp32 workspace, and a second kernel merges the splits of each head:
+// after another: at 128K that was ~74 ms per decode step for 19 GB of cache (~261 GB/s), and its decode accuracy was
+// below the end-to-end criterion. Here block (h, s, b) handles query head h of sequence b and the key tiles
+// [s*tps, (s+1)*tps); it writes its partial softmax state (m, l, unnormalised output) to an fp32 workspace, and a second
+// kernel merges the splits of each (sequence, head):
 //   m* = max_s m_s,  w_s = exp(m_s - m*),  O = sum_s w_s acc_s / sum_s w_s l_s.
 // blockIdx.x is the head, so the HQ/HKV query heads that share a KV head read the same split at the same time (L2).
-// Only rows of a 16-row tile are used for the single query (mma needs 16 rows); rows 1..15 are padding.
 constexpr int FD_BR = 16;      // query rows of the tile (1 used)
 constexpr int FD_BC = 128;     // keys per tile
 constexpr int FD_SMAX = 64;    // max number of splits (power of two: the combine loads them as one tile)
 
-struct DecodeWorkspace {        // fp32 partial results; sizes: o = HQ*FD_SMAX*FD_BR*FA_D, m = l = HQ*FD_SMAX*FD_BR
-    float* o = nullptr;
-    float* m = nullptr;
+// ---- batched decode over KV-cache slots (continuous batching) -----------------------------------------------------
+//
+// B sequences, one new token each. Sequence b lives in cache slot SLOTS[b] (rows slot*max_len .. of the cache tensors)
+// and its query is at position POS[b], so it attends to keys 0..POS[b]. Grid: (head, split, sequence). Same split-KV
+// scheme as above. Each sequence splits its OWN key tiles: s_b = min(split_target, n_tiles_b) splits of
+// tps_b = ceil(n_tiles_b / s_b) tiles, so how a sequence is summed depends only on its length and split_target, not on
+// which other sequences share the batch (with a fixed split_target, batched and alone decoding are bit-identical).
+// Splits past a sequence's last tile run zero iterations and write an empty state (m = -FLT_MAX, l = 0), which the
+// combine weights by exp(-huge) = 0.
+// The single query row is broadcast to the 16 rows the mma needs.
+struct BatchDecodeWorkspace {   // fp32 partial results for up to `max_parts` (sequence, split) pairs per head
+    float* o = nullptr;         // [max_parts * HQ * FD_BR * FA_D]
+    float* m = nullptr;         // [max_parts * HQ * FD_BR]
     float* l = nullptr;
+    int max_parts = 0;
 };
 
 template <typename T, int HQ, int HKV, int PV_MODE>
-__tile_global__ void flash_decode_partial_kernel(const T* __restrict__ _Q, const T* __restrict__ _K,
-                                                 const T* __restrict__ _V, float* __restrict__ _WO,
-                                                 float* __restrict__ _WM, float* __restrict__ _WL,
-                                                 int n_kv, int tiles_per_split, int n_splits, float scale) {
+__tile_global__ void flash_decode_batch_partial_kernel(const T* __restrict__ _Q, const T* __restrict__ _K,
+                                                       const T* __restrict__ _V, float* __restrict__ _WO,
+                                                       float* __restrict__ _WM, float* __restrict__ _WL,
+                                                       const int* __restrict__ SLOTS, const int* __restrict__ POS,
+                                                       int n_seqs, int max_len, int split_target, int n_splits,
+                                                       float scale) {
     using namespace ct::literals;
     using f32_scores = ct::tile<float, ct::shape<FD_BR, FD_BC>>;
     using f32_rows = ct::tile<float, ct::shape<FD_BR, 1>>;
@@ -160,44 +173,48 @@ __tile_global__ void flash_decode_partial_kernel(const T* __restrict__ _Q, const
     using i32_rows = ct::tile<int, ct::shape<FD_BR, 1>>;
     using i32_keys = ct::tile<int, ct::shape<1, FD_BC>>;
 
-    const T* Q = ct::assume_aligned(_Q, 16_ic);
-    const T* K = ct::assume_aligned(_K, 16_ic);
-    const T* V = ct::assume_aligned(_V, 16_ic);
+    auto [h_u, s_u, b_u] = ct::bid();
+    int h = static_cast<int>(h_u), split = static_cast<int>(s_u), b = static_cast<int>(b_u);
+    int kvh = h / (HQ / HKV);
+    int slot = SLOTS[b];
+    int n_kv = POS[b] + 1;
+    long long base = static_cast<long long>(slot) * max_len * HKV * FA_D;   // first element of this slot
 
-    auto pQ = ct::partition_view{ct::tensor_span{Q, ct::extents{1, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
-                                 ct::shape<FD_BR, 1, FA_D>{}};
+    const T* Q = ct::assume_aligned(_Q, 16_ic);
+    const T* K = ct::assume_aligned(_K + base, 16_ic);
+    const T* V = ct::assume_aligned(_V + base, 16_ic);
+
+    auto pQ = ct::partition_view{ct::tensor_span{Q, ct::extents{n_seqs, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
+                                 ct::shape<1, 1, FA_D>{}};
     auto pK = ct::partition_view{ct::tensor_span{K, ct::extents{n_kv, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FD_BC, 1, FA_D>{}};
     auto pV = ct::partition_view{ct::tensor_span{V, ct::extents{n_kv, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FD_BC, 1, FA_D>{}};
-    auto pWO = ct::partition_view{ct::tensor_span{_WO, ct::extents{ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}, ct::integral_constant<FA_D>{}}},
-                                  ct::shape<1, 1, FD_BR, FA_D>{}};
-    auto pWM = ct::partition_view{ct::tensor_span{_WM, ct::extents{ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
-                                  ct::shape<1, 1, FD_BR>{}};
-    auto pWL = ct::partition_view{ct::tensor_span{_WL, ct::extents{ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
-                                  ct::shape<1, 1, FD_BR>{}};
+    auto pWO = ct::partition_view{ct::tensor_span{_WO, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}, ct::integral_constant<FA_D>{}}},
+                                  ct::shape<1, 1, 1, FD_BR, FA_D>{}};
+    auto pWM = ct::partition_view{ct::tensor_span{_WM, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
+                                  ct::shape<1, 1, 1, FD_BR>{}};
+    auto pWL = ct::partition_view{ct::tensor_span{_WL, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
+                                  ct::shape<1, 1, 1, FD_BR>{}};
 
-    auto [h_u, s_u, dummy] = ct::bid();
-    int h = static_cast<int>(h_u);
-    int split = static_cast<int>(s_u);
-    int kvh = h / (HQ / HKV);
-
-    ct::tile<T, ct::shape<FD_BR, FA_D>> q = ct::reshape<ct::shape<FD_BR, FA_D>>(pQ.load_masked(0, h, 0));
-    i32_rows qpos = (n_kv - 1) + ct::iota<i32_rows>();   // row 0 is the real query (position n_kv - 1)
+    ct::tile<T, ct::shape<FD_BR, FA_D>> q =
+        ct::broadcast<ct::shape<FD_BR, FA_D>>(ct::reshape<ct::shape<1, FA_D>>(pQ.load(b, h, 0)));
+    i32_rows qpos = ct::full<i32_rows>(n_kv - 1);
 
     auto m = ct::full<f32_rows>(-FLT_MAX);
     auto l = ct::zeros<f32_rows>();
     auto acc = ct::zeros<f32_out>();
 
     int n_tiles = (n_kv + FD_BC - 1) / FD_BC;
-    int t0 = split * tiles_per_split;
-    int t1 = t0 + tiles_per_split < n_tiles ? t0 + tiles_per_split : n_tiles;
+    int s_b = split_target < n_tiles ? split_target : n_tiles;
+    int tps = (n_tiles + s_b - 1) / s_b;
+    int t0 = split * tps;
+    int t1 = t0 + tps < n_tiles ? t0 + tps : n_tiles;   // t1 <= t0: empty split
     for (auto kb : ct::irange(t0, t1)) {
         ct::tile<T, ct::shape<FD_BC, FA_D>> k = ct::reshape<ct::shape<FD_BC, FA_D>>(pK.load_masked(kb, kvh, 0));
         ct::tile<T, ct::shape<FD_BC, FA_D>> v = ct::reshape<ct::shape<FD_BC, FA_D>>(pV.load_masked(kb, kvh, 0));
         auto sc = ct::mma(q, ct::transpose(k), ct::zeros<f32_scores>()) * scale;
         i32_keys kidx = kb * FD_BC + ct::iota<i32_keys>();
-        // keys past the end of the cache (padding of the last tile) are masked; every split contains real keys
         sc = ct::select(kidx <= qpos, sc, ct::full<f32_scores>(-FLT_MAX));
         auto block_m = ct::reduce_max(sc, 1_ic);
         auto new_m = ct::max(m, block_m);
@@ -210,41 +227,41 @@ __tile_global__ void flash_decode_partial_kernel(const T* __restrict__ _Q, const
             acc = acc * alpha;
             acc = ct::mma(p_hi, v, acc);
             acc = ct::mma(p_lo, v, acc);
-        } else if constexpr (PV_MODE == 1) {
-            acc = acc * alpha + ct::mma(ct::element_cast<T>(p), v, ct::zeros<f32_out>());
         } else {
-            acc = acc * alpha + ct::mma(p, ct::element_cast<float>(v), ct::zeros<f32_out>());
+            acc = acc * alpha + ct::mma(ct::element_cast<T>(p), v, ct::zeros<f32_out>());
         }
         m = new_m;
     }
-    pWO.store(ct::reshape<ct::shape<1, 1, FD_BR, FA_D>>(acc), h, split, 0, 0);
-    pWM.store(ct::reshape<ct::shape<1, 1, FD_BR>>(m), h, split, 0);
-    pWL.store(ct::reshape<ct::shape<1, 1, FD_BR>>(l), h, split, 0);
+    pWO.store(ct::reshape<ct::shape<1, 1, 1, FD_BR, FA_D>>(acc), b, h, split, 0, 0);
+    pWM.store(ct::reshape<ct::shape<1, 1, 1, FD_BR>>(m), b, h, split, 0);
+    pWL.store(ct::reshape<ct::shape<1, 1, 1, FD_BR>>(l), b, h, split, 0);
 }
 
 template <typename T, int HQ>
-__tile_global__ void flash_decode_combine_kernel(const float* __restrict__ _WO, const float* __restrict__ _WM,
-                                                 const float* __restrict__ _WL, T* __restrict__ _O, int n_splits) {
+__tile_global__ void flash_decode_batch_combine_kernel(const float* __restrict__ _WO, const float* __restrict__ _WM,
+                                                       const float* __restrict__ _WL, T* __restrict__ _O, int n_seqs,
+                                                       int n_splits) {
     using namespace ct::literals;
     using f32_s = ct::tile<float, ct::shape<FD_SMAX, 1>>;
     using f32_so = ct::tile<float, ct::shape<FD_SMAX, FA_D>>;
     using i32_s = ct::tile<int, ct::shape<FD_SMAX, 1>>;
 
-    auto pWO = ct::partition_view{ct::tensor_span{_WO, ct::extents{ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}, ct::integral_constant<FA_D>{}}},
-                                  ct::shape<1, FD_SMAX, 1, FA_D>{}};
-    auto pWM = ct::partition_view{ct::tensor_span{_WM, ct::extents{ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
-                                  ct::shape<1, FD_SMAX, 1>{}};
-    auto pWL = ct::partition_view{ct::tensor_span{_WL, ct::extents{ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
-                                  ct::shape<1, FD_SMAX, 1>{}};
-    auto pO = ct::partition_view{ct::tensor_span{_O, ct::extents{1, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
+    auto pWO = ct::partition_view{ct::tensor_span{_WO, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}, ct::integral_constant<FA_D>{}}},
+                                  ct::shape<1, 1, FD_SMAX, 1, FA_D>{}};
+    auto pWM = ct::partition_view{ct::tensor_span{_WM, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
+                                  ct::shape<1, 1, FD_SMAX, 1>{}};
+    auto pWL = ct::partition_view{ct::tensor_span{_WL, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}}},
+                                  ct::shape<1, 1, FD_SMAX, 1>{}};
+    auto pO = ct::partition_view{ct::tensor_span{_O, ct::extents{n_seqs, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<1, 1, FA_D>{}};
 
-    int h = static_cast<int>(ct::bid().x);
+    auto [h_u, b_u, dummy] = ct::bid();
+    int h = static_cast<int>(h_u), b = static_cast<int>(b_u);
     i32_s sidx = ct::iota<i32_s>();
-    auto valid = sidx < n_splits;                                   // splits past n_splits are padding
-    f32_so o_s = ct::reshape<ct::shape<FD_SMAX, FA_D>>(pWO.load_masked(h, 0, 0, 0));   // row 0 of every split
-    f32_s m_s = ct::reshape<ct::shape<FD_SMAX, 1>>(pWM.load_masked(h, 0, 0));
-    f32_s l_s = ct::reshape<ct::shape<FD_SMAX, 1>>(pWL.load_masked(h, 0, 0));
+    auto valid = sidx < n_splits;
+    f32_so o_s = ct::reshape<ct::shape<FD_SMAX, FA_D>>(pWO.load_masked(b, h, 0, 0, 0));
+    f32_s m_s = ct::reshape<ct::shape<FD_SMAX, 1>>(pWM.load_masked(b, h, 0, 0));
+    f32_s l_s = ct::reshape<ct::shape<FD_SMAX, 1>>(pWL.load_masked(b, h, 0, 0));
     o_s = ct::select(valid, o_s, ct::zeros<f32_so>());
     l_s = ct::select(valid, l_s, ct::zeros<f32_s>());
     m_s = ct::select(valid, m_s, ct::full<f32_s>(-FLT_MAX));
@@ -252,34 +269,33 @@ __tile_global__ void flash_decode_combine_kernel(const float* __restrict__ _WO, 
     auto w = ct::select(valid, ct::exp(m_s - mstar), ct::zeros<f32_s>());
     auto L = ct::sum(w * l_s, 0_ic);
     auto o = ct::sum(o_s * w, 0_ic) / L;
-    pO.store(ct::reshape<ct::shape<1, 1, FA_D>>(ct::element_cast<T>(o)), 0, h, 0);
+    pO.store(ct::reshape<ct::shape<1, 1, FA_D>>(ct::element_cast<T>(o)), b, h, 0);
 }
 
+// q: [B, HQ, 128]; k_cache / v_cache: [max_seqs * max_len, HKV, 128]; o: [B, HQ, 128]. d_slots / d_pos: device ints.
+// max_kv: the longest attended length in the batch (host value; it only sets the grid's split dimension).
 template <typename T, int HQ, int HKV>
-cudaError_t launch_flash_decode(const T* q, const T* k, const T* v, T* o, int n_kv, const DecodeWorkspace& ws,
-                                cudaStream_t stream = 0) {
+cudaError_t launch_flash_decode_batch(const T* q, const T* k_cache, const T* v_cache, T* o, int B, const int* d_slots,
+                                      const int* d_pos, int max_len, int max_kv, const BatchDecodeWorkspace& ws,
+                                      cudaStream_t stream = 0) {
     float scale = 1.0f / std::sqrt(static_cast<float>(FA_D));
-    int n_tiles = (n_kv + FD_BC - 1) / FD_BC;
-    int want = (512 + HQ - 1) / HQ;                                  // aim at ~512 blocks
-    int n_splits = n_tiles < want ? n_tiles : want;
-    if (n_splits > FD_SMAX) n_splits = FD_SMAX;
-    int tps = (n_tiles + n_splits - 1) / n_splits;
-    n_splits = (n_tiles + tps - 1) / tps;                           // no empty split
-    flash_decode_partial_kernel<T, HQ, HKV, 2><<<dim3(HQ, n_splits, 1), 1, 0, stream>>>(
-        q, k, v, ws.o, ws.m, ws.l, n_kv, tps, n_splits, scale);
+    int n_tiles = (max_kv + FD_BC - 1) / FD_BC;
+    int want = (512 + HQ * B - 1) / (HQ * B);                       // ~512 blocks in total
+    // QWEN3_DECODE_SPLITS=<n> fixes the split count, so that the same sequence is summed in the same groups whatever the
+    // batch size (used to tell numerical regrouping apart from a bug when comparing batched and alone decoding).
+    static const int forced = [] { const char* e = std::getenv("QWEN3_DECODE_SPLITS"); return e ? std::atoi(e) : 0; }();
+    if (forced > 0) want = forced;
+    int target = want < 1 ? 1 : want;
+    if (target > FD_SMAX) target = FD_SMAX;
+    int n_splits = target < n_tiles ? target : n_tiles;   // no sequence uses more splits than this
+    if (B * n_splits > ws.max_parts) {
+        std::fprintf(stderr, "decode workspace too small: %d sequences x %d splits > %d\n", B, n_splits, ws.max_parts);
+        return cudaErrorInvalidValue;
+    }
+    flash_decode_batch_partial_kernel<T, HQ, HKV, 2><<<dim3(HQ, n_splits, B), 1, 0, stream>>>(
+        q, k_cache, v_cache, ws.o, ws.m, ws.l, d_slots, d_pos, B, max_len, target, n_splits, scale);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
-    flash_decode_combine_kernel<T, HQ><<<HQ, 1, 0, stream>>>(ws.o, ws.m, ws.l, o, n_splits);
+    flash_decode_batch_combine_kernel<T, HQ><<<dim3(HQ, B, 1), 1, 0, stream>>>(ws.o, ws.m, ws.l, o, B, n_splits);
     return cudaGetLastError();
-}
-
-// Entry point used by the engine: split-KV decode on Hopper when a workspace is given, the kernels above otherwise.
-template <typename T, int HQ, int HKV>
-cudaError_t launch_attention_auto(const T* q, const T* k, const T* v, T* o, int n_q, int n_kv, const DecodeWorkspace* ws,
-                                  cudaStream_t stream = 0) {
-    static const bool force_small = [] { const char* e = std::getenv("QWEN3_ATTN"); return e && std::string(e) == "small"; }();
-    static const bool no_split = [] { const char* e = std::getenv("QWEN3_DECODE_SPLIT"); return e && std::string(e) == "0"; }();
-    if (n_q == 1 && ws && tile_profile() == TileProfile::BIG && !force_small && !no_split)
-        return launch_flash_decode<T, HQ, HKV>(q, k, v, o, n_kv, *ws, stream);
-    return launch_flash_attention<T, HQ, HKV>(q, k, v, o, n_q, n_kv, stream);
 }

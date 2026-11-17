@@ -104,8 +104,7 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
     exp = full[n_prompt:].numpy()
     variants = [("default (big tiles; decode = split-KV kernel on Hopper)", {})]
     if ab:   # same HF reference, several engine configurations: isolates what changed the numbers
-        variants += [("default but decode with the 64x128 kernel (QWEN3_DECODE_SPLIT=0)", {"QWEN3_DECODE_SPLIT": "0"}),
-                     ("big GEMM tiles + SMALL attention (QWEN3_ATTN=small)", {"QWEN3_ATTN": "small"}),
+        variants += [("big GEMM tiles + SMALL attention (QWEN3_ATTN=small)", {"QWEN3_ATTN": "small"}),
                      ("all small tiles (QWEN3_TILES=small): the configuration verified on the L4", {"QWEN3_TILES": "small"})]
     summary = []
     for vi, (tag, extra) in enumerate(variants):

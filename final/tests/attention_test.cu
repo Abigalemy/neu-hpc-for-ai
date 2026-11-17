@@ -8,11 +8,21 @@ static int run(int n_q, int n_kv, char** a) {
     T* q = (T*)to_dev(read_file(a[0])); T* k = (T*)to_dev(read_file(a[1])); T* v = (T*)to_dev(read_file(a[2]));
     size_t bytes = (size_t)n_q * HQ * FA_D * sizeof(T);
     T* o; CK(cudaMalloc(&o, bytes));
-    DecodeWorkspace ws;   // the split-KV decode path is taken for n_q == 1 on Hopper (see launch_attention_auto)
-    CK(cudaMalloc(&ws.o, (size_t)HQ * FD_SMAX * FD_BR * FA_D * sizeof(float)));
-    CK(cudaMalloc(&ws.m, (size_t)HQ * FD_SMAX * FD_BR * sizeof(float)));
-    CK(cudaMalloc(&ws.l, (size_t)HQ * FD_SMAX * FD_BR * sizeof(float)));
-    CK((launch_attention_auto<T, HQ, HKV>(q, k, v, o, n_q, n_kv, &ws)));
+    if (n_q == 1 && tile_profile() == TileProfile::BIG) {
+        // the engine's decode path: batched split-KV kernel, here with one sequence in slot 0 of a cache of n_kv rows
+        BatchDecodeWorkspace ws;
+        ws.max_parts = FD_SMAX + 1;
+        CK(cudaMalloc(&ws.o, (size_t)ws.max_parts * HQ * FD_BR * FA_D * sizeof(float)));
+        CK(cudaMalloc(&ws.m, (size_t)ws.max_parts * HQ * FD_BR * sizeof(float)));
+        CK(cudaMalloc(&ws.l, (size_t)ws.max_parts * HQ * FD_BR * sizeof(float)));
+        int h_slot = 0, h_pos = n_kv - 1, *d_slot, *d_pos;
+        CK(cudaMalloc(&d_slot, sizeof(int))); CK(cudaMalloc(&d_pos, sizeof(int)));
+        CK(cudaMemcpy(d_slot, &h_slot, sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_pos, &h_pos, sizeof(int), cudaMemcpyHostToDevice));
+        CK((launch_flash_decode_batch<T, HQ, HKV>(q, k, v, o, 1, d_slot, d_pos, n_kv, n_kv, ws)));
+    } else {
+        CK((launch_flash_attention<T, HQ, HKV>(q, k, v, o, n_q, n_kv)));
+    }
     CK(cudaDeviceSynchronize());
     std::vector<char> h(bytes);
     CK(cudaMemcpy(h.data(), o, bytes, cudaMemcpyDeviceToHost));

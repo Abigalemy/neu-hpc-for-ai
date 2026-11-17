@@ -8,8 +8,8 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 |---|---|---|---|
 | 0. Setup, vLLM baseline | 11/16 | prep (weekly report) | in progress |
 | 1. Dense modules + tests | 11/17-11/18 | Part 0 | done (modules except attention; attention + KV cache are stage 2): RMSNorm passes all 90 synthetic cases on L4 (bf16: 89/90 bit-identical, 1 case differs by one bf16 ulp); RoPE (rotate-half, theta 1e6, in place) passes all 32 synthetic cases on L4 (bf16 bit-identical, fp32 worst 4.8e-7; cos/sin tables come from HF, our own table generator is still to do); MLP (gate/up fused with SiLU, then down) passes all 20 synthetic cases on L4 (fp32 256/512; bf16 256/512, 2048/768, 2560/1024) with tiles 16x32x32; 64x64 and 128x128 tiles failed to launch with "invalid argument" on bf16 (suspected: shared-memory footprint of the compiler's pipeline stages, not verified); embedding (bit-exact), lm_head linear layer, and greedy argmax (first index wins ties, incl. forced ties and vocab not a multiple of the 1024 chunk) all pass on L4 with synthetic data; real Qwen3-4B bf16 weights also pass on L4 (`real_weights_test.py`): embedding, all RMSNorms of layers 0 and 35 + final norm + q/k norms (bit-identical), MLP layers 0 and 35 with the real 2560/9728 shapes, lm_head with the real 151936 vocab, argmax. Inputs are embedding rows (not hidden states from deep inside the network); RoPE has no real-weight check (it has no weights, its tables come from HF) |
-| 2. End-to-end generation | 11/18-11/19 | Part 0 | done (first H100 numbers below): fused causal GQA flash attention reading the KV cache directly (online softmax, tiles 16x16) passes 36 synthetic cases on L4 (prefill and decode, heads 32/8, 32/4, 16/8, n_kv up to 1100). Whole model now runs end to end without PyTorch (`engine/`: safetensors parser, weights copied to the GPU once, per-layer KV cache, residual add, 36-layer forward, greedy decode) and is checked against HF on CPU with `e2e_test.py`: Qwen3-0.6B 43/43 top-1 positions agree, greedy output identical for 16/16 tokens, RoPE tables bit-identical; Qwen3-4B 40/43 top-1 (the 3 mismatches are HF near-ties, margins 0.0-0.125), cosine >= 0.9994, KV-cache decode path 16/16. Greedy generation of the 4B diverges from HF `generate` at token 2: most likely HF's cached decode vs full forward differing on a near tie (inferred from the logs, not yet confirmed). First timings on an L4 (27-token prompt, NOT comparable to the H100 vLLM baseline): 0.6B TTFT 9.9 ms / ITL 8.0 ms; 4B TTFT 44.5 ms / ITL 43.3 ms. Next: timing on the H100 with the same 3072-in/1024-out workload as the vLLM baseline, then an OpenAI-compatible server for AIPerf |
-| 3. Reach 10x of vLLM, 128K YaRN | 11/20-11/22 | Part 0 | 10x reached for 3072 in / 1024 out (TTFT 1.08x, ITL 2.03x of vLLM); 128K / YaRN and other workloads not done |
+| 2. End-to-end generation | 11/18-11/19 | Part 0 | done (first H100 numbers below; HTTP server written and tested with a fake engine, see "HTTP server"): fused causal GQA flash attention reading the KV cache directly (online softmax, tiles 16x16) passes 36 synthetic cases on L4 (prefill and decode, heads 32/8, 32/4, 16/8, n_kv up to 1100). Whole model now runs end to end without PyTorch (`engine/`: safetensors parser, weights copied to the GPU once, per-layer KV cache, residual add, 36-layer forward, greedy decode) and is checked against HF on CPU with `e2e_test.py`: Qwen3-0.6B 43/43 top-1 positions agree, greedy output identical for 16/16 tokens, RoPE tables bit-identical; Qwen3-4B 40/43 top-1 (the 3 mismatches are HF near-ties, margins 0.0-0.125), cosine >= 0.9994, KV-cache decode path 16/16. Greedy generation of the 4B diverges from HF `generate` at token 2: most likely HF's cached decode vs full forward differing on a near tie (inferred from the logs, not yet confirmed). First timings on an L4 (27-token prompt, NOT comparable to the H100 vLLM baseline): 0.6B TTFT 9.9 ms / ITL 8.0 ms; 4B TTFT 44.5 ms / ITL 43.3 ms. Next: timing on the H100 with the same 3072-in/1024-out workload as the vLLM baseline, then an OpenAI-compatible server for AIPerf |
+| 3. Reach 10x of vLLM, 128K YaRN, serving | 11/20-11/22 | Part 0 | done: through the HTTP server with AIPerf, every workload of the suite (concurrency 1 to 64) is within 2.4x of vLLM on TTFT and ITL, 128K (YaRN) TTFT 2.26x / ITL 2.46x; see "Workload suite" |
 | 4. Two-GPU all-to-all mock | 11/23 | Part 2 | not started |
 | 5. Single-GPU Qwen3-30B-A3B | 11/24-11/26 | Part 1 | not started |
 | 6. DP + EP, multi-process architecture | 11/27-11/28 | Part 3, Part 5 | not started |
@@ -184,7 +184,71 @@ Correctness at long context (128K itself cannot be compared with HF on a CPU): Q
   The default now passes (criterion unchanged) and its decode accuracy matches the small fp32-P attention (max error 0.312 vs 0.319). The old 64x128 decode reproduced its deficit to the digit (0.998630, 0.562, same as the previous run), confirming it is a property of that kernel with a single query. Root cause still not identified; a hypothesis consistent with the data is the long serial accumulation (64 key tiles into one accumulator inside the mma) that the split kernel avoids (4 tiles per block, fp32 combine). Not verified.
 - Decode at 128K with the split-KV kernel: attention 23.8 ms of a 31.5 ms step (810 GB/s of cache; floor ~5.8 ms). Each query head reads its KV head separately (4 query heads per KV head), relying on L2; packing the 4 heads into one block is the next lever (hypothesis).
 
-Not yet measured: 128K input (needs YaRN), and the same workload for the Qwen3-30B-A3B on H200.
+### HTTP server (OpenAI-compatible, no PyTorch), 2026-11-16
+
+- `engine/qwen3_capi.cu` -> `libqwen3engine.so`: C interface (`qe_create` with a number of KV-cache slots, `qe_prefill`
+  of one slot with chunked prefill for long prompts, `qe_decode_batch` of several slots in one step, `qe_vocab`,
+  `qe_max_len`, `qe_max_chunk`, `qe_max_seqs`).
+- `server/server.py`: FastAPI; `/v1/chat/completions` and `/v1/completions` (both with SSE streaming), `/v1/models`,
+  `/health`; `max_tokens` / `max_completion_tokens`, `min_tokens`, `ignore_eos`, `stream_options.include_usage`,
+  `chat_template_kwargs`. Greedy only: `temperature` > 0 is rejected with 400 instead of being silently ignored.
+  Lengths are checked before the engine is called (the engine exits on invalid arguments). Incremental detokenisation
+  with a sliding window, so the per-token cost does not grow with the output length. Tokenizer and chat template from
+  HF `tokenizers` / `transformers` (no PyTorch needed for them).
+- Continuous batching: a scheduler thread admits waiting requests into free KV-cache slots (prefill one request at a
+  time), then decodes every running sequence in one batched step; finished or disconnected requests free their slot at
+  once; an engine error fails only the requests involved. Limitation: a prefill stalls the decode of the others (no
+  chunked prefill interleaving). `min_tokens` does not mask
+  EOS like vLLM does: an early EOS is kept as a (silent) token and generation continues.
+- `server/test_server.py`: 11 tests with a fake engine and fake tokenizers, run locally and again inside the Modal image
+  at build time (stream format and [DONE], exact lengths and usage, EOS stop vs ignore_eos, max_completion_tokens
+  precedence, non-stream responses, completions with text and token ids, four 400 cases, three concurrent requests decoded in one
+  batch with output equal to running alone, more requests than slots, a client disconnect frees its slot, an engine
+  error fails only its request, a 3-byte UTF-8 character split over tokens). They found real bugs that are fixed: an
+  explicit `max_tokens: 0` was replaced by the default; a failing prefill could leak its slot; an exception could stop
+  the engine thread silently.
+- `modal_aipref.py`: the library is compiled for sm_90 and its exported symbols checked while the image is built on a
+  CPU; the GPU runs the server plus AIPerf with the same settings as `modal_vllm_aipref.py` (tokenizer given as the local
+  snapshot directory, offline). `--compat` runs AIPerf against the fake-engine server on a CPU first (0 errors at
+  concurrency 1 and 8).
+
+### Batched decode correctness (2026-11-17)
+
+`tests/batch_test.cu` (`batch_check.py`, Qwen3-4B, H100): 4 sequences of 27 / 300 / 1000 / 3000 tokens, each decoded
+16 steps alone in slot 0, then all four together in slots 0-3 with the same tokens (teacher forcing).
+
+- First run: min cosine 0.99926 against my pre-set 0.9999 -> FAIL (top-1 identical everywhere). Diagnosis with a fixed
+  split count (`QWEN3_DECODE_SPLITS=4`): every sequence whose key tiles were grouped the same way in both runs was
+  bit-identical; the rest differed only because the tiles-per-split was computed from the longest sequence of the batch,
+  i.e. a different fp32 summation order, not wrong data.
+- Fix: each sequence now splits its own key tiles (`s_b = min(target, n_tiles_b)`), so its result does not depend on
+  the other sequences in the batch. Rerun: with a fixed split count **64/64 rows bit-identical** (new criterion for this
+  test, stricter than a cosine bound); with the default rule (split count depends on the batch size) min cosine 0.99926,
+  top-1 0 mismatches, reported as informational. Attention unit tests 36/36 and the 8K YaRN A/B against HF (decode min
+  cosine 0.999687, unchanged) rerun after the change.
+
+### Workload suite (2026-11-17): our server vs vLLM, both through AIPerf
+
+Qwen3-4B bf16, 1x H100, greedy, EOS ignored, prefix caching off for vLLM; same AIPerf settings and seed; our server
+with 64 KV-cache slots of 4224 tokens. 0 request errors everywhere. Raw output on volume `final-results`
+(`suite_vllm_1794881615`, `suite_ours_1794881935`, `ours_isl130816_osl128_1794882219`).
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio | ITL vLLM / ours (ms) | ratio | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 29.21 / 13.60 | 0.47x | 4.25 / 6.70 | 1.58x | 224 / 147 |
+| long_out | 3072 / 1024, 1 | 63.73 / 74.78 | 1.17x | 4.44 / 7.76 | 1.75x | 222 / 128 |
+| balanced_c16 | 256 / 256, 16 | 107.33 / 99.53 | 0.93x | 4.70 / 8.73 | 1.86x | 3126 / 1750 |
+| balanced_c64 | 256 / 256, 64 | 270.13 / 387.44 | 1.43x | 6.35 / 15.01 | 2.36x | 8610 / 3873 |
+| prefill_heavy | 2048 / 32, 8 | 204.67 / 209.26 | 1.02x | 6.99 / 14.76 | 2.11x | 601 / 382 |
+| decode_heavy | 64 / 1024, 32 | 95.96 / 141.27 | 1.47x | 5.57 / 11.26 | 2.02x | 5639 / 2804 |
+| 128K (YaRN) | 130816 / 128, 1 | 10446.8 / 23604.25 | 2.26x | 10.43 / 25.65 | 2.46x | |
+
+Part 0 ("within 10x of vLLM for any workload") is met on every workload measured, worst 2.46x (128K ITL). Caveats:
+vLLM's 128K numbers are from the earlier run (same settings); TTFT ratios below 1 at low concurrency are not a claim of
+being faster at prefill (vLLM's server adds its own per-request overhead at small sizes). Weakest spots for Part 4
+(3x): batched ITL at concurrency 64 (2.36x) and long-context decode (2.46x).
+
+Not yet measured: the same workloads for the Qwen3-30B-A3B on H200.
 
 ## Tile toolchain notes
 - Compile: `nvcc --enable-tile -std=c++20 -arch=sm_80 file.cu`; include `cuda_tile.h`; kernels use `__tile_global__`; block dim must be 1.
