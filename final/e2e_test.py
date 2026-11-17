@@ -8,7 +8,7 @@
 
 What is checked:
   * teacher forcing: prefill the prompt in one chunk, then feed HF's own continuation one token at a time
-    (this exercises the KV-cache decode path); logits at every position vs HF: top-1 agreement, cosine, max error
+    (this exercises the KV-cache decode path); logits on the last min(total_tokens, 64) positions vs HF: top-1 agreement, cosine, max error
   * greedy generation of the engine vs HF's greedy tokens
   * the engine's RoPE tables vs HF's rotary embedding
   * TTFT / ITL of this (unoptimised) engine on the L4 -- NOT comparable with the vLLM H100 baseline.
