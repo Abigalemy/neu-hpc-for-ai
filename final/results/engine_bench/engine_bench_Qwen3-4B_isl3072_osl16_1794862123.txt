@@ -1,0 +1,25 @@
+config: hidden=2560 inter=9728 layers=36 heads=32/8 | load 4.5 s (weights copied to the GPU once)
+warm-up done (16 tokens generated)
+REQ 0: TTFT_MS 1071.82  ITL_MEAN_MS 19.939  ITL_P50_MS 19.933  ITL_P99_MS 19.956  E2E_MS 1370.9  (in 3072, out 16)
+AVERAGE over 1 requests: TTFT_MS 1071.82  ITL_MS 19.939
+
+PROFILE prefill, 1 request of the prompt length (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  mlp_gate_up_silu       36    290.687   27.1%       12.3      37.90
+  attention              36    249.127   23.2%        1.8      11.18
+  mlp_down               36    247.388   23.1%        7.2      22.27
+  q_proj                 36    109.228   10.2%        6.9      21.23
+  o_proj                 36    106.300    9.9%        7.1      21.82
+  v_proj                 36     27.731    2.6%        6.8      20.91
+  k_proj                 36     27.727    2.6%        6.8      20.91
+  qk_norm                36      9.230    0.9%      245.4       0.00
+  rmsnorm                73      1.796    0.2%     1261.0       0.00
+  residual_add           72      1.678    0.2%     2024.1       0.00
+  rope                   36      0.773    0.1%     2930.7       0.00
+  lm_head                 1      0.594    0.1%     1309.8       1.31
+  kv_write               36      0.477    0.0%     1899.3       0.00
+  embedding               1      0.027    0.0%      588.6       0.00
+  TOTAL (stages)              1072.763
+
+
+forward: n=1 start=3096 exceeds engine limits

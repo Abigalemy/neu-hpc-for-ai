@@ -1,0 +1,8 @@
+workload,isl,osl,concurrency,ttft_vllm_ms,ttft_ours_ms,ttft_ratio,itl_vllm_ms,itl_ours_ms,itl_ratio,tok_s_vllm,tok_s_ours,errors_ours_pct,run_ours,run_vllm
+baseline,128,128,1,29.21,13.6,0.47,4.25,6.7,1.58,224,147,0.0,suite_ours_1794881935/baseline,suite_vllm_1794881615/baseline
+long_out,3072,1024,1,63.73,74.78,1.17,4.44,7.76,1.75,222,128,0.0,suite_ours_1794881935/long_out,suite_vllm_1794881615/long_out
+balanced_c16,256,256,16,107.33,99.53,0.93,4.7,8.73,1.86,3126,1750,0.0,suite_ours_1794881935/balanced_c16,suite_vllm_1794881615/balanced_c16
+balanced_c64,256,256,64,270.13,387.44,1.43,6.35,15.01,2.36,8610,3873,0.0,suite_ours_1794881935/balanced_c64,suite_vllm_1794881615/balanced_c64
+prefill_heavy,2048,32,8,204.67,209.26,1.02,6.99,14.76,2.11,601,382,0.0,suite_ours_1794881935/prefill_heavy,suite_vllm_1794881615/prefill_heavy
+decode_heavy,64,1024,32,95.96,141.27,1.47,5.57,11.26,2.02,5639,2804,0.0,suite_ours_1794881935/decode_heavy,suite_vllm_1794881615/decode_heavy
+128k_yarn,130816,128,1,10446.84,23604.25,2.26,10.43,25.65,2.46,11,5,0.0,ours_isl130816_osl128_1794882219,vllm_isl130816_osl128_1794875810

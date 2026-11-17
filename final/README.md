@@ -2,32 +2,140 @@
 
 Goal (from the assignment): approach vLLM performance without PyTorch in the serving path.
 
-## Plan -> assignment parts
+## Status (2026-11-17)
 
-| Stage | Dates | Part | Status |
-|---|---|---|---|
-| 0. Setup, vLLM baseline | 11/16 | prep (weekly report) | in progress |
-| 1. Dense modules + tests | 11/17-11/18 | Part 0 | done (modules except attention; attention + KV cache are stage 2): RMSNorm passes all 90 synthetic cases on L4 (bf16: 89/90 bit-identical, 1 case differs by one bf16 ulp); RoPE (rotate-half, theta 1e6, in place) passes all 32 synthetic cases on L4 (bf16 bit-identical, fp32 worst 4.8e-7; cos/sin tables come from HF, our own table generator is still to do); MLP (gate/up fused with SiLU, then down) passes all 20 synthetic cases on L4 (fp32 256/512; bf16 256/512, 2048/768, 2560/1024) with tiles 16x32x32; 64x64 and 128x128 tiles failed to launch with "invalid argument" on bf16 (suspected: shared-memory footprint of the compiler's pipeline stages, not verified); embedding (bit-exact), lm_head linear layer, and greedy argmax (first index wins ties, incl. forced ties and vocab not a multiple of the 1024 chunk) all pass on L4 with synthetic data; real Qwen3-4B bf16 weights also pass on L4 (`real_weights_test.py`): embedding, all RMSNorms of layers 0 and 35 + final norm + q/k norms (bit-identical), MLP layers 0 and 35 with the real 2560/9728 shapes, lm_head with the real 151936 vocab, argmax. Inputs are embedding rows (not hidden states from deep inside the network); RoPE has no real-weight check (it has no weights, its tables come from HF) |
-| 2. End-to-end generation | 11/18-11/19 | Part 0 | done (first H100 numbers below; HTTP server written and tested with a fake engine, see "HTTP server"): fused causal GQA flash attention reading the KV cache directly (online softmax, tiles 16x16) passes 36 synthetic cases on L4 (prefill and decode, heads 32/8, 32/4, 16/8, n_kv up to 1100). Whole model now runs end to end without PyTorch (`engine/`: safetensors parser, weights copied to the GPU once, per-layer KV cache, residual add, 36-layer forward, greedy decode) and is checked against HF on CPU with `e2e_test.py`: Qwen3-0.6B 43/43 top-1 positions agree, greedy output identical for 16/16 tokens, RoPE tables bit-identical; Qwen3-4B 40/43 top-1 (the 3 mismatches are HF near-ties, margins 0.0-0.125), cosine >= 0.9994, KV-cache decode path 16/16. Greedy generation of the 4B diverges from HF `generate` at token 2: most likely HF's cached decode vs full forward differing on a near tie (inferred from the logs, not yet confirmed). First timings on an L4 (27-token prompt, NOT comparable to the H100 vLLM baseline): 0.6B TTFT 9.9 ms / ITL 8.0 ms; 4B TTFT 44.5 ms / ITL 43.3 ms. Next: timing on the H100 with the same 3072-in/1024-out workload as the vLLM baseline, then an OpenAI-compatible server for AIPerf |
-| 3. Reach 10x of vLLM, 128K YaRN, serving | 11/20-11/22 | Part 0 | done: through the HTTP server with AIPerf, every workload of the suite (concurrency 1 to 64) is within 2.4x of vLLM on TTFT and ITL, 128K (YaRN) TTFT 2.26x / ITL 2.46x; see "Workload suite" |
-| 4. Two-GPU all-to-all mock | 11/23 | Part 2 | not started |
-| 5. Single-GPU Qwen3-30B-A3B | 11/24-11/26 | Part 1 | not started |
-| 6. DP + EP, multi-process architecture | 11/27-11/28 | Part 3, Part 5 | not started |
-| 7. Performance to 3x, write-up | 11/29-11/30 | Part 4 + submission | not started |
+| Part | What | Status |
+|---|---|---|
+| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 2.46x (below) |
+| Part 2 | Two-GPU all-to-all mock | next |
+| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | not started |
+| Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
+| Part 4 | Within 3x of vLLM; write-up | not started |
 
-## Rules for myself
-- Understand every line the coding agent writes; Qwen3 only (head_dim 128), no generic code.
-- Attention must be fused (FlashAttention) and must use the KV cache; weights loaded to the GPU once.
-- Tile kernels (`__tile_global__`), not SIMT `__global__`.
-- Correctness check before any benchmark; record commit hash with each measurement.
+Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100): TTFT 23.60 s vs vLLM 10.45 s (2.26x), ITL
+25.65 ms vs 10.43 ms (2.46x).
 
-## Commands
+## What is here
+
+- `kernels/`: CUDA Tile kernels (`__tile_global__`): RMSNorm, RoPE, linear (GEMM), fused gate/up + SiLU, embedding,
+  argmax, residual add, KV-cache scatter, flash attention (causal GQA over the KV cache; prefill, and split-KV batched
+  decode over cache slots).
+- `engine/`: safetensors loader (weights copied to the GPU once), RoPE tables incl. YaRN, the 36-layer forward pass
+  with a per-slot KV cache (`qwen3_engine.cuh`), and a C API (`qwen3_capi.cu` -> `libqwen3engine.so`).
+- `server/`: OpenAI-compatible HTTP server (FastAPI, SSE streaming) with continuous batching; no PyTorch.
+- `tests/`, `gen_cases.py`, `run_tests.py`, `schema.sql`: unit tests per module against HF reference outputs stored
+  in SQLite; `e2e_test.py` (whole model vs HF), `batch_test.cu` (batched vs alone), `server/test_server.py`.
+- `results/`: AIPerf summary exports of every run in the tables below, plus `summary.csv` and `comparison.csv`
+  (`python tools/summarize_results.py` rebuilds both).
+- `modal_*.py`, `*_check.py`, `*_sweep_modal.py`, `bench_modal.py`: Modal launchers (each prints its plan and cost
+  cap and needs `--yes` to use a GPU).
+
+## Final configuration (Part 0)
+
+- Model: `Qwen/Qwen3-4B` bf16, snapshot `1cfa9a7208912126459214e8b04321603b3df60c` (the 8K check uses
+  `Qwen/Qwen3-0.6B`, snapshot `c1899de289a04d12100db370d81485cdf75e47ca`).
+- GPU: 1x H100. Tiles chosen by device: on Hopper GEMM 128x128x64 (64x128x64 for <= 64 tokens), fused gate/up 128x64x64 (64x64x64 for 17-64 tokens, 16x64x64 below),
+  prefill attention 64x128 with split P (P = P_hi + P_lo in bf16, fp32 accumulator), decode attention split-KV
+  (16-row query tile, 128 keys per tile, ~512 blocks in total, fp32 combine). On other GPUs the small tiles that were
+  verified on the L4.
+- 128K: YaRN factor 4 over the original 32768 context = 131072 tokens for input plus output.
+- Server: 64 KV-cache slots of 4224 tokens for the workload suite; 1 slot of 131072 tokens for 128K. Greedy only.
+- Environment switches (for experiments only; none is set in the runs above): `QWEN3_TILES=small`,
+  `QWEN3_ATTN=small`, `QWEN3_YARN=<factor>`, `QWEN3_DECODE_SPLITS=<n>` (fixed decode split count).
+
+## Results: our server vs vLLM (Part 0)
+
+Qwen3-4B bf16, 1x H100, both measured with AIPerf through their HTTP servers, same AIPerf settings and seed, greedy,
+EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source: `results/comparison.csv`.
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio | ITL vLLM / ours (ms) | ratio | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 29.21 / 13.60 | 0.47x | 4.25 / 6.70 | 1.58x | 224 / 147 |
+| long_out | 3072 / 1024, 1 | 63.73 / 74.78 | 1.17x | 4.44 / 7.76 | 1.75x | 222 / 128 |
+| balanced_c16 | 256 / 256, 16 | 107.33 / 99.53 | 0.93x | 4.70 / 8.73 | 1.86x | 3126 / 1750 |
+| balanced_c64 | 256 / 256, 64 | 270.13 / 387.44 | 1.43x | 6.35 / 15.01 | 2.36x | 8610 / 3873 |
+| prefill_heavy | 2048 / 32, 8 | 204.67 / 209.26 | 1.02x | 6.99 / 14.76 | 2.11x | 601 / 382 |
+| decode_heavy | 64 / 1024, 32 | 95.96 / 141.27 | 1.47x | 5.57 / 11.26 | 2.02x | 5639 / 2804 |
+| 128K (YaRN x4) | 130816 / 128, 1 | 10446.84 / 23604.25 | 2.26x | 10.43 / 25.65 | 2.46x | |
+
+Notes: the vLLM 128K run is from an earlier session with the same settings. TTFT ratios below 1 at low concurrency
+are not a claim of faster prefill (vLLM's server has its own per-request overhead at small sizes). The 128K workload
+is 130816 + 128 tokens because the chat template adds tokens and the YaRN context (131072) covers input and output.
+
+## Correctness checks
+
+- Unit tests per module against HF (SQLite cases, `modal_test_h100.py`): RMSNorm, RoPE, linear, MLP, embedding,
+  argmax, attention (36 cases, prefill and decode, heads 32/8, 32/4, 16/8; bf16 bound derived from the arithmetic,
+  |d| <= 2^-8 (max|V| + 2|e|)). All pass on the H100 with the final tiles; attention was rerun after the last kernel
+  change (2026-11-17).
+- Whole model vs HF (`e2e_test.py`): Qwen3-0.6B with an 8192-token prompt and YaRN x4: top-1 60/64 (every mismatch an
+  HF near-tie, margin <= 0.062), min cosine prefill 0.999789 / decode 0.999687 (criterion > 0.999), greedy tokens 16/16,
+  RoPE tables bit-identical. Qwen3-4B, 43 positions: criterion met (see the development log).
+- Batched decode vs decoding alone (`batch_check.py`, Qwen3-4B, 4 sequences of 27-3000 tokens, 16 steps): with a fixed
+  split count, 64/64 logits rows bit-identical.
+- Server (`server/test_server.py`, 11 tests, fake engine): stream format, exact lengths and usage, EOS handling,
+  rejections, batching equals running alone, more requests than slots, disconnects, engine errors, UTF-8 split over
+  tokens. AIPerf compatibility checked on a CPU against the fake-engine server.
+
+## Known limitations
+
+- A prefill stalls the decode of the other running sequences (no chunked-prefill interleaving).
+- Greedy only (`temperature` > 0 is rejected); `min_tokens` does not mask EOS like vLLM.
+- Closest to the Part 4 limit (3x): ITL at concurrency 64 (2.36x) and long-context decode (2.46x); decode attention
+  still dominates the 128K step.
+- The old 64x128 attention kernel was less accurate for a single query (decode); the default decode path now uses
+  the split-KV kernel, which meets the criterion. The root cause in the old kernel was not identified.
+
+## How to reproduce
+
 ```bash
-modal run modal_vllm_aipref.py            # dry run: prints plan and cost cap
-modal run modal_vllm_aipref.py --yes      # vLLM baseline, 3072 in / 1024 out, single sequence
+python server/test_server.py                       # local, no GPU
+modal run modal_aipref.py --compat                 # CPU only: AIPerf vs the fake-engine server
+modal run modal_test_h100.py --yes                 # unit tests, 1x H100
+modal run e2e_test.py --yes --model Qwen/Qwen3-0.6B --gpu h100 --long 8192 --yarn 4 --ab
+modal run batch_check.py --yes --splits ,4
+modal run modal_vllm_aipref.py --yes --suite       # vLLM, workload suite
+modal run modal_aipref.py --yes --suite            # ours, workload suite
+modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn
+modal run modal_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2
+python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf
 ```
 
-## Measured baselines
+Weights come from the Modal volume `qwen3-hf-cache`; unit-test cases come from `modal run gen_cases.py`
+(`test_cases.db`, not committed). Raw AIPerf output (per-request logs) stays on the volume `final-results`.
+
+## Rules for myself
+- Understand every line; Qwen3 only (head_dim 128), no generic code.
+- Attention must be fused (FlashAttention) and must use the KV cache; weights loaded to the GPU once.
+- Tile kernels (`__tile_global__`), not SIMT `__global__`.
+- Correctness check before any benchmark; record the commit with each measurement.
+
+## Development log (history)
+
+Kept as the record of how the engine got here. Numbers in this section are superseded by the tables above, and some
+switches mentioned here no longer exist (`QWEN3_DECODE_SPLIT` was removed once the split-KV decode became the only
+decode path on Hopper). Engine-only measurements here time forward + argmax without the HTTP server.
+
+Original plan (dates as planned on 2026-11-16):
+
+| Stage | Dates | Part | Outcome |
+|---|---|---|---|
+| 0. Setup, vLLM baseline | 11/16 | prep | done |
+| 1. Dense modules + tests | 11/17-11/18 | Part 0 | done 11/16 |
+| 2. End-to-end generation | 11/18-11/19 | Part 0 | done 11/16 |
+| 3. Reach 10x of vLLM, 128K YaRN, serving | 11/20-11/22 | Part 0 | done 11/17 |
+| 4. Two-GPU all-to-all mock | 11/23 | Part 2 | |
+| 5. Single-GPU Qwen3-30B-A3B | 11/24-11/26 | Part 1 | |
+| 6. DP + EP, multi-process architecture | 11/27-11/28 | Part 3, Part 5 | |
+| 7. Performance to 3x, write-up | 11/29-11/30 | Part 4 + submission | |
+
+Notes from stages 1-2: RMSNorm passes all 90 synthetic cases (bf16: 89/90 bit-identical, 1 differs by one bf16 ulp);
+RoPE 32 cases (bf16 bit-identical); MLP 20 cases; embedding bit-exact; lm_head and argmax (first index wins ties) pass;
+real Qwen3-4B weights pass for embedding, the RMSNorms of layers 0 and 35, MLP layers 0 and 35, lm_head and argmax
+(`real_weights_test.py`). First end-to-end run vs HF: Qwen3-0.6B 43/43 top-1, Qwen3-4B 40/43 (the 3 mismatches HF
+near-ties). First L4 timings (27-token prompt): 4B TTFT 44.5 ms / ITL 43.3 ms.
+
+### First baselines (2026-11-16)
 
 vLLM, Qwen3-4B, bf16, 1x H100, single sequence (concurrency 1), 3072 input / 1024 output tokens, 5 requests, prefix caching off, measured with AIPerf on 2026-11-16. Raw output is on Modal volume `final-results` (`/results_store/vllm_isl3072_osl1024_1794855146`).
 
@@ -227,30 +335,12 @@ Correctness at long context (128K itself cannot be compared with HF on a CPU): Q
   top-1 0 mismatches, reported as informational. Attention unit tests 36/36 and the 8K YaRN A/B against HF (decode min
   cosine 0.999687, unchanged) rerun after the change.
 
-### Workload suite (2026-11-17): our server vs vLLM, both through AIPerf
+### Workload suite (2026-11-17)
 
-Qwen3-4B bf16, 1x H100, greedy, EOS ignored, prefix caching off for vLLM; same AIPerf settings and seed; our server
-with 64 KV-cache slots of 4224 tokens. 0 request errors everywhere. Raw output on volume `final-results`
-(`suite_vllm_1794881615`, `suite_ours_1794881935`, `ours_isl130816_osl128_1794882219`).
-
-| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio | ITL vLLM / ours (ms) | ratio | output tok/s vLLM / ours |
-|---|---|---|---|---|---|---|
-| baseline | 128 / 128, 1 | 29.21 / 13.60 | 0.47x | 4.25 / 6.70 | 1.58x | 224 / 147 |
-| long_out | 3072 / 1024, 1 | 63.73 / 74.78 | 1.17x | 4.44 / 7.76 | 1.75x | 222 / 128 |
-| balanced_c16 | 256 / 256, 16 | 107.33 / 99.53 | 0.93x | 4.70 / 8.73 | 1.86x | 3126 / 1750 |
-| balanced_c64 | 256 / 256, 64 | 270.13 / 387.44 | 1.43x | 6.35 / 15.01 | 2.36x | 8610 / 3873 |
-| prefill_heavy | 2048 / 32, 8 | 204.67 / 209.26 | 1.02x | 6.99 / 14.76 | 2.11x | 601 / 382 |
-| decode_heavy | 64 / 1024, 32 | 95.96 / 141.27 | 1.47x | 5.57 / 11.26 | 2.02x | 5639 / 2804 |
-| 128K (YaRN) | 130816 / 128, 1 | 10446.8 / 23604.25 | 2.26x | 10.43 / 25.65 | 2.46x | |
-
-Part 0 ("within 10x of vLLM for any workload") is met on every workload measured, worst 2.46x (128K ITL). Caveats:
-vLLM's 128K numbers are from the earlier run (same settings); TTFT ratios below 1 at low concurrency are not a claim of
-being faster at prefill (vLLM's server adds its own per-request overhead at small sizes). Weakest spots for Part 4
-(3x): batched ITL at concurrency 64 (2.36x) and long-context decode (2.46x).
-
-Not yet measured: the same workloads for the Qwen3-30B-A3B on H200.
+Moved to "Results: our server vs vLLM (Part 0)" at the top; run directories are listed in `results/comparison.csv`.
 
 ## Tile toolchain notes
 - Compile: `nvcc --enable-tile -std=c++20 -arch=sm_80 file.cu`; include `cuda_tile.h`; kernels use `__tile_global__`; block dim must be 1.
-- Verified (CPU-only Modal build, `tile_check.py`): image `nvidia/cuda:13.5.0-devel-ubuntu24.04` has `cuda_tile.h` and compiles a Tile kernel for sm_80 and sm_90 (H100/H200). Not yet run on a GPU.
+- Image `nvidia/cuda:13.5.0-devel-ubuntu24.04` has `cuda_tile.h`; every kernel here is compiled for sm_90 (H100) at image build time on a CPU (`tile_check.py` was the first check) and runs on the L4 (sm_89, small tiles) and the H100.
+- Big tiles need the >= 200 KB opt-in shared memory of Hopper; on the L4 (99 KB) 64x64 and larger bf16 tiles fail to launch with "invalid argument", so tiles are chosen by device.
 - Reference samples: NVIDIA/cuda-samples `cpp/9_CUDA_Tile` (tileLayerNorm, tileRope, tileMatmul, tileBmm).

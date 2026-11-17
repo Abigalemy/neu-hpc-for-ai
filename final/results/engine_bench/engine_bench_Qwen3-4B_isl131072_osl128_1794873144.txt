@@ -1,0 +1,45 @@
+RoPE: YaRN factor 4, original context 32768
+config: hidden=2560 inter=9728 layers=36 heads=32/8 | load 5.0 s (weights copied to the GPU once)
+tile profile: BIG (QWEN3_TILES=unset)
+warm-up done (16 tokens generated)
+REQ 0: TTFT_MS 22959.97  ITL_MEAN_MS 79.270  ITL_P50_MS 79.167  ITL_P99_MS 79.466  E2E_MS 33027.2  (in 131072, out 128)
+REQ 1: TTFT_MS 23027.32  ITL_MEAN_MS 79.325  ITL_P50_MS 79.216  ITL_P99_MS 79.942  E2E_MS 33101.6  (in 131072, out 128)
+AVERAGE over 2 requests: TTFT_MS 22993.65  ITL_MS 79.297
+
+PROFILE prefill, 1 request of the prompt length (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36  19818.758   86.0%        1.0     255.65
+  mlp_gate_up_silu       36   1294.719    5.6%        2.8     363.04
+  mlp_down               36    637.760    2.8%        2.8     368.51
+  qk_norm                36    436.248    1.9%      221.5       0.00
+  q_proj                 36    270.899    1.2%        2.8     365.29
+  o_proj                 36    266.553    1.2%        2.8     371.24
+  rmsnorm                73     72.374    0.3%     1335.2       0.00
+  k_proj                 36     68.250    0.3%        2.8     362.48
+  v_proj                 36     68.216    0.3%        2.8     362.66
+  residual_add           72     65.185    0.3%     2223.7       0.00
+  rope                   36     33.273    0.1%     2904.3       0.00
+  kv_write               36     13.278    0.1%     2911.2       0.00
+  embedding               1      0.705    0.0%      951.3       0.00
+  lm_head                 1      0.268    0.0%     2899.5       2.90
+  TOTAL (stages)             23046.487
+
+PROFILE decode step at context ~prompt_len (averaged) (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36     73.955   90.6%      261.3       1.05
+  mlp_gate_up_silu       36      1.671    2.0%     2146.5       2.15
+  mlp_down               36      1.472    1.8%     1218.1       1.22
+  o_proj                 36      0.737    0.9%     1024.4       1.02
+  q_proj                 36      0.606    0.7%     1246.4       1.25
+  rmsnorm                73      0.577    0.7%        1.3       0.00
+  residual_add           72      0.525    0.6%        2.1       0.00
+  k_proj                 36      0.472    0.6%      400.2       0.40
+  v_proj                 36      0.470    0.6%      401.6       0.40
+  rope                   36      0.315    0.4%        2.3       0.00
+  qk_norm                36      0.309    0.4%        2.4       0.00
+  lm_head                 1      0.258    0.3%     3013.2       3.01
+  kv_write               36      0.247    0.3%        1.2       0.00
+  embedding               1      0.018    0.0%        0.3       0.00
+  TOTAL (stages)                81.631
+
+

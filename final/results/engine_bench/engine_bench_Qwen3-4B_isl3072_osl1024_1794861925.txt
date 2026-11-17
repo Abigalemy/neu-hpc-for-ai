@@ -1,0 +1,7 @@
+config: hidden=2560 inter=9728 layers=36 heads=32/8 | load 4.4 s (weights copied to the GPU once)
+warm-up done (16 tokens generated)
+REQ 0: TTFT_MS 1042.65  ITL_MEAN_MS 21.129  ITL_P50_MS 21.153  ITL_P99_MS 22.670  E2E_MS 22657.8  (in 3072, out 1024)
+REQ 1: TTFT_MS 1042.65  ITL_MEAN_MS 21.118  ITL_P50_MS 21.117  ITL_P99_MS 22.665  E2E_MS 22646.7  (in 3072, out 1024)
+REQ 2: TTFT_MS 1042.51  ITL_MEAN_MS 21.115  ITL_P50_MS 21.119  ITL_P99_MS 22.665  E2E_MS 22642.9  (in 3072, out 1024)
+AVERAGE over 3 requests: TTFT_MS 1042.61  ITL_MS 21.121
+
