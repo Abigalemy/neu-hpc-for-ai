@@ -6,7 +6,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 
 | Part | What | Status |
 |---|---|---|
-| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 2.46x (below) |
+| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 2.51x (below); PagedAttention (Week 7) still to add |
 | Part 2 | Two-GPU all-to-all mock | next |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | not started |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
@@ -39,7 +39,8 @@ Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100): TTFT 23.60 s
   (16-row query tile, 128 keys per tile, ~512 blocks in total, fp32 combine). On other GPUs the small tiles that were
   verified on the L4.
 - 128K: YaRN factor 4 over the original 32768 context = 131072 tokens for input plus output.
-- Server: 64 KV-cache slots of 4224 tokens for the workload suite; 1 slot of 131072 tokens for 128K. Greedy only.
+- Server: 64 KV-cache slots of 4224 tokens for the workload suite; 128 slots of 2048 tokens for the Week 7 lecture
+  workload (the lecture's vLLM limits); 1 slot of 131072 tokens for 128K. Greedy only.
 - Environment switches (for experiments only; none is set in the runs above): `QWEN3_TILES=small`,
   `QWEN3_ATTN=small`, `QWEN3_YARN=<factor>`, `QWEN3_DECODE_SPLITS=<n>` (fixed decode split count).
 
@@ -57,8 +58,14 @@ EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source:
 | prefill_heavy | 2048 / 32, 8 | 204.67 / 209.26 | 1.02x | 6.99 / 14.76 | 2.11x | 601 / 382 |
 | decode_heavy | 64 / 1024, 32 | 95.96 / 141.27 | 1.47x | 5.57 / 11.26 | 2.02x | 5639 / 2804 |
 | 128K (YaRN x4) | 130816 / 128, 1 | 10446.84 / 23604.25 | 2.26x | 10.43 / 25.65 | 2.46x | |
+| lecture_c100 (Week 7) | 1000 / 500, 100; 1000 requests | 453.13 / 1137.69 | 2.51x | 13.36 / 33.43 | 2.50x | 7015 / 2803 |
 
-Notes: the vLLM 128K run is from an earlier session with the same settings. TTFT ratios below 1 at low concurrency
+Notes: `lecture_c100` is the AIPerf example from the Week 7 lecture ("Performance Evaluation": concurrency 100, 1000
+requests, 1000 in / 500 out, warm-up 16 requests at concurrency 8), with the lecture's vLLM limits
+`--max-model-len 2048 --max-num-seqs 128 --gpu-memory-utilization 0.90`; our server gets the same limits (128 slots of
+2048 tokens). TTFT p99 there: vLLM 1513 ms, ours 2242 ms. It is the baseline before PagedAttention: our 128 slots
+reserve 128 x 2048 tokens of KV cache up front (2 x 2 bytes x 36 layers x 8 KV heads x 128 = 144 KiB per token, so
+38.7 GB), whatever the requests actually use. The vLLM 128K run is from an earlier session with the same settings. TTFT ratios below 1 at low concurrency
 are not a claim of faster prefill (vLLM's server has its own per-request overhead at small sizes). The 128K workload
 is 130816 + 128 tokens because the chat template adds tokens and the YaRN context (131072) covers input and output.
 
@@ -79,10 +86,13 @@ is 130816 + 128 tokens because the chat template adds tokens and the YaRN contex
 
 ## Known limitations
 
+- The KV cache is one contiguous slot per sequence, sized for the longest request (no PagedAttention yet), so one
+  server configuration serves either many short sequences or a few long ones. Next: block pool + block table, read by
+  the decode kernel in place.
 - A prefill stalls the decode of the other running sequences (no chunked-prefill interleaving).
 - Greedy only (`temperature` > 0 is rejected); `min_tokens` does not mask EOS like vLLM.
-- Closest to the Part 4 limit (3x): ITL at concurrency 64 (2.36x) and long-context decode (2.46x); decode attention
-  still dominates the 128K step.
+- Closest to the Part 4 limit (3x): the lecture workload at concurrency 100 (TTFT 2.51x, ITL 2.50x), long-context
+  decode (2.46x) and ITL at concurrency 64 (2.36x); decode attention still dominates the 128K step.
 - The old 64x128 attention kernel was less accurate for a single query (decode); the default decode path now uses
   the split-KV kernel, which meets the criterion. The root cause in the old kernel was not identified.
 
@@ -98,6 +108,8 @@ modal run modal_vllm_aipref.py --yes --suite       # vLLM, workload suite
 modal run modal_aipref.py --yes --suite            # ours, workload suite
 modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn
 modal run modal_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2
+modal run modal_vllm_aipref.py --yes --lecture     # vLLM, Week 7 lecture workload
+modal run modal_aipref.py --yes --lecture          # ours, Week 7 lecture workload
 python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf
 ```
 

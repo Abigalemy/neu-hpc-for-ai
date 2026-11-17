@@ -23,6 +23,8 @@ PAIRS = [
     ("prefill_heavy", "suite_ours_1794881935/prefill_heavy", "suite_vllm_1794881615/prefill_heavy"),
     ("decode_heavy", "suite_ours_1794881935/decode_heavy", "suite_vllm_1794881615/decode_heavy"),
     ("128k_yarn", "ours_isl130816_osl128_1794882219", "vllm_isl130816_osl128_1794875810"),
+    # the AIPerf example of the Week 7 lecture: 100 connections, 1000 requests, 1000 in / 500 out, 2048 x 128 limits
+    ("lecture_c100", "lecture_ours_1794894311/lecture_c100", "lecture_vllm_1794893920/lecture_c100"),
 ]
 
 

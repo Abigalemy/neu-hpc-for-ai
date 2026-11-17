@@ -52,17 +52,26 @@ SUITE = [
 ]
 SUITE_MAX_SEQS = 64
 SUITE_MAX_LEN = max(i + o for _, i, o, _, _ in SUITE) + 128
+# The AIPerf example from the Week 7 lecture ("Performance Evaluation"): 100 concurrent connections, 1000 requests of
+# 1000 input / 500 output tokens, warm-up 16 requests at concurrency 8; the lecture's vLLM runs with --max-model-len 2048
+# --max-num-seqs 128 --gpu-memory-utilization 0.90. Keep identical in modal_vllm_aipref.py.
+LECTURE = [("lecture_c100", 1000, 500, 100, 1000)]
+LECTURE_MAX_SEQS, LECTURE_MAX_LEN = 128, 2048
+LECTURE_WARMUP = (16, 8)   # (requests, concurrency)
 YARN_CONTEXT = 32768 * 4
 CHAT_TEMPLATE_MARGIN = 128
 
 
-def aiperf_cmd(model: str, url: str, isl: int, osl: int, requests: int, out: str, concurrency: int = 1):
-    """The same AIPerf invocation as modal_vllm_aipref.py."""
+def aiperf_cmd(model: str, url: str, isl: int, osl: int, requests: int, out: str, concurrency: int = 1, warmup=None):
+    """The same AIPerf invocation as modal_vllm_aipref.py. warmup = (requests, concurrency) overrides the default."""
+    if warmup:
+        warm = ["--warmup-request-count", str(warmup[0]), "--warmup-concurrency", str(warmup[1])]
+    else:
+        warm = ["--warmup-request-count", "1" if isl > 32768 else str(max(2, concurrency))]
     return ["aiperf", "profile", "--model", model, "--url", url,
             "--endpoint-type", "chat", "--streaming", "--tokenizer", model,
             "--extra-inputs", '{"ignore_eos": true, "temperature": 0}',
-            "--concurrency", str(concurrency), "--request-count", str(requests),
-            "--warmup-request-count", "1" if isl > 32768 else str(max(2, concurrency)),
+            "--concurrency", str(concurrency), "--request-count", str(requests)] + warm + [
             "--synthetic-input-tokens-mean", str(isl), "--synthetic-input-tokens-stddev", "0",
             "--output-tokens-mean", str(osl), "--output-tokens-stddev", "0",
             "--random-seed", "0", "--artifact-dir", out]
@@ -119,16 +128,19 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
 
 
 @app.function(image=image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=25 * 60)  # hard cap
-def run_suite(model: str, max_minutes: int):
-    """All SUITE workloads against ONE server instance (64 KV-cache slots), one after another."""
+def run_suite(model: str, max_minutes: int, lecture: bool = False):
+    """All SUITE workloads against ONE server instance (64 KV-cache slots), one after another; with lecture=True the
+    Week 7 lecture workload instead, with the lecture's server limits (2048 tokens, 128 sequences)."""
     import urllib.request
 
     from huggingface_hub import snapshot_download
     os.chdir("/root/final")
     snap = snapshot_download(model, local_files_only=True)
+    works, max_len, max_seqs = (LECTURE, LECTURE_MAX_LEN, LECTURE_MAX_SEQS) if lecture else (SUITE, SUITE_MAX_LEN, SUITE_MAX_SEQS)
+    tag = "lecture" if lecture else "suite"
     cmd = ["python", "server/server.py", "--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
-           "--max-len", str(SUITE_MAX_LEN), "--max-chunk", str(max(i for _, i, _, _, _ in SUITE) + CHAT_TEMPLATE_MARGIN),
-           "--max-seqs", str(SUITE_MAX_SEQS)]
+           "--max-len", str(max_len), "--max-chunk", str(max(i for _, i, _, _, _ in works) + CHAT_TEMPLATE_MARGIN),
+           "--max-seqs", str(max_seqs)]
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
     stamp = int(time.time())
@@ -145,15 +157,15 @@ def run_suite(model: str, max_minutes: int):
                     raise TimeoutError("server never became ready")
                 time.sleep(2)
         deadline = time.time() + max_minutes * 60
-        for name, isl, osl, conc, reqs in SUITE:
+        for name, isl, osl, conc, reqs in works:
             left = int(deadline - time.time())
             if left < 30:
                 print(f"=== {name}: skipped, benchmark time cap reached")
                 continue
-            out = f"/tmp/suite_ours/{name}"
+            out = f"/tmp/{tag}_ours/{name}"
             print(f"=== WORKLOAD {name}: {isl} in / {osl} out, concurrency {conc}, {reqs} requests", flush=True)
             rc = subprocess.run(["timeout", str(left)] + aiperf_cmd(model, f"http://localhost:{PORT}", isl, osl, reqs, out,
-                                                                     conc)).returncode
+                                                                     conc, LECTURE_WARMUP if lecture else None)).returncode
             print(f"=== {name}: aiperf exit code {rc}", flush=True)
     finally:
         server.terminate()
@@ -161,9 +173,9 @@ def run_suite(model: str, max_minutes: int):
             server.wait(timeout=30)
         except subprocess.TimeoutExpired:
             server.kill()
-    subprocess.run(["cp", "-r", "/tmp/suite_ours", f"{RES_DIR}/suite_ours_{stamp}"], check=False)
+    subprocess.run(["cp", "-r", f"/tmp/{tag}_ours", f"{RES_DIR}/{tag}_ours_{stamp}"], check=False)
     results_vol.commit()
-    print(f"raw results saved to volume final-results:{RES_DIR}/suite_ours_{stamp}")
+    print(f"raw results saved to volume final-results:{RES_DIR}/{tag}_ours_{stamp}")
 
 
 @app.function(image=image, volumes={HF_DIR: hf_cache}, timeout=15 * 60)   # CPU only
@@ -182,9 +194,12 @@ def compat_check():
             except Exception:
                 time.sleep(1)
         rcs = []
-        for conc, reqs in ((1, 3), (8, 24)):     # one sequence, then a batch of 8 through the continuous batcher
-            r = subprocess.run(aiperf_cmd("Qwen/Qwen3-4B", f"http://localhost:{PORT}", 64, 16, reqs, f"/tmp/aiperf_compat_c{conc}", conc))
-            print(f"=== concurrency {conc}: aiperf exit code {r.returncode}", flush=True)
+        # one sequence, a batch of 8 through the continuous batcher, and the lecture's warm-up flags with more
+        # connections (12) than slots (8), so some requests wait for a free slot
+        for conc, reqs, warm in ((1, 3, None), (8, 24, None), (12, 36, LECTURE_WARMUP)):
+            r = subprocess.run(aiperf_cmd("Qwen/Qwen3-4B", f"http://localhost:{PORT}", 64, 16, reqs,
+                                          f"/tmp/aiperf_compat_c{conc}", conc, warm))
+            print(f"=== concurrency {conc} warmup {warm}: aiperf exit code {r.returncode}", flush=True)
             rcs.append(r.returncode)
         return max(rcs)
     finally:
@@ -193,7 +208,16 @@ def compat_check():
 
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False, requests: int = 5,
-         max_minutes: int = 18, compat: bool = False, suite: bool = False, yes: bool = False):
+         max_minutes: int = 18, compat: bool = False, suite: bool = False, lecture: bool = False, yes: bool = False):
+    if lecture:
+        print(f"PLAN: our server, {model}, 1 H100, Week 7 lecture workload {LECTURE} (max {LECTURE_MAX_SEQS} sequences of "
+              f"{LECTURE_MAX_LEN} tokens), benchmark cap {max_minutes} min, container hard cap 25 min -> at most "
+              f"~${25 / 60 * PRICE_H100:.2f} of shared credit")
+        if yes:
+            run_suite.remote(model, max_minutes, True)
+        else:
+            print("Dry run only. Pass --yes to start.")
+        return
     if suite:
         print(f"PLAN: our server, {model}, 1 H100, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
               f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
