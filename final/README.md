@@ -7,7 +7,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 | Part | What | Status |
 |---|---|---|
 | Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
-| Part 2 | Two-GPU all-to-all mock | next |
+| Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | not started |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
 | Part 4 | Within 3x of vLLM; write-up | not started |
@@ -109,6 +109,29 @@ needed. Source: `results/comparison.csv` (rows `paged/*`, `slots8/*`).
 - Ours in this configuration: lecture ITL 3.45x vLLM, above the Part 4 limit (3x); the batched decode at 100
   sequences is the next thing to optimise (Part 4).
 
+## Part 2: two-GPU all-to-all mock
+
+`part2/` implements the figure of the Week 8 handout: two workers (one GPU each), four experts (0, 1 on worker 0;
+2, 3 on worker 1), tokens and top-1 routing hard-wired as in the figure (worker 0: Today->3, is->3, hot->1; worker 1:
+I->2, feel->0, happy->3), experts mocked as e_k(x) = (k + 1) x + k on 128-wide rows.
+
+| Step (figure column) | Implementation |
+|---|---|
+| Routing | hard-wired expert and gate weight per token (`a2a_plan.h`) |
+| Permutation | stable sort by expert on the host; rows gathered on the GPU with the CUDA Tile `gather_scatter_view` (`gather_rows`) |
+| All-to-all (dispatch) | counts exchanged first, then rows and expert ids with grouped `ncclSend` / `ncclRecv` (counts differ per peer) |
+| Computation | each received row through its local expert (`run_experts`) |
+| All-to-all (combine) | the dispatch inverted: the rows go back to their worker in the order they were sent |
+| Un-permutation + scale | rows scattered back to their original positions with `gather_scatter_view`, times the gate weight (`scatter_scale`) |
+
+One host thread per GPU plays one worker (one MPI rank in the Week 5 "MPI with CUDA" notebook; the NCCL unique id,
+which rank 0 would broadcast with MPI, is shared between the threads). About 160 non-comment lines (`a2a_mock.cu` 125,
+`a2a_plan.h` 39). Checks: `test_plan.cpp` simulates the whole pipeline on the host (the all-to-all as copies) and is
+run while the image is built (CPU); on 2x H100 (2026-11-18, NCCL 2.32.3) the permuted orders match the figure
+(hot, Today, is / feel, I, happy) and all 6 outputs are exact (`results/part2/a2a_mock_2xH100_2026-11-18.txt`).
+Rows past the end of a tile get an out-of-range index, which the masked gather / scatter skips (verified by this run:
+5 padding rows per tile, results exact, no memory error).
+
 ## Correctness checks
 
 - Unit tests per module against HF (SQLite cases, `modal_test_h100.py`): RMSNorm, RoPE, linear, MLP, embedding,
@@ -166,6 +189,8 @@ modal run modal_vllm_aipref.py --yes --mode paged  # vLLM, PagedAttention compar
 modal run modal_aipref.py --yes --mode paged       # ours, paged (128 sequences share the pool)
 modal run modal_aipref.py --yes --mode slots8      # ours, same pool, 8 sequences (= contiguous slots)
 modal run compile_check.py                         # CPU only: compile the engine and every test
+modal run part2/modal_a2a.py --yes                 # Part 2: all-to-all mock on 2x H100
+modal run hw_check.py --yes                        # 2x H200 available? peer access, NCCL in the image
 modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container
 modal run modal_test_h100.py --yes --tests paged,paged_bench   # paged vs contiguous attention: bits and timing
 python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf

@@ -1,0 +1,15 @@
+PLAN: 2x H100, about 1 minute (hard cap 5 min) -> at most ~$0.66 of shared credit
+0, NVIDIA H100 80GB HBM3
+1, NVIDIA H100 80GB HBM3
+NCCL version 2.32.3+cuda13.4
+worker 0: permuted order hot(e1) Today(e3) is(e3)
+worker 0: sends 1/2 rows to workers 0/1, its experts receive 2 rows (experts 1 0)
+worker 0: Today  -> 0.75 * e3(x): exact
+worker 0: is     -> 0.50 * e3(x): exact
+worker 0: hot    -> 0.25 * e1(x): exact
+worker 1: permuted order feel(e0) I(e2) happy(e3)
+worker 1: sends 1/2 rows to workers 0/1, its experts receive 4 rows (experts 3 3 2 3)
+worker 1: I      -> 0.50 * e2(x): exact
+worker 1: feel   -> 0.75 * e0(x): exact
+worker 1: happy  -> 1.00 * e3(x): exact
+PASS: all 6 tokens exact after dispatch, experts, combine
