@@ -204,9 +204,31 @@ async def test_preemption_by_recompute():
         assert fins[-1] == "length" and all(f is None for f in fins[:-1]), fins
         assert usage["completion_tokens"] == 8, usage
     assert sched.preemptions > 0, "the pool is too small for all five: some sequence must have been preempted"
-    recomputes = [c for c in be.calls if c[0] == "prefill" and c[2] > 3]   # prefill of prompt + generated tokens
+    recomputes = [ids for _, ids in be.prefill_ids if len(ids) > 3]        # prefill of prompt + generated tokens
     assert len(recomputes) == sched.preemptions, (recomputes, sched.preemptions)
+    # every recompute re-feeds exactly the prompt and the tokens already sent, in order (the fake's output depends on
+    # the whole history, so a lost or reordered token would also change the streamed text above)
+    alone_ids = [int(w[1:]) for w in alone[0].split()]
+    for ids in recomputes:
+        assert ids == [11, 12, 13] + alone_ids[:len(ids) - 3], (ids, alone_ids)
     assert be.free_blocks() == 6 and not be.blocks and sorted(sched.free) == list(range(8)), (be.blocks, sched.free)
+
+
+def test_fake_backend_depends_on_history():
+    # the property the recompute test relies on: same last token, different earlier token -> different next token
+    be = FakeBackend(max_seqs=2)
+    be.reserve(0, 8); be.reserve(1, 8)
+    assert be.prefill(0, [11, 12, 13]) != be.prefill(1, [11, 99, 13])
+
+
+async def test_bad_token_ids_rejected():
+    _, app = make()
+    async with client_for(app) as c:
+        for prompt in ([11, 1000], [11, -1], [11, 1.5], [11, True]):       # vocab of the fake engine is 1000
+            r = await c.post("/v1/completions", json={"prompt": prompt, "max_tokens": 2})
+            assert r.status_code == 400 and "token ids" in r.json()["detail"], (prompt, r.status_code, r.text)
+        r = await c.post("/v1/completions", json={"prompt": [11, 999], "max_tokens": 2})
+        assert r.status_code == 200, r.text
 
 
 async def test_request_larger_than_kv_pool():
@@ -235,12 +257,14 @@ async def main():
              test_max_completion_tokens_wins_and_non_stream, test_completions_string_and_ids, test_rejections,
              test_requests_are_batched, test_more_requests_than_slots, test_disconnect_frees_slot,
              test_engine_error_fails_only_that_request, test_paged_blocks_admit_more_than_contiguous,
-             test_preemption_by_recompute, test_request_larger_than_kv_pool]
+             test_preemption_by_recompute, test_request_larger_than_kv_pool, test_bad_token_ids_rejected]
     for t in tests:
         await t()
         print("ok  ", t.__name__)
     test_detokenizer_utf8()
     print("ok   test_detokenizer_utf8")
+    test_fake_backend_depends_on_history()
+    print("ok   test_fake_backend_depends_on_history")
     print("ALL SERVER TESTS PASSED")
 
 

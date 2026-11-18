@@ -71,9 +71,10 @@ They came out 7-28% slower than the run before paging (`suite_ours_1794881935`, 
 ms), so the two engines were timed in ONE container, alternating old, new, old, new (`tools/ab_engine_bench.py`):
 the paged engine is as fast or slightly faster (decode step B=64, L=256: 12.48 / 12.58 ms vs 13.05 / 12.93 ms before
 paging; B=100, L=1000: 27.37 vs 28.18 / 28.03 ms; B=1: 6.80 / 6.95 vs 6.97 / 6.88 ms), and the Python scheduler costs
-0.012 ms more per step (fake engine, local). The difference between the two suite runs is therefore not the paging;
-it is the container (another H100 / host; our server is partly host-bound at small sizes), which this project cannot
-control. The rows above are the current code as measured; balanced_c64 ITL lands at 3.03x, at the Part 4 limit.
+0.012 ms more per step (fake engine, local). So the engine A/B in one container does not reproduce the slowdown; what
+remains (the container and host, or server-side effects under AIPerf) was not separated, since the two complete HTTP
+servers were not run alternately in one container. The rows above are the current code as measured; balanced_c64
+ITL lands at 3.03x, at the Part 4 limit.
 `lecture_c100` is the AIPerf example from the Week 7 lecture ("Performance Evaluation": concurrency 100, 1000
 requests, 1000 in / 500 out, warm-up 16 requests at concurrency 8), with the lecture's vLLM limits
 `--max-model-len 2048 --max-num-seqs 128 --gpu-memory-utilization 0.90`; our server gets the same limits (128 slots of
@@ -83,13 +84,16 @@ reserve 128 x 2048 tokens of KV cache up front (2 x 2 bytes x 36 layers x 8 KV h
 are not a claim of faster prefill (vLLM's server has its own per-request overhead at small sizes). The 128K workload
 is 130816 + 128 tokens because the chat template adds tokens and the YaRN context (131072) covers input and output.
 
-## PagedAttention: with and without (Week 7)
+## PagedAttention: with and without (Week 7) - an equal-memory capacity simulation
 
 One server configuration for everything: context limit 32768 tokens, the same KV memory as the 128 x 2048 lecture
 slots (262144 tokens = 38.7 GB at 144 KiB per token), the lecture workload and long prompts one after another.
 "With" = 128 sequences share the block pool and take blocks on demand. "Without" = what contiguous per-sequence
-slots give in the same memory: each sequence reserves 32768 tokens, so only 8 fit (measured as the same pool limited to
-8 sequences; 200 lecture requests there instead of 1000, as only 8 run at a time). vLLM: `--max-model-len 32768
+slots give in the same memory: each sequence reserves 32768 tokens, so only 8 fit. This is SIMULATED with the same
+paged engine limited to 8 sequences (200 lecture requests there instead of 1000, as only 8 run at a time): it measures
+the capacity loss of fixed reservations, not the time of the two addressing schemes (their kernels were timed
+separately: the block-table lookup costs nothing measurable, see Correctness). The other two Week 7 comparisons, KV
+cache on / off and continuous / static batching, were measured in the Week 7 assignment, not with this engine. vLLM: `--max-model-len 32768
 --max-num-seqs 128 --gpu-memory-utilization 0.90`. Qwen3-4B, 1x H100, AIPerf, 0 request errors, no preemption
 needed. Source: `results/comparison.csv` (rows `paged/*`, `slots8/*`).
 
@@ -127,9 +131,14 @@ torch 2.15.0, CPU) into `test_cases_moe.db`: the router at its real shape (2048 
 of width 128 with 1-128 tokens, and a designed 2-token case (token 0 -> experts 0-7, token 1 -> 4-11). `run_tests.py
 ... moe`: expert sets per token (a different set only as a near-tie, reference probabilities within 1e-3), weights per
 expert, and y against HF's bf16 expert outputs summed in fp64 with a bound derived from the per-expert mlp rule (the
-8 terms can cancel, so the bound is the weighted sum of the per-term bounds). On H100 (2026-11-18): 10/10 cases pass,
-y within 15-32% of the bound; 4 router tokens and 1 block token are bf16 ties (equal logits) where `torch.topk`
-picks the other expert. `tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
+8 terms can cancel, so the bound is the weighted sum of the per-term bounds; it is the acceptance tolerance of the final
+weighted sum, not a per-expert result). On H100 (2026-11-18): 10/10 cases pass, y within 15-32% of the bound; 4 router
+tokens and 1 block token are bf16 ties (equal logits) where `torch.topk` picks the other expert. In that run the
+tie token's y was left out of the comparison; the runner now recomputes its terms for the experts the GPU chose and
+compares every token (checked locally with fakes, not yet rerun on a GPU). What this covers: the router at its real shape, the
+block at 16 experts of width 128 and up to 128 tokens (both row-tile sizes, several sort tiles); NOT yet the
+production shape (128 experts of width 768) or long prefills: a single real layer of Qwen3-30B-A3B is the next test.
+Log: `results/part1/moe_unit_h100_2026-11-18.txt`. `tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
 the GPU's own intermediates: all exact or within 0.3% on 4 cases.
 
 Two findings on the way: `gather_scatter_view` takes element offsets (not tile coordinates) in every dimension other
@@ -194,7 +203,8 @@ Rows past the end of a tile get an out-of-range index, which the masked gather /
 - Above the Part 4 limit (3x): lecture workload ITL with the 32K context limit (3.45x) and balanced_c64 ITL (3.03x).
   Closest below it: the lecture
   workload at context 2048 (TTFT 2.51x, ITL 2.50x), long prompts at concurrency 8 (ITL 2.70x), long-context
-  decode (2.37x) and ITL at concurrency 64 (2.36x); decode attention still dominates the 128K step.
+  decode (2.37x); decode attention still dominates the 128K step. (balanced_c64 ITL was 2.36x before the suite rerun;
+  now 3.03x, see the note under the results table.)
 - The old 64x128 attention kernel was less accurate for a single query (decode); the default decode path now uses
   the split-KV kernel, which meets the criterion. The root cause in the old kernel was not identified.
 

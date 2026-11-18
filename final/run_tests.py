@@ -284,41 +284,64 @@ def compare_moe(y, expert_out, w):
     Reference: e[t] = sum_j w[t,j] * out[t,j] in fp64, with HF's bf16 expert outputs out (the same SwiGLU roundings
     as our kernel) and HF's bf16 weights w. Each of our expert outputs is held to the mlp rule against HF's,
     |d out| <= 2**-6 * (|out| + 0.05 * max|out|) (the rule the mlp kernel passes against HF); the K terms can cancel,
-    so the bound is the weighted sum of the per-term bounds, plus one bf16 rounding of y:
+    so the bound is the weighted sum of the per-term bounds, plus one bf16 rounding of y. This is the ACCEPTANCE
+    tolerance of the final weighted sum: per-term errors can cancel, so it does not show that every expert alone meets
+    the mlp rule (tools/moe_debug.py checks each stage separately):
       |y - e| <= 2**-6 * (sum_j w_j |out_j| + 0.05 * max|out|) + 2**-8 * |e|.
     expert_out: [T, K, H], w: [T, K]. Returns (ok, max |y - e|, max |y - e| / bound, e)."""
     e = (expert_out.astype(np.float64) * w[:, :, None]).sum(axis=1)
     d = np.abs(y.astype(np.float64) - e)
     mag = (np.abs(expert_out) * w[:, :, None]).sum(axis=1)
     bound = 2.0 ** -6 * (mag + 0.05 * float(np.abs(expert_out).max())) + 2.0 ** -8 * np.abs(e)
+    bound = np.maximum(bound, 1e-30)                    # an all-zero reference must not divide by zero
     return bool((d <= bound).all()), float(d.max()), float((d / bound).max()), e
 
 
 def _tie_tokens(got_idx, exp_idx, probs):
     """Tokens whose expert set differs from the reference only by a near-tie swap (see _check_routing)."""
     out = []
+    K = exp_idx.shape[1]
     for t in range(exp_idx.shape[0]):
-        sw = set(got_idx[t]) ^ set(exp_idx[t])
-        if sw and probs is not None:
+        g, e = set(got_idx[t]), set(exp_idx[t])
+        sw = g ^ e
+        if sw and probs is not None and len(g) == K and len(g - e) == len(e - g):
             pv = [probs[t, x] for x in sw]
             if max(pv) - min(pv) < 1e-3 * max(pv):
                 out.append(t)
     return out
 
 
-def _check_routing(got_idx, got_w, exp_idx, exp_w, probs=None):
+def _bf16(a):
+    u = np.asarray(a, np.float32).view(np.uint32)
+    return ((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000).view(np.float32)
+
+
+def _expert_out(x, e, wg, wu, wd):
+    """One expert on one token with the kernel's (and HF's) bf16 roundings: g, u, silu(g), h and the output."""
+    g = _bf16(x @ wg[e].T); u = _bf16(x @ wu[e].T)
+    return _bf16(_bf16(_bf16(g / (1 + np.exp(-g))) * u) @ wd[e].T)
+
+
+def _check_routing(got_idx, got_w, exp_idx, exp_w, probs=None, n_experts=None):
     """Per token: the same set of experts, and the same weight for each expert (bf16 tolerance). A different set is
     accepted only as a near-tie: the reference probabilities of the swapped experts differ by < 1e-3 (relative)."""
     bad_set = ties = 0
     werr = 0.0
     w_ok = True
+    K = exp_idx.shape[1]
     for t in range(exp_idx.shape[0]):
         g, e = list(got_idx[t]), list(exp_idx[t])
-        w_ok &= bool(np.isfinite(got_w[t]).all()) and abs(float(got_w[t].sum()) - 1.0) < 2e-2   # renormalised
+        # a row must name K different experts in range, with finite non-negative weights summing to ~1, before any
+        # set / near-tie logic (a duplicated id would otherwise shrink the set difference to look like a tie)
+        if len(set(g)) != K or (n_experts is not None and not all(0 <= x < n_experts for x in g)):
+            bad_set += 1
+            continue
+        w_ok &= bool(np.isfinite(got_w[t]).all()) and bool((got_w[t] >= 0).all()) and abs(float(got_w[t].sum()) - 1.0) < 2e-2
         if set(g) != set(e):
             swapped = set(g) ^ set(e)
             pv = [probs[t, x] for x in swapped] if probs is not None else None
-            if pv is not None and max(pv) - min(pv) < 1e-3 * max(pv):
+            one_for_one = len(set(g) - set(e)) == len(set(e) - set(g))
+            if pv is not None and one_for_one and max(pv) - min(pv) < 1e-3 * max(pv):
                 ties += 1          # a near-tie swap: the experts both sides chose are still checked below
             else:
                 bad_set += 1
@@ -342,8 +365,11 @@ def run_moe(db, binary):
         E, K, hid = param(db, mid, "num_experts"), param(db, mid, "top_k"), param(db, mid, "hidden_size")
         block = kind != "moe_router"
         names = ("router", "gate_proj", "up_proj", "down_proj") if block else ("gate",)
+        Wt = {}
         for i, name in enumerate(names):
-            write(f"/tmp/m{i}.bin", db.execute("SELECT data FROM module_tensor WHERE module_id=? AND name=?", (mid, name)).fetchone()[0])
+            data, wshape = db.execute("SELECT data, shape FROM module_tensor WHERE module_id=? AND name=?", (mid, name)).fetchone()
+            write(f"/tmp/m{i}.bin", data)
+            Wt[name] = load(data, "bfloat16", wshape)
         inter = param(db, mid, "moe_intermediate_size") if block else 0
         n = n_ok = 0
         worst = 0.0
@@ -368,7 +394,7 @@ def run_moe(db, binary):
             got_w = load(open("/tmp/w.bin", "rb").read(), "bfloat16", f"{T}x{K}")
             pr = case_tensor(db, cid, "expected", "probs")
             probs = load(pr[0], "float32", pr[1]) if pr else None
-            bad_set, ties, w_ok, werr = _check_routing(got_idx, got_w, exp_idx, exp_w, probs)
+            bad_set, ties, w_ok, werr = _check_routing(got_idx, got_w, exp_idx, exp_w, probs, E)
             ok = bad_set == 0 and w_ok
             msg = f"experts: {T - bad_set - ties}/{T} tokens same set" + (f", {ties} near-tie" if ties else "")
             if block:
@@ -376,17 +402,24 @@ def run_moe(db, binary):
                 d, sh, _ = case_tensor(db, cid, "expected", "y"); ehf = load(d, "bfloat16", sh)
                 y = load(open("/tmp/y.bin", "rb").read(), "bfloat16", sh)
                 d, sh2, _ = case_tensor(db, cid, "expected", "expert_out"); eo = load(d, "bfloat16", sh2)
-                # a near-tie token went through other experts than the reference: its y cannot match the reference
-                # outputs, so it is left out of the y check (its routing was checked above; tools/moe_debug.py checks
-                # every stage with the GPU's own choices)
-                keep = [t for t in range(T) if t not in set(_tie_tokens(got_idx, exp_idx, probs))]
-                ok_y, dref, frac, eref = compare_moe(y[keep], eo[keep], exp_w[keep])
-                m = float(np.abs(eref).max())
+                # a near-tie token went through other experts than the reference: its reference terms are recomputed
+                # for the experts the GPU chose (same bf16 roundings), with the GPU's (checked) weights, so every
+                # token's y is still compared
+                eo = eo.copy(); wref = exp_w.copy()
+                ties_t = _tie_tokens(got_idx, exp_idx, probs)
+                xin = load(xd, "bfloat16", xs)
+                for t in ties_t:
+                    for j in range(K):
+                        eo[t, j] = _expert_out(xin[t], int(got_idx[t, j]), Wt["gate_proj"], Wt["up_proj"], Wt["down_proj"])
+                    wref[t] = got_w[t]
+                ok_y, dref, frac, eref = compare_moe(y, eo, wref)
+                m = float(np.abs(eref).max()) or 1.0
                 d32 = float(np.abs(y - e32).max()) / m
                 dhf = float(np.abs(y - ehf).max()) / m
                 ok &= ok_y
                 worst = max(worst, dref / m)
-                msg += (f"; y: max err {dref / m:.2e} of max|e| = {frac:.2f} of the bound ({'ok' if ok_y else 'FAIL'}); "
+                msg += (f"; y ({T} tokens, {len(ties_t)} with recomputed terms): max err {dref / m:.2e} of max|e| = "
+                        f"{frac:.2f} of the bound ({'ok' if ok_y else 'FAIL'}); "
                         f"for information: vs fp32 path {d32:.2e}, vs HF's bf16 sum {dhf:.2e}")
             n_ok += ok
             print(f"  {'ok  ' if ok else 'FAIL'} {kind} E={E} {label}: {msg}")

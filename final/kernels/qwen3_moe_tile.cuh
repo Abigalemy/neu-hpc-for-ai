@@ -255,7 +255,8 @@ cudaError_t launch_moe_router(const T* x, const T* wr, int* idx, T* w, int n, in
 template <typename T, int E, int K>
 cudaError_t launch_moe(const T* x, const T* wr, const T* wg, const T* wu, const T* wd, T* y, int n, int hid, int inter,
                        bool norm_topk, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
-    if (n > ws.max_tokens) { std::fprintf(stderr, "moe: %d tokens > workspace %d\n", n, ws.max_tokens); return cudaErrorInvalidValue; }
+    if (n <= 0 || n > ws.max_tokens) { std::fprintf(stderr, "moe: %d tokens (workspace %d)\n", n, ws.max_tokens); return cudaErrorInvalidValue; }
+    if ((long long)n * K > 0x7fffffffLL) { std::fprintf(stderr, "moe: %d x %d assignments overflow int\n", n, K); return cudaErrorInvalidValue; }
     if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
     const int A = n * K;
     cudaError_t e = launch_moe_router<T, E, K>(x, wr, ws.idx, ws.w, n, hid, norm_topk, s);

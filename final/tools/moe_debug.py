@@ -27,6 +27,15 @@ def rd(path, dtype, shape):
     return load(data, dtype, "x".join(map(str, shape)))
 
 
+def worst_row(got, ref):
+    """Per-row relative error (so a small row that is entirely wrong cannot hide under another row's large maximum):
+    max_r max|got_r - ref_r| / max(max|ref_r|, 1e-3 * max|ref|). Returns (error, row)."""
+    num = np.abs(got - ref).max(axis=1)
+    den = np.maximum(np.abs(ref).max(axis=1), 1e-3 * float(np.abs(ref).max()) + 1e-30)
+    r = int(np.argmax(num / den))
+    return float((num / den)[r]), r
+
+
 def check(name, ok, detail=""):
     print(f"  {'ok  ' if ok else 'FAIL'} {name} {detail}")
     return ok
@@ -91,7 +100,9 @@ def main(dbp, binary):
             g = bf16(x[t] @ W["gate_proj"][e].T); u = bf16(x[t] @ W["up_proj"][e].T)
             href[pos] = bf16(bf16(g / (1 + np.exp(-g))) * u)
         eh = np.abs(hb - href).max() / np.abs(href).max()
-        good = check("gate_up (hbuf)", eh < 2e-2, f"max err {eh:.2e} of max|h|; row0 got {hb[0, :4]} want {href[0, :4]}")
+        rh, rr = worst_row(hb, href)
+        good = check("gate_up (hbuf)", eh < 2e-2 and rh < 3e-2,
+                     f"max err {eh:.2e} of max|h|, worst row {rr} {rh:.2e} of its own max; row0 got {hb[0, :4]} want {href[0, :4]}")
         ok &= good
         if not good:
             for pos in range(min(A, 4)):
@@ -103,14 +114,18 @@ def main(dbp, binary):
             a = srt[pos] if 0 <= srt[pos] < A else want_srt[pos]
             yref[pos] = bf16(hb[pos] @ W["down_proj"][flat[a]].T)
         ey = np.abs(ys - yref).max() / np.abs(yref).max()
-        ok &= check("down (ysorted)", ey < 2e-2, f"max err {ey:.2e} of max|y|; row0 got {ys[0, :4]} want {yref[0, :4]}")
+        ry, rr = worst_row(ys, yref)
+        ok &= check("down (ysorted)", ey < 2e-2 and ry < 3e-2,
+                    f"max err {ey:.2e} of max|y|, worst row {rr} {ry:.2e} of its own max; row0 got {ys[0, :4]} want {yref[0, :4]}")
         # combine: from the GPU's own ysorted, inv and weights
         want_y = np.zeros((T, H))
         for a in range(A):
             if 0 <= inv[a] < A:
                 want_y[a // K] += w.reshape(-1)[a] * ys[inv[a]]
         e_ = np.abs(y - want_y).max() / np.abs(want_y).max()
-        ok &= check("combine (y)", e_ < 2e-2, f"max err {e_:.2e} of max|y|; row0 got {y[0, :4]} want {want_y[0, :4]}")
+        rc, rr = worst_row(y, want_y)
+        ok &= check("combine (y)", e_ < 2e-2 and rc < 3e-2,
+                    f"max err {e_:.2e} of max|y|, worst token {rr} {rc:.2e} of its own max; row0 got {y[0, :4]} want {want_y[0, :4]}")
         bad += not ok
     print("\nMOE DEBUG: all stages ok" if bad == 0 else f"\nMOE DEBUG: {bad} case(s) with a wrong stage")
     return 1 if bad else 0

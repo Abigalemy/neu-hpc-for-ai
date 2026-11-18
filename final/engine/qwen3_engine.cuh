@@ -215,8 +215,12 @@ public:
     // (earlier positions must already be in that slot). Returns device logits: [n, vocab] if all_logits (needs
     // max_logit_rows >= n), else [1, vocab] for the last new token. n == 1 runs the decode path (batch of one).
     const bf16* forward(const int* h_tokens, int n, int start_pos, bool all_logits, int slot = 0) {
+        if (n <= 0 || start_pos < 0 || n > max_len - start_pos) {
+            std::fprintf(stderr, "forward: n=%d start=%d out of range (max_len %d)\n", n, start_pos, max_len);
+            std::exit(2);
+        }
         if (n == 1) return forward_decode(h_tokens, &slot, &start_pos, 1);
-        if (n > max_chunk || start_pos + n > max_len || slot < 0 || slot >= max_seqs || (all_logits && n > max_logit_rows)) {
+        if (n > max_chunk || slot < 0 || slot >= max_seqs || (all_logits && n > max_logit_rows)) {
             std::fprintf(stderr, "forward: n=%d start=%d slot=%d exceeds engine limits\n", n, start_pos, slot);
             std::exit(2);
         }

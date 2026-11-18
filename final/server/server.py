@@ -90,15 +90,19 @@ class CBackend:
 
 
 class FakeBackend:
-    """Deterministic stand-in for tests: the next token is a function of the previous one; the `eos_after`-th generated
-    token of a sequence (if set) is `eos`, once, so both stopping at EOS and ignoring it can be tested."""
+    """Deterministic stand-in for tests: the next token is a function of the WHOLE sequence so far (a rolling hash of
+    every token at every position), so a recompute that lost or reordered any earlier token gives other tokens; every
+    decode must feed the position right after the slot's history. The `eos_after`-th generated token of a sequence
+    (if set) is `eos`, once, so both stopping at EOS and ignoring it can be tested."""
 
     def __init__(self, vocab: int = 1000, max_len: int = 4096, eos: int = 2, eos_after: Optional[int] = None,
                  max_seqs: int = 4, delay: float = 0.0, block_size: int = 128, num_blocks: Optional[int] = None):
         self.vocab, self.max_len, self.eos, self.eos_after, self.max_seqs = vocab, max_len, eos, eos_after, max_seqs
         self.delay = delay            # seconds per engine call, to let concurrent requests overlap in tests
         self.calls = []
+        self.prefill_ids = []         # (slot, ids) of every prefill, for the recompute test
         self.n_gen = {}
+        self.hist = {}                # slot -> tokens in its "KV cache" (prompt, then every fed token)
         # block accounting like the engine's (default: every slot can reach max_len)
         self.block_size = block_size
         self.num_blocks = num_blocks if num_blocks is not None else max_seqs * -(-max_len // block_size)
@@ -125,18 +129,23 @@ class FakeBackend:
     def _check_reserved(self, slot: int, n_tokens: int):   # the engine exits if a written position has no block
         assert self.blocks.get(slot, 0) * self.block_size >= n_tokens, (slot, n_tokens, self.blocks.get(slot, 0))
 
-    def _next(self, slot: int, tok: int) -> int:
+    def _next(self, slot: int) -> int:
         self.n_gen[slot] = self.n_gen.get(slot, 0) + 1
         if self.eos_after is not None and self.n_gen[slot] == self.eos_after:
             return self.eos
-        return 10 + (tok * 7 + 3) % (self.vocab - 10)
+        h = 0
+        for t in self.hist[slot]:
+            h = (h * 1000003 + t + 1) % 2147483647
+        return 10 + h % (self.vocab - 10)
 
     def prefill(self, slot: int, ids: List[int]) -> int:
         time.sleep(self.delay)
         self._check_reserved(slot, len(ids))
         self.calls.append(("prefill", slot, len(ids)))
+        self.prefill_ids.append((slot, list(ids)))
         self.n_gen[slot] = 0
-        return self._next(slot, ids[-1])
+        self.hist[slot] = list(ids)
+        return self._next(slot)
 
     def decode_batch(self, slots: List[int], tokens: List[int], positions: List[int]) -> List[int]:
         time.sleep(self.delay)
@@ -144,7 +153,12 @@ class FakeBackend:
         for s_, p in zip(slots, positions):
             self._check_reserved(s_, p + 1)
         self.calls.append(("decode", tuple(slots), tuple(positions)))
-        return [self._next(s_, t) for s_, t in zip(slots, tokens)]
+        out = []
+        for s_, t, p in zip(slots, tokens, positions):
+            assert p == len(self.hist[s_]), f"slot {s_}: token fed at position {p}, history has {len(self.hist[s_])}"
+            self.hist[s_].append(t)
+            out.append(self._next(s_))
+        return out
 
 
 class FakeTokenizer:
@@ -410,7 +424,13 @@ def create_app(backend, tokenizer, model_name: str, eos_ids: List[int]) -> FastA
         body = await request.json()
         prompt = body.get("prompt")
         if isinstance(prompt, list):     # list of token ids or a single-element list of strings
-            ids = prompt if prompt and isinstance(prompt[0], int) else tokenizer.encode(prompt[0] if prompt else "")
+            if prompt and isinstance(prompt[0], int):
+                # the engine reads the embedding row of every id without a check: reject bad ids here (400)
+                if not all(type(t) is int and 0 <= t < backend.vocab for t in prompt):
+                    raise HTTPException(400, f"prompt token ids must be integers in [0, {backend.vocab})")
+                ids = prompt
+            else:
+                ids = tokenizer.encode(prompt[0] if prompt else "")
         else:
             ids = tokenizer.encode(prompt or "")
         return await _respond(body, ids, chat=False)
