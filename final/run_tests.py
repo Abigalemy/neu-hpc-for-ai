@@ -279,6 +279,100 @@ def run_attention(db, binary):
     return report("Flash attention (causal GQA over KV cache)", out)
 
 
+def compare_moe(y, expert_out, w):
+    """MoE tolerance, derived from the per-expert one (like compare_attention, from the arithmetic, not tuned).
+    Reference: e[t] = sum_j w[t,j] * out[t,j] in fp64, with HF's bf16 expert outputs out (the same SwiGLU roundings
+    as our kernel) and HF's bf16 weights w. Each of our expert outputs is held to the mlp rule against HF's,
+    |d out| <= 2**-6 * (|out| + 0.05 * max|out|) (the rule the mlp kernel passes against HF); the K terms can cancel,
+    so the bound is the weighted sum of the per-term bounds, plus one bf16 rounding of y:
+      |y - e| <= 2**-6 * (sum_j w_j |out_j| + 0.05 * max|out|) + 2**-8 * |e|.
+    expert_out: [T, K, H], w: [T, K]. Returns (ok, max |y - e|, max |y - e| / bound, e)."""
+    e = (expert_out.astype(np.float64) * w[:, :, None]).sum(axis=1)
+    d = np.abs(y.astype(np.float64) - e)
+    mag = (np.abs(expert_out) * w[:, :, None]).sum(axis=1)
+    bound = 2.0 ** -6 * (mag + 0.05 * float(np.abs(expert_out).max())) + 2.0 ** -8 * np.abs(e)
+    return bool((d <= bound).all()), float(d.max()), float((d / bound).max()), e
+
+
+def _check_routing(got_idx, got_w, exp_idx, exp_w, probs=None):
+    """Per token: the same set of experts, and the same weight for each expert (bf16 tolerance). A different set is
+    accepted only as a near-tie: the reference probabilities of the swapped experts differ by < 1e-3 (relative)."""
+    bad_set = ties = 0
+    werr = 0.0
+    w_ok = True
+    for t in range(exp_idx.shape[0]):
+        g, e = list(got_idx[t]), list(exp_idx[t])
+        if set(g) != set(e):
+            if probs is not None:
+                swapped = set(g) ^ set(e)
+                pv = [probs[t, x] for x in swapped]
+                if max(pv) - min(pv) < 1e-3 * max(pv):
+                    ties += 1
+                    continue
+            bad_set += 1
+            continue
+        gw = {x: got_w[t, i] for i, x in enumerate(g)}
+        for i, x in enumerate(e):
+            ok, _, d = compare("bfloat16", np.array([gw[x]], np.float32), np.array([exp_w[t, i]], np.float32))
+            w_ok &= ok
+            werr = max(werr, d)
+    return bad_set, ties, w_ok, werr
+
+
+def run_moe(db, binary):
+    out = []
+    for mid, kind, dtype in db.execute("SELECT id, kind, dtype FROM module WHERE kind LIKE 'moe_%'").fetchall():
+        E, K, hid = param(db, mid, "num_experts"), param(db, mid, "top_k"), param(db, mid, "hidden_size")
+        block = kind != "moe_router"
+        names = ("router", "gate_proj", "up_proj", "down_proj") if block else ("gate",)
+        for i, name in enumerate(names):
+            write(f"/tmp/m{i}.bin", db.execute("SELECT data FROM module_tensor WHERE module_id=? AND name=?", (mid, name)).fetchone()[0])
+        inter = param(db, mid, "moe_intermediate_size") if block else 0
+        n = n_ok = 0
+        worst = 0.0
+        for cid, label in db.execute("SELECT id, label FROM test_case WHERE module_id=?", (mid,)).fetchall():
+            xd, xs, _ = case_tensor(db, cid, "input", "x")
+            write("/tmp/x.bin", xd)
+            T = xs.split("x")[0]
+            if block:
+                cmd = [binary, "block", str(E), str(K), str(hid), str(inter), T, "/tmp/x.bin", "/tmp/m0.bin", "/tmp/m1.bin",
+                       "/tmp/m2.bin", "/tmp/m3.bin", "/tmp/idx.bin", "/tmp/w.bin", "/tmp/y.bin"]
+            else:
+                cmd = [binary, "router", str(E), str(K), str(hid), T, "/tmp/x.bin", "/tmp/m0.bin", "/tmp/idx.bin", "/tmp/w.bin"]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            n += 1
+            if r.returncode != 0:
+                print(f"  ! {kind} {label}: binary failed: {r.stderr.strip()[:300]}")
+                continue
+            T = int(T)
+            d, sh, _ = case_tensor(db, cid, "expected", "topk_idx"); exp_idx = load(d, "int32", sh)
+            d, sh, _ = case_tensor(db, cid, "expected", "topk_w"); exp_w = load(d, "bfloat16", sh)
+            got_idx = np.frombuffer(open("/tmp/idx.bin", "rb").read(), dtype=np.int32).reshape(T, K)
+            got_w = load(open("/tmp/w.bin", "rb").read(), "bfloat16", f"{T}x{K}")
+            pr = case_tensor(db, cid, "expected", "probs")
+            probs = load(pr[0], "float32", pr[1]) if pr else None
+            bad_set, ties, w_ok, werr = _check_routing(got_idx, got_w, exp_idx, exp_w, probs)
+            ok = bad_set == 0 and w_ok and (ties == 0 or kind == "moe_router")
+            msg = f"experts: {T - bad_set - ties}/{T} tokens same set" + (f", {ties} near-tie" if ties else "")
+            if block:
+                d, sh, _ = case_tensor(db, cid, "expected", "y_f32"); e32 = load(d, "float32", sh)
+                d, sh, _ = case_tensor(db, cid, "expected", "y"); ehf = load(d, "bfloat16", sh)
+                y = load(open("/tmp/y.bin", "rb").read(), "bfloat16", sh)
+                d, sh2, _ = case_tensor(db, cid, "expected", "expert_out"); eo = load(d, "bfloat16", sh2)
+                ok_y, dref, frac, eref = compare_moe(y, eo, exp_w)
+                m = float(np.abs(eref).max())
+                d32 = float(np.abs(y - e32).max()) / m
+                dhf = float(np.abs(y - ehf).max()) / m
+                ok &= ok_y
+                worst = max(worst, dref / m)
+                msg += (f"; y: max err {dref / m:.2e} of max|e| = {frac:.2f} of the bound ({'ok' if ok_y else 'FAIL'}); "
+                        f"for information: vs fp32 path {d32:.2e}, vs HF's bf16 sum {dhf:.2e}")
+            n_ok += ok
+            print(f"  {'ok  ' if ok else 'FAIL'} {kind} E={E} {label}: {msg}")
+        out.append((f"{kind} E={E} top-{K}", n, n_ok, n_ok, worst))
+    return report("MoE (Qwen3-30B-A3B sparse block; worst = rel. to max|e|)", out)
+
+
 if __name__ == "__main__":
     db = sqlite3.connect(sys.argv[1])
     build = sys.argv[2]
@@ -298,6 +392,8 @@ if __name__ == "__main__":
         results.append(run_argmax(db, f"{build}/argmax_test"))
     if "attention" in which:
         results.append(run_attention(db, f"{build}/attention_test"))
+    if "moe" in which:
+        results.append(run_moe(db, f"{build}/moe_test"))
     ok = all(results)
     print("\nALL PASS (tolerance)" if ok else "\nSOME CASES FAILED")
     sys.exit(0 if ok else 1)

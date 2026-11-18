@@ -18,13 +18,14 @@ TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention"]
 
 
 # self-checking binaries without SQLite cases (exit code 0 = pass): `--tests paged` runs the PagedAttention test
+MOE = ["moe"]   # Part 1: cases in test_cases_moe.db (modal run part1/gen_moe_cases.py), `--tests moe`
 SELF_CHECKING = ["paged_attention", "paged_bench"]   # paged_bench: timings only (`--tests paged_bench`)
 
 
 def build_cmd(arch):
     # compiled in parallel: one after another, the binaries no longer fit the image-build time limit (seen 2026-11-18);
     # xargs exits non-zero if any compile fails, which fails the build before a GPU is started
-    names = " ".join(TESTS + SELF_CHECKING)
+    names = " ".join(TESTS + MOE + SELF_CHECKING)
     return (f"cd /root/final && mkdir -p build && printf '%s\\n' {names} | xargs -P 8 -I{{}} "
             f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{{}}_test.cu -o build/{{}}_test")
 
@@ -47,6 +48,10 @@ def run_all(tests: list):
     db_tests = [t for t in tests if t in TESTS]
     if db_tests:
         rc |= subprocess.run(["python", "run_tests.py", "test_cases.db", "build"] + db_tests, cwd="/root/final").returncode
+    if "moe_debug" in tests:
+        rc |= subprocess.run(["python", "tools/moe_debug.py", "test_cases_moe.db", "build/moe_test"], cwd="/root/final").returncode
+    if "moe" in tests:
+        rc |= subprocess.run(["python", "run_tests.py", "test_cases_moe.db", "build", "moe"], cwd="/root/final").returncode
     if "paged" in tests:
         rc |= subprocess.run(["build/paged_attention_test"], cwd="/root/final").returncode
     if "paged_bench" in tests:

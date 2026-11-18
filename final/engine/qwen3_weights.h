@@ -85,6 +85,13 @@ struct Qwen3Config {
     bool yarn = false;                       // YaRN from the config (or the QWEN3_YARN override, see the engine)
     double yarn_factor = 0, yarn_beta_fast = 32, yarn_beta_slow = 1, yarn_attention_factor = -1;
     int yarn_orig_max = 32768;
+    // Qwen3-MoE (Qwen3-30B-A3B: 128 experts, top-8, expert width 768). experts == 0: dense model. Note that the MoE
+    // config also has intermediate_size (6144, for dense MLP layers, which Qwen3-30B-A3B does not have): the experts
+    // use moe_intermediate_size.
+    int experts = 0, top_k = 0, moe_inter = 0, sparse_step = 1;
+    bool norm_topk = true;
+    bool has_mlp_only_layers = false;        // dense layers inside an MoE model: not supported (none in 30B-A3B)
+    bool is_moe_layer(int l) const { return experts > 0 && (l + 1) % sparse_step == 0; }
 };
 
 static std::string slurp(const std::string& path) {
@@ -113,6 +120,12 @@ static Qwen3Config load_config(const std::string& dir) {
     c.eps = (float)num("rms_norm_eps", 1e-6);
     c.rope_theta = num("rope_theta", 1e6);
     c.tie_embeddings = num("tie_word_embeddings", 1) != 0;
+    c.experts = (int)num("num_experts", 0);
+    c.top_k = (int)num("num_experts_per_tok", 0);
+    c.moe_inter = (int)num("moe_intermediate_size", 0);
+    c.sparse_step = (int)num("decoder_sparse_step", 1);
+    c.norm_topk = num("norm_topk_prob", 1) != 0;   // json_parse reads true / false as 1 / 0
+    if (const JV* ml = j.get("mlp_only_layers")) c.has_mlp_only_layers = ml->t == JV::ARR && !ml->arr.empty();
     const JV* rs = j.get("rope_scaling");
     if (!rs || rs->t != JV::OBJ) rs = j.get("rope_parameters");   // newer config layout
     if (rs && rs->t == JV::OBJ) {
