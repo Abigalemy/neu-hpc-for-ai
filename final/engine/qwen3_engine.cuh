@@ -436,6 +436,7 @@ private:
                 stage("moe", ex_bytes, 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H), [&] {
                     CKL((launch_moe<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk, moe_ws_)));
                 });
+                if (moe_dump_) dump_routing(l, n, h_pos);
             } else {
                 stage("mlp_gate_up_silu", 2.0 * lin_bytes(cfg.inter, H), 2.0 * lin_flops(cfg.inter, H),
                       [&] { CKL(launch_mlp_gate_up<bf16>(h_, L.wg, L.wu, mlp_h_, n, H, cfg.inter)); });
@@ -453,6 +454,19 @@ private:
         CK(cudaDeviceSynchronize());
         if (profile) prof_collect();
         return logits_;
+    }
+
+    // QWEN3_MOE_DUMP=<file>: append every MoE layer's chosen experts, record = int32 layer, n, positions[n],
+    // experts[n * K] (debugging only: a device-to-host copy per layer)
+    std::FILE* moe_dump_ = [] { const char* p = std::getenv("QWEN3_MOE_DUMP"); return p ? std::fopen(p, "wb") : nullptr; }();
+    void dump_routing(int layer, int n, const int* h_pos) {
+        std::vector<int> idx((size_t)n * cfg.top_k);
+        CK(cudaMemcpy(idx.data(), moe_ws_.idx, idx.size() * sizeof(int), cudaMemcpyDeviceToHost));
+        int head[2] = {layer, n};
+        std::fwrite(head, sizeof(int), 2, moe_dump_);
+        std::fwrite(h_pos, sizeof(int), n, moe_dump_);
+        std::fwrite(idx.data(), sizeof(int), idx.size(), moe_dump_);
+        std::fflush(moe_dump_);
     }
 
     void upload_tables() {   // device copy of the block tables that changed since the last forward
