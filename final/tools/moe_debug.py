@@ -36,7 +36,9 @@ def main(dbp, binary):
     db = sqlite3.connect(dbp)
     d = "/tmp/moedbg"
     os.makedirs(d, exist_ok=True)
-    for kind, label in (("moe_block_designed", "two_tokens_overlap"), ("moe_block", "t5")):
+    bad = 0
+    for kind, label in (("moe_block_designed", "two_tokens_overlap"), ("moe_block", "t5"), ("moe_block", "t33"),
+                        ("moe_block", "t128")):
         mid = db.execute("SELECT id FROM module WHERE kind=?", (kind,)).fetchone()[0]
         E, K, H, I = (param(db, mid, k) for k in ("num_experts", "top_k", "hidden_size", "moe_intermediate_size"))
         W = {}
@@ -66,43 +68,52 @@ def main(dbp, binary):
         srt = np.frombuffer(open(f"{d}/sorted.bin", "rb").read(), np.int32)
         inv = np.frombuffer(open(f"{d}/inv.bin", "rb").read(), np.int32)
         flat = idx.reshape(-1)
+        # every stage is checked from the GPU's OWN outputs of the stage before (so one wrong stage does not hide or
+        # fake a later one), and every stage is checked even when an earlier one failed
+        ok = True
         want_cnt = np.bincount(flat, minlength=E)
-        if not check("count", np.array_equal(cnt, want_cnt), f"got {cnt.tolist()} want {want_cnt.tolist()}"):
-            continue
-        want_off = np.concatenate([[0], np.cumsum(want_cnt)[:-1]])
-        if not check("off", np.array_equal(off, want_off), f"got {off.tolist()} want {want_off.tolist()}"):
-            continue
+        ok &= check("count", np.array_equal(cnt, want_cnt), f"got {cnt.tolist()} want {want_cnt.tolist()}")
+        want_off = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+        ok &= check("off", np.array_equal(off, want_off), f"got {off.tolist()} want {want_off.tolist()}")
         want_srt = np.argsort(flat, kind="stable").astype(np.int32)
-        if not check("sorted", np.array_equal(srt, want_srt), f"got {srt[:24].tolist()} want {want_srt[:24].tolist()}"):
-            continue
-        want_inv = np.empty(A, np.int32); want_inv[want_srt] = np.arange(A)
-        if not check("inv", np.array_equal(inv, want_inv), f"got {inv[:24].tolist()} want {want_inv[:24].tolist()}"):
-            continue
+        ok &= check("sorted", np.array_equal(srt, want_srt), f"got {srt[:24].tolist()} want {want_srt[:24].tolist()}")
+        valid = (srt >= 0) & (srt < A)
+        want_inv = np.full(A, -1, np.int32); want_inv[srt[valid]] = np.arange(A)[valid]
+        ok &= check("inv", np.array_equal(inv, want_inv), f"got {inv[:24].tolist()} want {want_inv[:24].tolist()}")
         hb = rd(f"{d}/hbuf.bin", "bfloat16", (A, I))
         ys = rd(f"{d}/ysorted.bin", "bfloat16", (A, H))
-        href = np.zeros((A, I), np.float32); yref = np.zeros((A, H), np.float32)
+        y = rd("/tmp/y.bin", "bfloat16", (T, H))
+        # gate/up: row p of hbuf from the token and expert the GPU's sorted list names
+        href = np.zeros((A, I), np.float32)
         for pos in range(A):
-            a = want_srt[pos]; t, e = a // K, flat[a]
+            a = srt[pos] if 0 <= srt[pos] < A else want_srt[pos]
+            t, e = a // K, flat[a]
             g = bf16(x[t] @ W["gate_proj"][e].T); u = bf16(x[t] @ W["up_proj"][e].T)
             href[pos] = bf16(bf16(g / (1 + np.exp(-g))) * u)
-            yref[pos] = bf16(href[pos] @ W["down_proj"][e].T)
         eh = np.abs(hb - href).max() / np.abs(href).max()
-        if not check("hbuf", eh < 2e-2, f"max err {eh:.2e} of max|h|; row0 got {hb[0, :4]} want {href[0, :4]}"):
-            # which rows / columns: does a row of hbuf match the reference for another token?
+        good = check("gate_up (hbuf)", eh < 2e-2, f"max err {eh:.2e} of max|h|; row0 got {hb[0, :4]} want {href[0, :4]}")
+        ok &= good
+        if not good:
             for pos in range(min(A, 4)):
                 errs = [np.abs(hb[pos] - href[q]).max() for q in range(A)]
                 print(f"    hbuf row {pos}: closest reference row {int(np.argmin(errs))} (err {min(errs):.3g})")
-            continue
+        # down: from the GPU's own hbuf
+        yref = np.zeros((A, H), np.float32)
+        for pos in range(A):
+            a = srt[pos] if 0 <= srt[pos] < A else want_srt[pos]
+            yref[pos] = bf16(hb[pos] @ W["down_proj"][flat[a]].T)
         ey = np.abs(ys - yref).max() / np.abs(yref).max()
-        if not check("ysorted", ey < 2e-2, f"max err {ey:.2e} of max|y|; row0 got {ys[0, :4]} want {yref[0, :4]}"):
-            continue
-        y = rd("/tmp/y.bin", "bfloat16", (T, H))
-        want_y = np.zeros((T, H));
+        ok &= check("down (ysorted)", ey < 2e-2, f"max err {ey:.2e} of max|y|; row0 got {ys[0, :4]} want {yref[0, :4]}")
+        # combine: from the GPU's own ysorted, inv and weights
+        want_y = np.zeros((T, H))
         for a in range(A):
-            want_y[a // K] += w.reshape(-1)[a] * yref[want_inv[a]]
+            if 0 <= inv[a] < A:
+                want_y[a // K] += w.reshape(-1)[a] * ys[inv[a]]
         e_ = np.abs(y - want_y).max() / np.abs(want_y).max()
-        check("combine (y)", e_ < 2e-2, f"max err {e_:.2e} of max|y|; row0 got {y[0, :4]} want {want_y[0, :4]}")
-    return 0
+        ok &= check("combine (y)", e_ < 2e-2, f"max err {e_:.2e} of max|y|; row0 got {y[0, :4]} want {want_y[0, :4]}")
+        bad += not ok
+    print("\nMOE DEBUG: all stages ok" if bad == 0 else f"\nMOE DEBUG: {bad} case(s) with a wrong stage")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

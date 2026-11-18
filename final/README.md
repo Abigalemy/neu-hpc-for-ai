@@ -8,7 +8,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 |---|---|---|
 | Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
 | Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
-| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | not started |
+| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | in progress: MoE kernels pass their unit tests (below); engine, server, H200 benchmark next |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
 | Part 4 | Within 3x of vLLM; write-up | not started |
 
@@ -109,6 +109,33 @@ needed. Source: `results/comparison.csv` (rows `paged/*`, `slots8/*`).
 - Ours in this configuration: lecture ITL 3.45x vLLM, above the Part 4 limit (3x); the batched decode at 100
   sequences is the next thing to optimise (Part 4).
 
+## Part 1 (in progress): Qwen3-30B-A3B on one GPU
+
+Continued from the Part 0 server (commit `ba38271`); one code base serves both models, chosen by the checkpoint's
+config (`num_experts > 0` -> MoE layers). Weights: `Qwen/Qwen3-30B-A3B` bf16 at revision
+`ad44e777bcd18fa416d9da3bd8f70d33ebb85d39` (61.1 GB, 16 shards) in our volume `qwen3-hf-cache` (`part1/download_moe.py`).
+Qwen3-30B-A3B differs from the 4B in the MLP only: every layer is a sparse MoE block, 128 experts of width
+`moe_intermediate_size` = 768 (not `intermediate_size` = 6144), top-8 with renormalised weights; attention 32 / 4 heads.
+
+MoE block (`kernels/qwen3_moe_tile.cuh`), all on the GPU, no host round trip for the routing: router (bf16 logits,
+fp32 softmax, top-8, renormalise), count per expert, stable counting sort by expert, grouped gate/up + SiLU with the
+rows gathered from x by token id (`gather_scatter_view`), grouped down, and a combine where each token gathers its 8
+expert outputs and sums them in fp32 (deterministic, no atomics).
+
+Tests: `part1/gen_moe_cases.py` makes reference cases with the HF `Qwen3MoeSparseMoeBlock` (transformers 5.23.0,
+torch 2.15.0, CPU) into `test_cases_moe.db`: the router at its real shape (2048 -> 128, top-8), blocks of 16 experts
+of width 128 with 1-128 tokens, and a designed 2-token case (token 0 -> experts 0-7, token 1 -> 4-11). `run_tests.py
+... moe`: expert sets per token (a different set only as a near-tie, reference probabilities within 1e-3), weights per
+expert, and y against HF's bf16 expert outputs summed in fp64 with a bound derived from the per-expert mlp rule (the
+8 terms can cancel, so the bound is the weighted sum of the per-term bounds). On H100 (2026-11-18): 10/10 cases pass,
+y within 15-32% of the bound; 4 router tokens and 1 block token are bf16 ties (equal logits) where `torch.topk`
+picks the other expert. `tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
+the GPU's own intermediates: all exact or within 0.3% on 4 cases.
+
+Two findings on the way: `gather_scatter_view` takes element offsets (not tile coordinates) in every dimension other
+than the gathered one (a probe in `tests/moe_test.cu`); and a prefix sum written as a mma with a lower-triangular bf16
+matrix left positions of the sort unwritten on the H100, replaced by an integer masked row sum.
+
 ## Part 2: two-GPU all-to-all mock
 
 `part2/` implements the figure of the Week 8 handout: two workers (one GPU each), four experts (0, 1 on worker 0;
@@ -189,6 +216,9 @@ modal run modal_vllm_aipref.py --yes --mode paged  # vLLM, PagedAttention compar
 modal run modal_aipref.py --yes --mode paged       # ours, paged (128 sequences share the pool)
 modal run modal_aipref.py --yes --mode slots8      # ours, same pool, 8 sequences (= contiguous slots)
 modal run compile_check.py                         # CPU only: compile the engine and every test
+modal run part1/download_moe.py --yes              # Part 1: Qwen3-30B-A3B weights into qwen3-hf-cache (CPU)
+modal run part1/gen_moe_cases.py                   # Part 1: MoE reference cases -> test_cases_moe.db (CPU)
+modal run modal_test_h100.py --yes --tests moe,moe_debug   # Part 1: MoE unit tests + stage-by-stage check
 modal run part2/modal_a2a.py --yes                 # Part 2: all-to-all mock on 2x H100
 modal run hw_check.py --yes                        # 2x H200 available? peer access, NCCL in the image
 modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container

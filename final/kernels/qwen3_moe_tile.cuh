@@ -11,14 +11,19 @@
 //   2. moe_count       COUNT[e] = number of assignments to expert e (one block per expert)
 //   3. moe_sort        stable counting sort of the assignments by expert: SORTED[OFF[e] + i] = the i-th assignment of
 //                      expert e (token order), INV[a] = its position, OFF[e] = sum of the counts of experts < e (one
-//                      block per expert; the position inside a tile of assignments is a prefix sum, done as a mma
-//                      with a lower-triangular matrix of ones)
+//                      block per expert; the position inside a tile of assignments is a prefix sum, a masked row
+//                      sum over a [BA, BA] tile)
 //   4. moe_gate_up     per (expert, row tile, INTER tile): H rows gathered from x with gather_scatter_view by token
 //                      id (SORTED / K), fused SwiGLU like gate_up_silu_kernel, rows stored in sorted order
 //   5. moe_down        per (expert, row tile, HID tile): expert output rows in sorted order (T, like HF's expert out)
 //   6. moe_combine     y[t] = T(sum_j float(w[t,j]) * float(Ysorted[INV[t*K+j]])), rows gathered by INV
 // Steps 4/5 launch a grid for the worst case (every token on every expert); tiles past an expert's count do no work.
 // Expert weights are packed per layer: Wg, Wu [E, INTER, HID], Wd [E, HID, INTER] (HF layout per expert).
+//
+// Note on gather_scatter_view (measured on an H100, tests/moe_test.cu probe, 2026-11-18): the gathered dimension takes
+// a tile of row indices, and every OTHER dimension takes an ELEMENT offset, not a tile coordinate as in partition_view:
+// a <BM, BK> tile at column block kb is load(rows, kb * BK). (cuda_tile.h does not say; the first version used kb and
+// read the wrong columns.)
 #pragma once
 #include <cstdio>
 #include "cuda_tile.h"
@@ -111,7 +116,6 @@ __tile_global__ void moe_sort_kernel(const int* __restrict__ IDX, int n_assign, 
     using namespace ct::literals;
     using i32_a = ct::tile<int, ct::shape<MOE_BA>>;
     using i32_aa = ct::tile<int, ct::shape<MOE_BA, MOE_BA>>;
-    using t_a16 = ct::tile<T, ct::shape<MOE_BA, 16>>;
     int e = static_cast<int>(ct::bid().x);
     // OFF[e] = sum of the counts of the experts before e
     auto pCnt = ct::partition_view{ct::tensor_span{COUNT, ct::extents{ct::integral_constant<E>{}}}, ct::shape<E>{}};
@@ -121,10 +125,14 @@ __tile_global__ void moe_sort_kernel(const int* __restrict__ IDX, int n_assign, 
     auto pOff = ct::partition_view{ct::tensor_span{OFF, ct::extents{ct::integral_constant<E>{}}}, ct::shape<1>{}};
     pOff.store(off, e);
 
-    // lower-triangular ones (strict): pre[r] = number of matches at positions < r inside the tile
+    // pre[r] = number of matches at positions < r inside the tile: a masked row sum over a [BA, BA] tile (integer,
+    // exact). The first version computed it as a mma with a lower-triangular bf16 matrix of ones; on the H100 SORTED
+    // then had unwritten positions once more than 40 lanes of a tile were used (tools/moe_debug.py, t33 / t128), and
+    // replacing only that mma by this integer form made every stage exact (2026-11-18). Why the mma form failed was
+    // not investigated further.
     auto rr = ct::broadcast<ct::shape<MOE_BA, MOE_BA>>(ct::reshape<ct::shape<MOE_BA, 1>>(ct::iota<i32_a>()));
     auto cc = ct::broadcast<ct::shape<MOE_BA, MOE_BA>>(ct::reshape<ct::shape<1, MOE_BA>>(ct::iota<i32_a>()));
-    auto ltri = ct::element_cast<T>(ct::select(cc < rr, ct::full<i32_aa>(1), ct::zeros<i32_aa>()));
+    auto lower = cc < rr;
 
     auto pA = ct::partition_view{ct::tensor_span{IDX, ct::extents{n_assign}}, ct::shape<MOE_BA>{}};
     auto gS = ct::gather_scatter_view{ct::tensor_span{SORTED, ct::extents{n_assign}}, ct::shape<MOE_BA>{}, ct::integral_constant<0>{}};
@@ -134,9 +142,8 @@ __tile_global__ void moe_sort_kernel(const int* __restrict__ IDX, int n_assign, 
         auto pos = ab * MOE_BA + ct::iota<i32_a>();
         auto ids = ct::select(pos < n_assign, pA.load_masked(ab), ct::full<i32_a>(-1));
         auto hit = ct::select(ids == e, ct::full<i32_a>(1), ct::zeros<i32_a>());
-        auto hit16 = ct::element_cast<T>(ct::broadcast<ct::shape<MOE_BA, 16>>(ct::reshape<ct::shape<MOE_BA, 1>>(hit)));
-        auto pre = ct::mma(ltri, hit16, ct::zeros<ct::tile<float, ct::shape<MOE_BA, 16>>>());   // every column the same
-        auto pre1 = ct::element_cast<int>(ct::reshape<ct::shape<MOE_BA>>(ct::sum(pre, 1_ic) / 16.0f));
+        auto hit_row = ct::broadcast<ct::shape<MOE_BA, MOE_BA>>(ct::reshape<ct::shape<1, MOE_BA>>(hit));
+        auto pre1 = ct::reshape<ct::shape<MOE_BA>>(ct::sum(ct::select(lower, hit_row, ct::zeros<i32_aa>()), 1_ic));
         auto dst = ct::select(hit == 1, running + pre1, ct::full<i32_a>(n_assign));   // n_assign = masked out
         gS.store_masked(pos, dst);                                                    // SORTED[dst] = assignment id
         gI.store_masked(dst, ct::select(hit == 1, pos, ct::full<i32_a>(n_assign)));   // INV[assignment] = dst
@@ -172,7 +179,7 @@ __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, 
     auto acc_g = ct::zeros<acc_t>();
     auto acc_u = ct::zeros<acc_t>();
     for (auto kb : ct::irange(0, k_blocks)) {
-        ct::tile<T, ct::shape<BM, BK>> x = gX.load_masked(tok, kb);
+        ct::tile<T, ct::shape<BM, BK>> x = gX.load_masked(tok, kb * BK);   // element offset, see the note above
         ct::tile<T, ct::shape<BN, BK>> wg = pWG.load(nb, kb);
         ct::tile<T, ct::shape<BN, BK>> wu = pWU.load(nb, kb);
         acc_g = ct::mma(x, ct::transpose(wg), acc_g);
@@ -227,7 +234,7 @@ __tile_global__ void moe_combine_kernel(const T* __restrict__ YS, int n_assign, 
         auto row = ct::select(t < n_tokens, ct::reshape<ct::shape<BR>>(pInv.load_masked(tb, j)),
                               ct::full<ct::tile<int, ct::shape<BR>>>(n_assign));
         auto w = ct::element_cast<float>(pW.load_masked(tb, j));                    // [BR, 1]
-        acc = acc + ct::element_cast<float>(gY.load_masked(row, nb)) * w;
+        acc = acc + ct::element_cast<float>(gY.load_masked(row, nb * BN)) * w;   // element offset (note above)
     }
     auto pY = ct::partition_view{ct::tensor_span{Y, ct::extents{n_tokens, hid}}, ct::shape<BR, BN>{}};
     pY.store_masked(ct::element_cast<T>(acc), tb, nb);
@@ -269,6 +276,7 @@ cudaError_t launch_moe(const T* x, const T* wr, const T* wg, const T* wu, const 
     else grouped(std::integral_constant<int, 16>{});
     if ((e = cudaGetLastError()) != cudaSuccess) return e;
     constexpr int BR = 16, BN = 256;
-    moe_combine_kernel<T, K, BR, BN><<<dim3((n + BR - 1) / BR, hid / BN, 1), 1, 0, s>>>(ws.ysorted, A, ws.inv, ws.w, y, n, hid);
+    moe_combine_kernel<T, K, BR, BN><<<dim3((n + BR - 1) / BR, (hid + BN - 1) / BN, 1), 1, 0, s>>>(ws.ysorted, A, ws.inv,
+                                                                                            ws.w, y, n, hid);
     return cudaGetLastError();
 }

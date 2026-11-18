@@ -10,7 +10,8 @@ Modules (all bf16, hidden size 2048 as in Qwen3-30B-A3B):
   moe_block_designed  as moe_block, but the router picks known experts: token 0 -> experts 0..7, token 1 -> 4..11
               (overlap 4..7), so a wrong expert, a wrong row or a wrong sum can be told apart
 
-Expected tensors per case: topk_idx (int32), topk_w (bf16, what HF multiplies with), y (HF's bf16 output: HF adds the
+Expected tensors per case: topk_idx (int32), topk_w (bf16, what HF multiplies with), probs (fp32 router
+probabilities, to recognise a near-tie choice), y (HF's bf16 output: HF adds the
 8 expert outputs one by one into a bf16 tensor, in expert order), y_f32 (the same maths in fp32 from the same bf16
 inputs and weights: the reference for a kernel that sums in fp32), and expert_out (each token's 8 expert outputs,
 [tokens, 8, hidden], for debugging). The generator checks its own reference against the HF module before writing.
@@ -134,7 +135,7 @@ def add_block_cases(db, kind, blk, wg, gate, up, down, cases, E, I, k):
     for label, x in cases:
         with torch.no_grad():
             y_hf = blk(x[None])[0]
-            _, _, idx, w = route(x, wg, k)
+            _, probs, idx, w = route(x, wg, k)
             out16, _ = experts_ref(x, idx, w, gate, up, down, torch.bfloat16)
             out32, y32 = experts_ref(x, idx, w, gate, up, down, torch.float32)
             # HF adds the k expert outputs (each already times its bf16 weight) into a bf16 tensor in expert order
@@ -150,7 +151,7 @@ def add_block_cases(db, kind, blk, wg, gate, up, down, cases, E, I, k):
         # the reference one token at a time, and CPU bf16 matmuls round differently for different shapes
         assert d_hf < 2e-2 and d_32 < 2e-2, "own reference does not reproduce the HF module"
         add_case(db, mid, label, {"x": x}, {"topk_idx": idx.to(torch.int32), "topk_w": w, "y": y_hf.contiguous(),
-                                            "y_f32": y32, "expert_out": out16})
+                                            "y_f32": y32, "expert_out": out16, "probs": probs})
     return idx
 
 
