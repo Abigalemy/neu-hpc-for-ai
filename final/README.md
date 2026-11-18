@@ -2,11 +2,11 @@
 
 Goal (from the assignment): approach vLLM performance without PyTorch in the serving path.
 
-## Status (2026-11-17)
+## Status (2026-11-18)
 
 | Part | What | Status |
 |---|---|---|
-| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 2.51x (below); paged KV cache (Week 7) in, its benchmark still to run |
+| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
 | Part 2 | Two-GPU all-to-all mock | next |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | not started |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
@@ -57,16 +57,24 @@ EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source:
 
 | Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio | ITL vLLM / ours (ms) | ratio | output tok/s vLLM / ours |
 |---|---|---|---|---|---|---|
-| baseline | 128 / 128, 1 | 29.21 / 13.60 | 0.47x | 4.25 / 6.70 | 1.58x | 224 / 147 |
-| long_out | 3072 / 1024, 1 | 63.73 / 74.78 | 1.17x | 4.44 / 7.76 | 1.75x | 222 / 128 |
-| balanced_c16 | 256 / 256, 16 | 107.33 / 99.53 | 0.93x | 4.70 / 8.73 | 1.86x | 3126 / 1750 |
-| balanced_c64 | 256 / 256, 64 | 270.13 / 387.44 | 1.43x | 6.35 / 15.01 | 2.36x | 8610 / 3873 |
-| prefill_heavy | 2048 / 32, 8 | 204.67 / 209.26 | 1.02x | 6.99 / 14.76 | 2.11x | 601 / 382 |
-| decode_heavy | 64 / 1024, 32 | 95.96 / 141.27 | 1.47x | 5.57 / 11.26 | 2.02x | 5639 / 2804 |
+| baseline | 128 / 128, 1 | 29.21 / 14.83 | 0.51x | 4.25 / 7.37 | 1.73x | 224 / 134 |
+| long_out | 3072 / 1024, 1 | 63.73 / 79.13 | 1.24x | 4.44 / 8.30 | 1.87x | 222 / 119 |
+| balanced_c16 | 256 / 256, 16 | 107.33 / 109.51 | 1.02x | 4.70 / 9.66 | 2.06x | 3126 / 1582 |
+| balanced_c64 | 256 / 256, 64 | 270.13 / 404.88 | 1.50x | 6.35 / 19.22 | 3.03x | 8610 / 3077 |
+| prefill_heavy | 2048 / 32, 8 | 204.67 / 227.10 | 1.11x | 6.99 / 15.75 | 2.25x | 601 / 356 |
+| decode_heavy | 64 / 1024, 32 | 95.96 / 154.76 | 1.61x | 5.57 / 13.03 | 2.34x | 5639 / 2424 |
 | 128K (YaRN x4), paged KV | 130816 / 128, 1 | 10446.84 / 23366.57 | 2.24x | 10.43 / 24.73 | 2.37x | |
 | lecture_c100 (Week 7) | 1000 / 500, 100; 1000 requests | 453.13 / 1137.69 | 2.51x | 13.36 / 33.43 | 2.50x | 7015 / 2803 |
 
-Notes: `lecture_c100` is the AIPerf example from the Week 7 lecture ("Performance Evaluation": concurrency 100, 1000
+Notes: the six suite rows were rerun with the paged engine on 2026-11-18 (`suite_ours_1795031469`; vLLM unchanged).
+They came out 7-28% slower than the run before paging (`suite_ours_1794881935`, e.g. balanced_c64 ITL 15.01 -> 19.22
+ms), so the two engines were timed in ONE container, alternating old, new, old, new (`tools/ab_engine_bench.py`):
+the paged engine is as fast or slightly faster (decode step B=64, L=256: 12.48 / 12.58 ms vs 13.05 / 12.93 ms before
+paging; B=100, L=1000: 27.37 vs 28.18 / 28.03 ms; B=1: 6.80 / 6.95 vs 6.97 / 6.88 ms), and the Python scheduler costs
+0.012 ms more per step (fake engine, local). The difference between the two suite runs is therefore not the paging;
+it is the container (another H100 / host; our server is partly host-bound at small sizes), which this project cannot
+control. The rows above are the current code as measured; balanced_c64 ITL lands at 3.03x, at the Part 4 limit.
+`lecture_c100` is the AIPerf example from the Week 7 lecture ("Performance Evaluation": concurrency 100, 1000
 requests, 1000 in / 500 out, warm-up 16 requests at concurrency 8), with the lecture's vLLM limits
 `--max-model-len 2048 --max-num-seqs 128 --gpu-memory-utilization 0.90`; our server gets the same limits (128 slots of
 2048 tokens). TTFT p99 there: vLLM 1513 ms, ours 2242 ms. It is the baseline before PagedAttention: our 128 slots
@@ -74,6 +82,32 @@ reserve 128 x 2048 tokens of KV cache up front (2 x 2 bytes x 36 layers x 8 KV h
 38.7 GB), whatever the requests actually use. The vLLM 128K run is from an earlier session with the same settings. TTFT ratios below 1 at low concurrency
 are not a claim of faster prefill (vLLM's server has its own per-request overhead at small sizes). The 128K workload
 is 130816 + 128 tokens because the chat template adds tokens and the YaRN context (131072) covers input and output.
+
+## PagedAttention: with and without (Week 7)
+
+One server configuration for everything: context limit 32768 tokens, the same KV memory as the 128 x 2048 lecture
+slots (262144 tokens = 38.7 GB at 144 KiB per token), the lecture workload and long prompts one after another.
+"With" = 128 sequences share the block pool and take blocks on demand. "Without" = what contiguous per-sequence
+slots give in the same memory: each sequence reserves 32768 tokens, so only 8 fit (measured as the same pool limited to
+8 sequences; 200 lecture requests there instead of 1000, as only 8 run at a time). vLLM: `--max-model-len 32768
+--max-num-seqs 128 --gpu-memory-utilization 0.90`. Qwen3-4B, 1x H100, AIPerf, 0 request errors, no preemption
+needed. Source: `results/comparison.csv` (rows `paged/*`, `slots8/*`).
+
+| Workload | vLLM: TTFT / ITL (ms), tok/s | ours, paged: TTFT / ITL, tok/s | ratio | ours, 8 slots: TTFT / ITL, tok/s | ratio |
+|---|---|---|---|---|---|
+| lecture_c100: 1000 / 500, concurrency 100 | 863 / 10.21, 8370 | 1157 / 35.21, 2668 | 1.34x / 3.45x | 39791 / 9.06, 868 | **46.1x** / 0.89x |
+| long_c8: 16000 / 256, concurrency 8 | 1445 / 12.79, 433 | 3189 / 34.49, 171 | 2.21x / 2.70x | 3178 / 34.14, 172 | 2.20x / 2.67x |
+
+- Without paging the lecture workload fails Part 0: 92 of the 100 connections wait for one of 8 slots, so TTFT is
+  46x vLLM (p50 50.8 s) and throughput a third, although each slot reserves 32768 tokens for a request that uses
+  1500. With paging the same memory holds all 100 (100 x 1500 tokens = 57% of the pool) and TTFT is 1.34x vLLM. This
+  is the lecture's point: reserving the maximum length per sequence wastes memory (here 95%) and caps the batch.
+- The long prompts need 8 x 16.3K tokens, which fits either way, so paging changes nothing there (same numbers).
+- The ITL of the 8-slot run is lower only because it decodes 8 sequences per step instead of 100.
+- vLLM itself behaves differently with the larger context limit (lecture TTFT 863 vs 453 ms, ITL 10.2 vs 13.4 ms at
+  `--max-model-len 2048`), so both sides were measured in the same configuration.
+- Ours in this configuration: lecture ITL 3.45x vLLM, above the Part 4 limit (3x); the batched decode at 100
+  sequences is the next thing to optimise (Part 4).
 
 ## Correctness checks
 
@@ -99,14 +133,17 @@ is 130816 + 128 tokens because the chat template adds tokens and the YaRN contex
 
 ## Known limitations
 
-- Paged KV cache: implemented and verified (see Correctness), but the benchmark that shows its capacity gain over
-  fixed per-sequence slots has not been run yet; the suite and lecture rows above were measured before paging.
+- The 2048-context lecture row was measured before paging; everything else in the tables after.
+- Run-to-run variance between containers is large for our server (two suite runs 7-28% apart with engines that time
+  the same in one container); differences of that size between single runs are not evidence of a change.
 - Stale rows of a reused block are not zeroed: masked keys get P = 0 exactly, which needs finite stale values (the pool
   is zeroed at start). Zeroing them in the attention loop cost 1.9x (decode) / 2.5x (prefill) and was removed
   (`tests/paged_bench_test.cu`).
 - A prefill stalls the decode of the other running sequences (no chunked-prefill interleaving).
 - Greedy only (`temperature` > 0 is rejected); `min_tokens` does not mask EOS like vLLM.
-- Closest to the Part 4 limit (3x): the lecture workload at concurrency 100 (TTFT 2.51x, ITL 2.50x), long-context
+- Above the Part 4 limit (3x): lecture workload ITL with the 32K context limit (3.45x) and balanced_c64 ITL (3.03x).
+  Closest below it: the lecture
+  workload at context 2048 (TTFT 2.51x, ITL 2.50x), long prompts at concurrency 8 (ITL 2.70x), long-context
   decode (2.37x) and ITL at concurrency 64 (2.36x); decode attention still dominates the 128K step.
 - The old 64x128 attention kernel was less accurate for a single query (decode); the default decode path now uses
   the split-KV kernel, which meets the criterion. The root cause in the old kernel was not identified.
@@ -125,6 +162,12 @@ modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn
 modal run modal_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2
 modal run modal_vllm_aipref.py --yes --lecture     # vLLM, Week 7 lecture workload
 modal run modal_aipref.py --yes --lecture          # ours, Week 7 lecture workload
+modal run modal_vllm_aipref.py --yes --mode paged  # vLLM, PagedAttention comparison configuration
+modal run modal_aipref.py --yes --mode paged       # ours, paged (128 sequences share the pool)
+modal run modal_aipref.py --yes --mode slots8      # ours, same pool, 8 sequences (= contiguous slots)
+modal run compile_check.py                         # CPU only: compile the engine and every test
+modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container
+modal run modal_test_h100.py --yes --tests paged,paged_bench   # paged vs contiguous attention: bits and timing
 python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf
 ```
 

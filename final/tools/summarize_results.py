@@ -16,15 +16,22 @@ RES = os.path.join(HERE, "results")
 
 # (workload, our run dir, vLLM run dir): the pairs compared in the README
 PAIRS = [
-    ("baseline", "suite_ours_1794881935/baseline", "suite_vllm_1794881615/baseline"),
-    ("long_out", "suite_ours_1794881935/long_out", "suite_vllm_1794881615/long_out"),
-    ("balanced_c16", "suite_ours_1794881935/balanced_c16", "suite_vllm_1794881615/balanced_c16"),
-    ("balanced_c64", "suite_ours_1794881935/balanced_c64", "suite_vllm_1794881615/balanced_c64"),
-    ("prefill_heavy", "suite_ours_1794881935/prefill_heavy", "suite_vllm_1794881615/prefill_heavy"),
-    ("decode_heavy", "suite_ours_1794881935/decode_heavy", "suite_vllm_1794881615/decode_heavy"),
+    ("baseline", "suite_ours_1795031469/baseline", "suite_vllm_1794881615/baseline"),
+    ("long_out", "suite_ours_1795031469/long_out", "suite_vllm_1794881615/long_out"),
+    ("balanced_c16", "suite_ours_1795031469/balanced_c16", "suite_vllm_1794881615/balanced_c16"),
+    ("balanced_c64", "suite_ours_1795031469/balanced_c64", "suite_vllm_1794881615/balanced_c64"),
+    ("prefill_heavy", "suite_ours_1795031469/prefill_heavy", "suite_vllm_1794881615/prefill_heavy"),
+    ("decode_heavy", "suite_ours_1795031469/decode_heavy", "suite_vllm_1794881615/decode_heavy"),
     ("128k_yarn", "ours_isl130816_osl128_1795026977", "vllm_isl130816_osl128_1794875810"),
     # the AIPerf example of the Week 7 lecture: 100 connections, 1000 requests, 1000 in / 500 out, 2048 x 128 limits
     ("lecture_c100", "lecture_ours_1794894311/lecture_c100", "lecture_vllm_1794893920/lecture_c100"),
+    # PagedAttention with and without (2026-11-18): one configuration, context 32768, KV pool 262144 tokens for ours;
+    # "paged" = 128 sequences share the pool, "slots8" = at most 8 (= 8 contiguous slots of 32768 in the same memory,
+    # 200 lecture requests instead of 1000); vLLM with --max-model-len 32768 --max-num-seqs 128
+    ("paged/lecture_c100", "paged_ours_1795030271/lecture_c100", "paged_vllm_1795029909/lecture_c100"),
+    ("paged/long_c8", "paged_ours_1795030271/long_c8", "paged_vllm_1795029909/long_c8"),
+    ("slots8/lecture_c100", "slots8_ours_1795030663/lecture_c100", "paged_vllm_1795029909/lecture_c100"),
+    ("slots8/long_c8", "slots8_ours_1795030663/long_c8", "paged_vllm_1795029909/long_c8"),
 ]
 
 
