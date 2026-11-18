@@ -7,10 +7,18 @@ Endpoints: POST /v1/chat/completions, POST /v1/completions (both with "stream": 
 Request fields understood: max_tokens / max_completion_tokens, min_tokens, ignore_eos, stream, stream_options.include_usage,
 temperature (only 0 / greedy is supported: anything else is rejected with 400), chat_template_kwargs.
 
-Continuous batching: a scheduler thread owns the engine. Each iteration it admits waiting requests into free KV-cache
-slots (prefill, which yields their first token), then runs ONE decode step for all running sequences together; finished
-or disconnected sequences free their slot at once, so waiting requests join at the next iteration. A prefill pauses the
-decode of the others while it runs (no chunked mixing of prefill and decode yet).
+Continuous batching: a scheduler thread owns the engine. Each iteration it admits waiting requests (prefill, which
+yields their first token), then runs ONE decode step for all running sequences together; finished or disconnected
+sequences free their slot and their KV blocks at once, so waiting requests join at the next iteration. A prefill pauses
+the decode of the others while it runs (no chunked mixing of prefill and decode yet).
+
+PagedAttention (Week 7 lecture; nano-vllm's Scheduler + BlockManager): the KV cache is a pool of fixed-size blocks
+shared by all sequences, and a sequence takes blocks only as its length grows, so memory is not reserved for max_len
+up front. Admission (first come, first served): the request at the head of the queue starts when a slot is free and
+the pool has blocks for its prompt plus the first generated token. Before each decode step every running sequence
+needs room for one more token; if a new block is needed and none is free, the most recently admitted sequence is
+preempted: its blocks are freed and it goes back to the front of the queue, to be recomputed later (prefill of its
+prompt plus the tokens it already produced), as in vLLM's recompute preemption. Its stream just pauses meanwhile.
 """
 import argparse
 import asyncio
@@ -31,11 +39,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 class CBackend:
     """The real engine through the C interface of engine/qwen3_capi.cu."""
 
-    def __init__(self, lib_path: str, model_dir: str, max_len: int, max_chunk: int, yarn: float, max_seqs: int):
+    def __init__(self, lib_path: str, model_dir: str, max_len: int, max_chunk: int, yarn: float, max_seqs: int,
+                 kv_tokens: int = 0):
         lib = ctypes.CDLL(lib_path)
         lib.qe_create.restype = ctypes.c_void_p
-        lib.qe_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int]
-        for name in ("qe_vocab", "qe_max_len", "qe_max_chunk", "qe_max_seqs"):
+        lib.qe_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int,
+                                  ctypes.c_longlong]
+        for name in ("qe_vocab", "qe_max_len", "qe_max_chunk", "qe_max_seqs", "qe_block_size", "qe_num_blocks",
+                     "qe_free_blocks"):
             getattr(lib, name).restype = ctypes.c_int
             getattr(lib, name).argtypes = [ctypes.c_void_p]
         IntP = ctypes.POINTER(ctypes.c_int)
@@ -43,13 +54,28 @@ class CBackend:
         lib.qe_prefill.argtypes = [ctypes.c_void_p, ctypes.c_int, IntP, ctypes.c_int]
         lib.qe_decode_batch.restype = None
         lib.qe_decode_batch.argtypes = [ctypes.c_void_p, ctypes.c_int, IntP, IntP, IntP, IntP]
+        lib.qe_reserve.restype = ctypes.c_int
+        lib.qe_reserve.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.qe_release.restype = None
+        lib.qe_release.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.lib = lib
-        self.h = lib.qe_create(model_dir.encode(), max_len, max_chunk, yarn, max_seqs)
+        self.h = lib.qe_create(model_dir.encode(), max_len, max_chunk, yarn, max_seqs, kv_tokens)
         if not self.h:
             raise RuntimeError("qe_create failed")
         self.vocab = lib.qe_vocab(self.h)
         self.max_len = lib.qe_max_len(self.h)
         self.max_seqs = lib.qe_max_seqs(self.h)
+        self.block_size = lib.qe_block_size(self.h)
+        self.num_blocks = lib.qe_num_blocks(self.h)
+
+    def free_blocks(self) -> int:
+        return self.lib.qe_free_blocks(self.h)
+
+    def reserve(self, slot: int, n_tokens: int) -> bool:
+        return bool(self.lib.qe_reserve(self.h, slot, n_tokens))
+
+    def release(self, slot: int):
+        self.lib.qe_release(self.h, slot)
 
     def prefill(self, slot: int, ids: List[int]) -> int:
         arr = (ctypes.c_int * len(ids))(*ids)
@@ -68,11 +94,36 @@ class FakeBackend:
     token of a sequence (if set) is `eos`, once, so both stopping at EOS and ignoring it can be tested."""
 
     def __init__(self, vocab: int = 1000, max_len: int = 4096, eos: int = 2, eos_after: Optional[int] = None,
-                 max_seqs: int = 4, delay: float = 0.0):
+                 max_seqs: int = 4, delay: float = 0.0, block_size: int = 128, num_blocks: Optional[int] = None):
         self.vocab, self.max_len, self.eos, self.eos_after, self.max_seqs = vocab, max_len, eos, eos_after, max_seqs
         self.delay = delay            # seconds per engine call, to let concurrent requests overlap in tests
         self.calls = []
         self.n_gen = {}
+        # block accounting like the engine's (default: every slot can reach max_len)
+        self.block_size = block_size
+        self.num_blocks = num_blocks if num_blocks is not None else max_seqs * -(-max_len // block_size)
+        self.blocks = {}              # slot -> number of blocks it holds
+        self.min_free = self.num_blocks
+
+    def free_blocks(self) -> int:
+        return self.num_blocks - sum(self.blocks.values())
+
+    def reserve(self, slot: int, n_tokens: int) -> bool:
+        need = -(-n_tokens // self.block_size)
+        have = self.blocks.get(slot, 0)
+        if need <= have:
+            return True
+        if need > -(-self.max_len // self.block_size) or need - have > self.free_blocks():
+            return False
+        self.blocks[slot] = need
+        self.min_free = min(self.min_free, self.free_blocks())
+        return True
+
+    def release(self, slot: int):
+        self.blocks.pop(slot, None)
+
+    def _check_reserved(self, slot: int, n_tokens: int):   # the engine exits if a written position has no block
+        assert self.blocks.get(slot, 0) * self.block_size >= n_tokens, (slot, n_tokens, self.blocks.get(slot, 0))
 
     def _next(self, slot: int, tok: int) -> int:
         self.n_gen[slot] = self.n_gen.get(slot, 0) + 1
@@ -82,6 +133,7 @@ class FakeBackend:
 
     def prefill(self, slot: int, ids: List[int]) -> int:
         time.sleep(self.delay)
+        self._check_reserved(slot, len(ids))
         self.calls.append(("prefill", slot, len(ids)))
         self.n_gen[slot] = 0
         return self._next(slot, ids[-1])
@@ -89,6 +141,8 @@ class FakeBackend:
     def decode_batch(self, slots: List[int], tokens: List[int], positions: List[int]) -> List[int]:
         time.sleep(self.delay)
         assert len(set(slots)) == len(slots), "a slot appears twice in one batch"
+        for s_, p in zip(slots, positions):
+            self._check_reserved(s_, p + 1)
         self.calls.append(("decode", tuple(slots), tuple(positions)))
         return [self._next(s_, t) for s_, t in zip(slots, tokens)]
 
@@ -113,8 +167,9 @@ class GenRequest:
     def __init__(self, ids: List[int], max_new: int, min_new: int, ignore_eos: bool, loop):
         self.ids, self.max_new, self.min_new, self.ignore_eos = ids, max_new, min_new, ignore_eos
         self.loop, self.queue = loop, asyncio.Queue()
-        self.slot = self.pos = self.last_tok = None
+        self.slot = self.pos = self.last_tok = None   # pos: tokens in the KV cache (None: not prefilled yet)
         self.n_gen = 0               # tokens generated so far (an ignored EOS counts, a final EOS does not)
+        self.gen: List[int] = []     # those tokens: a preempted request is recomputed from ids + gen
         self.cancelled = False       # set by the HTTP side when the client goes away
 
     def emit(self, tok: int, finish: Optional[str]):
@@ -127,10 +182,11 @@ class Scheduler:
     def __init__(self, backend, eos_ids: List[int]):
         self.backend, self.eos = backend, set(eos_ids)
         self.free = list(range(backend.max_seqs))
-        self.running: List[GenRequest] = []
+        self.running: List[GenRequest] = []   # in admission order (the last one is preempted first)
         self.waiting = collections.deque()
         self.cv = threading.Condition()
         self.batch_sizes: List[int] = []      # decode batch size of every step (statistics, tests)
+        self.preemptions = 0
         threading.Thread(target=self._loop, daemon=True).start()
 
     def submit(self, req: GenRequest):
@@ -146,12 +202,23 @@ class Scheduler:
         last = req.n_gen == req.max_new - 1
         req.emit(tok, "length" if last else None)
         req.n_gen += 1
+        req.gen.append(tok)
         req.last_tok = tok
         return last
 
     def _release(self, req: GenRequest):
         self.running.remove(req)
+        self.backend.release(req.slot)
         self.free.append(req.slot)
+
+    def _preempt(self, req: GenRequest):
+        """Recompute preemption: free the request's blocks and slot; it waits at the front of the queue."""
+        self._release(req)
+        req.slot = req.pos = None
+        self.waiting.appendleft(req)
+        self.preemptions += 1
+        print(f"preempted a sequence of {len(req.ids) + len(req.gen)} tokens ({self.preemptions} so far, "
+              f"{len(self.running)} running)", flush=True)
 
     def _loop(self):
         while True:
@@ -170,22 +237,33 @@ class Scheduler:
             while not self.waiting and not self.running:
                 self.cv.wait()
             admitted = []
-            while self.waiting and self.free:
-                r = self.waiting.popleft()
+            while self.waiting and self.free:    # first come, first served: stop at the first request that must wait
+                r = self.waiting[0]
                 if r.cancelled:
+                    self.waiting.popleft()
                     continue
+                n = len(r.ids) + len(r.gen)      # tokens to prefill (prompt + already generated, if recomputed)
+                if not self.backend.reserve(self.free[0], n + 1):   # its prompt and the first decode token
+                    break
+                self.waiting.popleft()
                 r.slot = self.free.pop(0)
                 self.running.append(r)       # running from now on, so an exception below still frees its slot
                 admitted.append(r)
         for r in admitted:                   # prefill: this request's first token = its TTFT
-            tok = self.backend.prefill(r.slot, r.ids)
+            ids = r.ids + r.gen
+            tok = self.backend.prefill(r.slot, ids)
             with self.cv:
-                r.pos = len(r.ids)
+                r.pos = len(ids)
                 if self._accept(r, tok):
                     self._release(r)
         with self.cv:
             for r in [r for r in self.running if r.cancelled]:
                 self._release(r)
+            # every running sequence writes one more position: take a block where one is needed, oldest first;
+            # when the pool is empty, preempt the newest sequence (possibly the one asking) until it fits
+            for r in list(self.running):
+                while r in self.running and not self.backend.reserve(r.slot, r.pos + 1):
+                    self._preempt(self.running[-1])
             batch = [r for r in self.running if r.pos is not None]
         if not batch:
             return
@@ -248,6 +326,9 @@ def create_app(backend, tokenizer, model_name: str, eos_ids: List[int]) -> FastA
             raise HTTPException(400, "empty prompt")
         if n_prompt + max_new > backend.max_len:
             raise HTTPException(400, f"prompt ({n_prompt}) + max_tokens ({max_new}) exceeds the context ({backend.max_len})")
+        if -(-(n_prompt + max_new) // backend.block_size) > backend.num_blocks:   # could never run, even alone
+            raise HTTPException(400, f"prompt ({n_prompt}) + max_tokens ({max_new}) exceeds the KV cache "
+                                     f"({backend.num_blocks * backend.block_size} tokens)")
 
     async def _respond(body: dict, prompt_ids: List[int], chat: bool):
         # explicit values win even when they are 0 (then rejected below); only a missing field takes the default
@@ -354,11 +435,15 @@ def main():
     ap.add_argument("--max-len", type=int, default=4096 + 1024 + 64)
     ap.add_argument("--max-chunk", type=int, default=4096)
     ap.add_argument("--yarn", type=float, default=0.0)
-    ap.add_argument("--max-seqs", type=int, default=1, help="KV-cache slots = sequences decoded together")
+    ap.add_argument("--max-seqs", type=int, default=1, help="slots = most sequences decoded together")
+    ap.add_argument("--kv-tokens", type=int, default=0,
+                    help="KV-cache pool size in tokens, shared by all sequences (0: max-seqs x max-len)")
     ap.add_argument("--fake", action="store_true")
     a = ap.parse_args()
     if a.fake:
-        backend, tok, eos = FakeBackend(max_len=a.max_len, max_seqs=a.max_seqs), FakeTokenizer(), [FakeTokenizer.eos_token_id]
+        backend = FakeBackend(max_len=a.max_len, max_seqs=a.max_seqs,
+                              num_blocks=-(-a.kv_tokens // 128) if a.kv_tokens > 0 else None)
+        tok, eos = FakeTokenizer(), [FakeTokenizer.eos_token_id]
     else:
         from transformers import AutoTokenizer   # tokenizer only; PyTorch is not needed for it
         tok = AutoTokenizer.from_pretrained(a.model_dir)
@@ -367,9 +452,10 @@ def main():
         if os.path.exists(gc):
             e = json.load(open(gc)).get("eos_token_id")
             eos += e if isinstance(e, list) else ([e] if e is not None else [])
-        backend = CBackend(a.lib, a.model_dir, a.max_len, a.max_chunk, a.yarn, a.max_seqs)
+        backend = CBackend(a.lib, a.model_dir, a.max_len, a.max_chunk, a.yarn, a.max_seqs, a.kv_tokens)
         print(f"engine ready: vocab {backend.vocab}, max_len {backend.max_len}, max_seqs {backend.max_seqs}, "
-              f"YaRN {a.yarn or 'off'}, eos {sorted(set(eos))}", flush=True)
+              f"KV pool {backend.num_blocks} blocks x {backend.block_size} tokens, YaRN {a.yarn or 'off'}, "
+              f"eos {sorted(set(eos))}", flush=True)
     import uvicorn
     uvicorn.run(create_app(backend, tok, a.served_model_name, eos), host="0.0.0.0", port=a.port, log_level="warning")
 

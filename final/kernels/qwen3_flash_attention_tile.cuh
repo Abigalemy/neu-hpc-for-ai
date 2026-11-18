@@ -7,6 +7,18 @@
 // O is [n_q, HQ, 128]. Prefill is n_q == n_kv; decode is n_q == 1. One block per (query tile, query head).
 // Notation follows the Week 3 notebook / FlashAttention-2: m = running row max, l = running row sum,
 // acc = unnormalised output. Scores and the softmax statistics are fp32; P@V accumulates in fp32.
+//
+// PagedAttention (Week 7 lecture; Kwon et al., SOSP 2023): the KV cache is a pool of fixed-size blocks of KV_BLOCK
+// tokens, [n_blocks * KV_BLOCK, HKV, 128] per layer, and a sequence owns a block table BT (logical block i -> physical
+// block BT[i]). Token position p of the sequence lives in pool row BT[p / KV_BLOCK] * KV_BLOCK + p % KV_BLOCK. The paged
+// kernels read the blocks in place through the table (no copy into a contiguous buffer). KV_BLOCK equals the key tile
+// of the decode kernel, so one key tile is exactly one physical block; the prefill key tile divides it.
+// Rows of a block past the sequence's length hold stale K/V of an earlier owner. Their scores are masked to -FLT_MAX as
+// before, so P = exp(-FLT_MAX - m) = 0 exactly and they add 0 * (stale V) = 0, provided the stale values are finite:
+// the engine zeroes the pool once at start, and afterwards every row was written by a real token (finite K/V; a
+// non-finite K/V would already be a wrong result). Zeroing those V rows with a select in the loop instead cost 1.9x in
+// decode and 2.5x in prefill (tests/paged_bench_test.cu, H100, 2026-11-18), so it is not done. Reading the block
+// table itself costs nothing measurable, even with shuffled blocks.
 #pragma once
 #include <cfloat>
 #include <cmath>
@@ -16,24 +28,30 @@
 
 namespace ct = cuda::tiles;
 
-constexpr int FA_D = 128;   // Qwen3 head_dim
+constexpr int FA_D = 128;       // Qwen3 head_dim
+constexpr int KV_BLOCK = 128;   // tokens per KV-cache block (PagedAttention block size)
 // BR = query rows per block, BC = keys per tile. PV_MODE selects how P (= exp(s - m)) enters the second matmul:
 //   0: fp32 P, fp32 mma                     (most accurate, very slow: no tensor-core fast path)
 //   1: P cast to the activation dtype       (what FlashAttention-2 does; one bf16 rounding of P)
 //   2: P split into two bf16 terms, P_hi + P_lo, two bf16 mmas accumulated into the same fp32 accumulator
 //      (P keeps ~16 significant bits, so the P rounding error of mode 1 disappears; second matmul costs 2x)
 
-template <typename T, int HQ, int HKV, int FA_BR, int FA_BC, int PV_MODE>
+// PAGED = false: K and V are this sequence's own contiguous cache of k_rows == n_kv rows.
+// PAGED = true:  K and V are the whole block pool (k_rows rows) and BT is this sequence's block table.
+template <typename T, int HQ, int HKV, int FA_BR, int FA_BC, int PV_MODE, bool PAGED>
 __tile_global__ void flash_attention_kernel(const T* __restrict__ _Q, const T* __restrict__ _K,
                                             const T* __restrict__ _V, T* __restrict__ _O,
-                                            int n_q, int n_kv, float scale) {
+                                            int n_q, int n_kv, float scale, const int* __restrict__ BT, int k_rows) {
     static_assert(HQ % HKV == 0, "HQ must be a multiple of HKV");
+    static_assert(KV_BLOCK % FA_BC == 0, "a key tile must not cross a KV-cache block");
+    constexpr int TILES_PER_BLOCK = KV_BLOCK / FA_BC;
     using namespace ct::literals;
     using f32_scores = ct::tile<float, ct::shape<FA_BR, FA_BC>>;
     using f32_rows = ct::tile<float, ct::shape<FA_BR, 1>>;
     using f32_out = ct::tile<float, ct::shape<FA_BR, FA_D>>;
     using i32_rows = ct::tile<int, ct::shape<FA_BR, 1>>;
     using i32_keys = ct::tile<int, ct::shape<1, FA_BC>>;
+    using kv_tile = ct::tile<T, ct::shape<FA_BC, FA_D>>;
 
     const T* Q = ct::assume_aligned(_Q, 16_ic);
     const T* K = ct::assume_aligned(_K, 16_ic);
@@ -42,9 +60,9 @@ __tile_global__ void flash_attention_kernel(const T* __restrict__ _Q, const T* _
 
     auto pQ = ct::partition_view{ct::tensor_span{Q, ct::extents{n_q, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FA_BR, 1, FA_D>{}};
-    auto pK = ct::partition_view{ct::tensor_span{K, ct::extents{n_kv, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
+    auto pK = ct::partition_view{ct::tensor_span{K, ct::extents{k_rows, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FA_BC, 1, FA_D>{}};
-    auto pV = ct::partition_view{ct::tensor_span{V, ct::extents{n_kv, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
+    auto pV = ct::partition_view{ct::tensor_span{V, ct::extents{k_rows, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FA_BC, 1, FA_D>{}};
     auto pO = ct::partition_view{ct::tensor_span{O, ct::extents{n_q, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FA_BR, 1, FA_D>{}};
@@ -69,8 +87,10 @@ __tile_global__ void flash_attention_kernel(const T* __restrict__ _Q, const T* _
     int n_tiles = last_q / FA_BC + 1;
 
     for (auto kb : ct::irange(0, n_tiles)) {
-        ct::tile<T, ct::shape<FA_BC, FA_D>> k = ct::reshape<ct::shape<FA_BC, FA_D>>(pK.load_masked(kb, kvh, 0));
-        ct::tile<T, ct::shape<FA_BC, FA_D>> v = ct::reshape<ct::shape<FA_BC, FA_D>>(pV.load_masked(kb, kvh, 0));
+        int tile = kb;                                       // index of this key tile in the K / V views
+        if constexpr (PAGED) tile = BT[kb / TILES_PER_BLOCK] * TILES_PER_BLOCK + kb % TILES_PER_BLOCK;
+        kv_tile k = ct::reshape<ct::shape<FA_BC, FA_D>>(pK.load_masked(tile, kvh, 0));
+        kv_tile v = ct::reshape<ct::shape<FA_BC, FA_D>>(pV.load_masked(tile, kvh, 0));
 
         auto s = ct::mma(q, ct::transpose(k), ct::zeros<f32_scores>()) * scale;
 
@@ -102,13 +122,19 @@ __tile_global__ void flash_attention_kernel(const T* __restrict__ _Q, const T* _
     pO.store_masked(ct::reshape<ct::shape<FA_BR, 1, FA_D>>(ct::element_cast<T>(out)), qb, h, 0);
 }
 
-// Host launchers.
+// Host launchers. Contiguous: k, v hold this sequence's n_kv rows. Paged (block_table != nullptr): k, v are the block
+// pool of pool_rows rows and block_table is this sequence's table (device ints).
 template <typename T, int HQ, int HKV, int BR, int BC, int PV_MODE>
 cudaError_t launch_flash_attention_tiled(const T* q, const T* k, const T* v, T* o, int n_q, int n_kv,
-                                         cudaStream_t stream = 0) {
+                                         cudaStream_t stream = 0, const int* block_table = nullptr, int pool_rows = 0) {
     float scale = 1.0f / std::sqrt(static_cast<float>(FA_D));
     int gq = (n_q + BR - 1) / BR;
-    flash_attention_kernel<T, HQ, HKV, BR, BC, PV_MODE><<<dim3(gq, HQ, 1), 1, 0, stream>>>(q, k, v, o, n_q, n_kv, scale);
+    if (block_table)
+        flash_attention_kernel<T, HQ, HKV, BR, BC, PV_MODE, true><<<dim3(gq, HQ, 1), 1, 0, stream>>>(
+            q, k, v, o, n_q, n_kv, scale, block_table, pool_rows);
+    else
+        flash_attention_kernel<T, HQ, HKV, BR, BC, PV_MODE, false><<<dim3(gq, HQ, 1), 1, 0, stream>>>(
+            q, k, v, o, n_q, n_kv, scale, nullptr, n_kv);
     return cudaGetLastError();
 }
 
@@ -122,11 +148,11 @@ cudaError_t launch_flash_attention_tiled(const T* q, const T* k, const T* v, T* 
 // Devices without Hopper-sized shared memory keep the verified 16x16 / fp32-P configuration.
 template <typename T, int HQ, int HKV>
 cudaError_t launch_flash_attention(const T* q, const T* k, const T* v, T* o, int n_q, int n_kv,
-                                   cudaStream_t stream = 0) {
+                                   cudaStream_t stream = 0, const int* block_table = nullptr, int pool_rows = 0) {
     static const bool force_small = [] { const char* e = std::getenv("QWEN3_ATTN"); return e && std::string(e) == "small"; }();
     if (tile_profile() == TileProfile::BIG && !force_small)   // QWEN3_ATTN=small: A/B switch for the attention only
-        return launch_flash_attention_tiled<T, HQ, HKV, 64, 128, 2>(q, k, v, o, n_q, n_kv, stream);
-    return launch_flash_attention_tiled<T, HQ, HKV, 16, 16, 0>(q, k, v, o, n_q, n_kv, stream);
+        return launch_flash_attention_tiled<T, HQ, HKV, 64, 128, 2>(q, k, v, o, n_q, n_kv, stream, block_table, pool_rows);
+    return launch_flash_attention_tiled<T, HQ, HKV, 16, 16, 0>(q, k, v, o, n_q, n_kv, stream, block_table, pool_rows);
 }
 
 // ---- decode: split the KV length across blocks, then combine (flash-decoding) -----------------------------------------
@@ -142,10 +168,11 @@ constexpr int FD_BR = 16;      // query rows of the tile (1 used)
 constexpr int FD_BC = 128;     // keys per tile
 constexpr int FD_SMAX = 64;    // max number of splits (power of two: the combine loads them as one tile)
 
-// ---- batched decode over KV-cache slots (continuous batching) -----------------------------------------------------
+// ---- batched decode over the paged KV cache (continuous batching) -------------------------------------------------
 //
-// B sequences, one new token each. Sequence b lives in cache slot SLOTS[b] (rows slot*max_len .. of the cache tensors)
-// and its query is at position POS[b], so it attends to keys 0..POS[b]. Grid: (head, split, sequence). Same split-KV
+// B sequences, one new token each. Sequence b uses slot SLOTS[b], whose block table is row SLOTS[b] of BT
+// ([n_slots, max_blocks] ints), and its query is at position POS[b], so it attends to keys 0..POS[b]: key tile t is
+// physical block BT[slot][t] of the pool (FD_BC == KV_BLOCK). Grid: (head, split, sequence). Same split-KV
 // scheme as above. Each sequence splits its OWN key tiles: s_b = min(split_target, n_tiles_b) splits of
 // tps_b = ceil(n_tiles_b / s_b) tiles, so how a sequence is summed depends only on its length and split_target, not on
 // which other sequences share the batch (with a fixed split_target, batched and alone decoding are bit-identical).
@@ -159,36 +186,39 @@ struct BatchDecodeWorkspace {   // fp32 partial results for up to `max_parts` (s
     int max_parts = 0;
 };
 
-template <typename T, int HQ, int HKV, int PV_MODE>
+// KMODE: 1 = paged (the engine's path); 0 = no table, key tile kb of slot s is block s * max_blocks + kb (slots laid
+// out contiguously, as before paging): kept only as the timing reference of tests/paged_bench_test.cu.
+template <typename T, int HQ, int HKV, int PV_MODE, int KMODE = 1>
 __tile_global__ void flash_decode_batch_partial_kernel(const T* __restrict__ _Q, const T* __restrict__ _K,
                                                        const T* __restrict__ _V, float* __restrict__ _WO,
                                                        float* __restrict__ _WM, float* __restrict__ _WL,
                                                        const int* __restrict__ SLOTS, const int* __restrict__ POS,
-                                                       int n_seqs, int max_len, int split_target, int n_splits,
-                                                       float scale) {
+                                                       const int* __restrict__ BT, int n_seqs, int max_blocks,
+                                                       int pool_rows, int split_target, int n_splits, float scale) {
+    static_assert(FD_BC == KV_BLOCK, "one decode key tile = one KV-cache block");
     using namespace ct::literals;
     using f32_scores = ct::tile<float, ct::shape<FD_BR, FD_BC>>;
     using f32_rows = ct::tile<float, ct::shape<FD_BR, 1>>;
     using f32_out = ct::tile<float, ct::shape<FD_BR, FA_D>>;
     using i32_rows = ct::tile<int, ct::shape<FD_BR, 1>>;
     using i32_keys = ct::tile<int, ct::shape<1, FD_BC>>;
+    using kv_tile = ct::tile<T, ct::shape<FD_BC, FA_D>>;
 
     auto [h_u, s_u, b_u] = ct::bid();
     int h = static_cast<int>(h_u), split = static_cast<int>(s_u), b = static_cast<int>(b_u);
     int kvh = h / (HQ / HKV);
-    int slot = SLOTS[b];
+    const int* table = BT + static_cast<long long>(SLOTS[b]) * max_blocks;   // this sequence's block table
     int n_kv = POS[b] + 1;
-    long long base = static_cast<long long>(slot) * max_len * HKV * FA_D;   // first element of this slot
 
     const T* Q = ct::assume_aligned(_Q, 16_ic);
-    const T* K = ct::assume_aligned(_K + base, 16_ic);
-    const T* V = ct::assume_aligned(_V + base, 16_ic);
+    const T* K = ct::assume_aligned(_K, 16_ic);
+    const T* V = ct::assume_aligned(_V, 16_ic);
 
     auto pQ = ct::partition_view{ct::tensor_span{Q, ct::extents{n_seqs, ct::integral_constant<HQ>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<1, 1, FA_D>{}};
-    auto pK = ct::partition_view{ct::tensor_span{K, ct::extents{n_kv, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
+    auto pK = ct::partition_view{ct::tensor_span{K, ct::extents{pool_rows, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FD_BC, 1, FA_D>{}};
-    auto pV = ct::partition_view{ct::tensor_span{V, ct::extents{n_kv, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
+    auto pV = ct::partition_view{ct::tensor_span{V, ct::extents{pool_rows, ct::integral_constant<HKV>{}, ct::integral_constant<FA_D>{}}},
                                  ct::shape<FD_BC, 1, FA_D>{}};
     auto pWO = ct::partition_view{ct::tensor_span{_WO, ct::extents{n_seqs, ct::integral_constant<HQ>{}, n_splits, ct::integral_constant<FD_BR>{}, ct::integral_constant<FA_D>{}}},
                                   ct::shape<1, 1, 1, FD_BR, FA_D>{}};
@@ -211,8 +241,11 @@ __tile_global__ void flash_decode_batch_partial_kernel(const T* __restrict__ _Q,
     int t0 = split * tps;
     int t1 = t0 + tps < n_tiles ? t0 + tps : n_tiles;   // t1 <= t0: empty split
     for (auto kb : ct::irange(t0, t1)) {
-        ct::tile<T, ct::shape<FD_BC, FA_D>> k = ct::reshape<ct::shape<FD_BC, FA_D>>(pK.load_masked(kb, kvh, 0));
-        ct::tile<T, ct::shape<FD_BC, FA_D>> v = ct::reshape<ct::shape<FD_BC, FA_D>>(pV.load_masked(kb, kvh, 0));
+        int blk;                                             // physical block of key tile kb
+        if constexpr (KMODE == 0) blk = SLOTS[b] * max_blocks + kb;
+        else blk = table[kb];
+        kv_tile k = ct::reshape<ct::shape<FD_BC, FA_D>>(pK.load_masked(blk, kvh, 0));
+        kv_tile v = ct::reshape<ct::shape<FD_BC, FA_D>>(pV.load_masked(blk, kvh, 0));
         auto sc = ct::mma(q, ct::transpose(k), ct::zeros<f32_scores>()) * scale;
         i32_keys kidx = kb * FD_BC + ct::iota<i32_keys>();
         sc = ct::select(kidx <= qpos, sc, ct::full<f32_scores>(-FLT_MAX));
@@ -272,12 +305,13 @@ __tile_global__ void flash_decode_batch_combine_kernel(const float* __restrict__
     pO.store(ct::reshape<ct::shape<1, 1, FA_D>>(ct::element_cast<T>(o)), b, h, 0);
 }
 
-// q: [B, HQ, 128]; k_cache / v_cache: [max_seqs * max_len, HKV, 128]; o: [B, HQ, 128]. d_slots / d_pos: device ints.
-// max_kv: the longest attended length in the batch (host value; it only sets the grid's split dimension).
-template <typename T, int HQ, int HKV>
+// q: [B, HQ, 128]; k_cache / v_cache: the block pool [pool_rows, HKV, 128]; o: [B, HQ, 128]. d_slots / d_pos: device
+// ints; d_bt: device block tables [n_slots, max_blocks]. max_kv: the longest attended length in the batch (host value;
+// it only sets the grid's split dimension).
+template <typename T, int HQ, int HKV, int KMODE = 1>
 cudaError_t launch_flash_decode_batch(const T* q, const T* k_cache, const T* v_cache, T* o, int B, const int* d_slots,
-                                      const int* d_pos, int max_len, int max_kv, const BatchDecodeWorkspace& ws,
-                                      cudaStream_t stream = 0) {
+                                      const int* d_pos, const int* d_bt, int max_blocks, int pool_rows, int max_kv,
+                                      const BatchDecodeWorkspace& ws, cudaStream_t stream = 0) {
     float scale = 1.0f / std::sqrt(static_cast<float>(FA_D));
     int n_tiles = (max_kv + FD_BC - 1) / FD_BC;
     int want = (512 + HQ * B - 1) / (HQ * B);                       // ~512 blocks in total
@@ -292,8 +326,8 @@ cudaError_t launch_flash_decode_batch(const T* q, const T* k_cache, const T* v_c
         std::fprintf(stderr, "decode workspace too small: %d sequences x %d splits > %d\n", B, n_splits, ws.max_parts);
         return cudaErrorInvalidValue;
     }
-    flash_decode_batch_partial_kernel<T, HQ, HKV, 2><<<dim3(HQ, n_splits, B), 1, 0, stream>>>(
-        q, k_cache, v_cache, ws.o, ws.m, ws.l, d_slots, d_pos, B, max_len, target, n_splits, scale);
+    flash_decode_batch_partial_kernel<T, HQ, HKV, 2, KMODE><<<dim3(HQ, n_splits, B), 1, 0, stream>>>(
+        q, k_cache, v_cache, ws.o, ws.m, ws.l, d_slots, d_pos, d_bt, B, max_blocks, pool_rows, target, n_splits, scale);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
     flash_decode_batch_combine_kernel<T, HQ><<<dim3(HQ, B, 1), 1, 0, stream>>>(ws.o, ws.m, ws.l, o, B, n_splits);

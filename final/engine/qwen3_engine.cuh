@@ -60,35 +60,37 @@ static cudaError_t rope_dispatch(bf16* q, bf16* k, const bf16* c, const bf16* s,
     return cudaErrorInvalidValue;
 }
 
-// Prefill / chunk of ONE sequence: q [n_q, HQ, 128] against that sequence's cache k, v (already offset to its slot).
-static cudaError_t attention_prefill(const bf16* q, const bf16* k, const bf16* v, bf16* o, int n_q, int n_kv, int hq, int hkv) {
-    if (hq == 16 && hkv == 8) return launch_flash_attention<bf16, 16, 8>(q, k, v, o, n_q, n_kv);
-    if (hq == 32 && hkv == 8) return launch_flash_attention<bf16, 32, 8>(q, k, v, o, n_q, n_kv);
-    if (hq == 32 && hkv == 4) return launch_flash_attention<bf16, 32, 4>(q, k, v, o, n_q, n_kv);
+// Prefill / chunk of ONE sequence: q [n_q, HQ, 128] against the block pool kc, vc (pool_rows rows) through that
+// sequence's block table d_bt (device).
+static cudaError_t attention_prefill(const bf16* q, const bf16* kc, const bf16* vc, bf16* o, int n_q, int n_kv,
+                                     const int* d_bt, int pool_rows, int hq, int hkv) {
+    if (hq == 16 && hkv == 8) return launch_flash_attention<bf16, 16, 8>(q, kc, vc, o, n_q, n_kv, 0, d_bt, pool_rows);
+    if (hq == 32 && hkv == 8) return launch_flash_attention<bf16, 32, 8>(q, kc, vc, o, n_q, n_kv, 0, d_bt, pool_rows);
+    if (hq == 32 && hkv == 4) return launch_flash_attention<bf16, 32, 4>(q, kc, vc, o, n_q, n_kv, 0, d_bt, pool_rows);
     std::fprintf(stderr, "attention: unsupported heads %d/%d\n", hq, hkv);
     return cudaErrorInvalidValue;
 }
 
-// One decode step of B sequences (split-KV kernel over cache slots). QWEN3_ATTN=small or a device without big tiles:
-// one launch per sequence with the verified 16x16 / fp32-P kernel instead.
+// One decode step of B sequences (split-KV kernel over the block pool; d_bt = all block tables [slots, max_blocks]).
+// QWEN3_ATTN=small or a device without big tiles: one launch per sequence with the verified 16x16 / fp32-P kernel.
 static cudaError_t attention_decode(const bf16* q, const bf16* kc, const bf16* vc, bf16* o, int B, const int* d_slots,
-                                    const int* d_pos, const int* h_slots, const int* h_pos, int max_len, int hq, int hkv,
-                                    const BatchDecodeWorkspace& ws) {
+                                    const int* d_pos, const int* h_slots, const int* h_pos, const int* d_bt, int max_blocks,
+                                    int pool_rows, int hq, int hkv, const BatchDecodeWorkspace& ws) {
     static const bool force_small = [] { const char* e = std::getenv("QWEN3_ATTN"); return e && std::string(e) == "small"; }();
     if (tile_profile() != TileProfile::BIG || force_small) {
-        const size_t QD = (size_t)hq * FA_D, KD = (size_t)hkv * FA_D;
+        const size_t QD = (size_t)hq * FA_D;
         for (int b = 0; b < B; ++b) {
-            size_t base = (size_t)h_slots[b] * max_len * KD;
-            cudaError_t e = attention_prefill(q + b * QD, kc + base, vc + base, o + b * QD, 1, h_pos[b] + 1, hq, hkv);
+            cudaError_t e = attention_prefill(q + b * QD, kc, vc, o + b * QD, 1, h_pos[b] + 1,
+                                              d_bt + (size_t)h_slots[b] * max_blocks, pool_rows, hq, hkv);
             if (e != cudaSuccess) return e;
         }
         return cudaSuccess;
     }
     int max_kv = 0;
     for (int b = 0; b < B; ++b) max_kv = std::max(max_kv, h_pos[b] + 1);
-    if (hq == 16 && hkv == 8) return launch_flash_decode_batch<bf16, 16, 8>(q, kc, vc, o, B, d_slots, d_pos, max_len, max_kv, ws);
-    if (hq == 32 && hkv == 8) return launch_flash_decode_batch<bf16, 32, 8>(q, kc, vc, o, B, d_slots, d_pos, max_len, max_kv, ws);
-    if (hq == 32 && hkv == 4) return launch_flash_decode_batch<bf16, 32, 4>(q, kc, vc, o, B, d_slots, d_pos, max_len, max_kv, ws);
+    if (hq == 16 && hkv == 8) return launch_flash_decode_batch<bf16, 16, 8>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws);
+    if (hq == 32 && hkv == 8) return launch_flash_decode_batch<bf16, 32, 8>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws);
+    if (hq == 32 && hkv == 4) return launch_flash_decode_batch<bf16, 32, 4>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws);
     std::fprintf(stderr, "attention: unsupported heads %d/%d\n", hq, hkv);
     return cudaErrorInvalidValue;
 }
@@ -109,14 +111,22 @@ class Qwen3Engine {
 public:
     Qwen3Config cfg;
     int max_len, max_chunk, max_logit_rows, max_seqs;
-    bool profile = false;   // when true, forward() times every stage with CUDA events (see prof_report)
+    int max_blocks;          // block-table width: blocks of one sequence of max_len tokens
+    int n_blocks;            // KV-cache blocks in the pool (KV_BLOCK tokens each), shared by all sequences
+    bool profile = false;    // when true, forward() times every stage with CUDA events (see prof_report)
 
     // yarn_factor > 0 turns YaRN on (original context 32768) even if the checkpoint's config has no rope_scaling, as
     // needed for Qwen3-4B at 128K (factor 4). If it is <= 0 the environment variable QWEN3_YARN is used the same way.
-    // max_seqs: number of KV-cache slots, i.e. sequences that can be decoded together (continuous batching).
+    // max_seqs: number of slots, i.e. sequences that can be decoded together (continuous batching). A slot is only a
+    // row of the block table; the KV memory is the pool of kv_tokens tokens (rounded up to whole blocks) shared by all
+    // slots (PagedAttention). kv_tokens <= 0: max_seqs * max_len, i.e. enough for every slot at full length.
     Qwen3Engine(const std::string& dir, int max_len_, int max_chunk_, int max_logit_rows_ = 1, double yarn_factor = 0,
-                int max_seqs_ = 1)
+                int max_seqs_ = 1, long long kv_tokens = 0)
         : max_len(max_len_), max_chunk(max_chunk_), max_logit_rows(std::max(max_logit_rows_, max_seqs_)), max_seqs(max_seqs_) {
+        max_blocks = (max_len + KV_BLOCK - 1) / KV_BLOCK;
+        long long want = kv_tokens > 0 ? (kv_tokens + KV_BLOCK - 1) / KV_BLOCK : (long long)max_seqs * max_blocks;
+        if (want * KV_BLOCK > 0x7fffffffLL) { std::fprintf(stderr, "KV pool too large for 32-bit row indices\n"); std::exit(2); }
+        n_blocks = (int)want;
         cfg = load_config(dir);
         if (cfg.head_dim != FA_D) { std::fprintf(stderr, "head_dim must be 128\n"); std::exit(2); }
         if (cfg.unsupported_rope_scaling) { std::fprintf(stderr, "this rope_scaling type is not supported (only default and YaRN)\n"); std::exit(2); }
@@ -137,12 +147,24 @@ public:
                                W(p + "mlp.gate_proj.weight"), W(p + "mlp.up_proj.weight"), W(p + "mlp.down_proj.weight")});
         }
 
-        // 2) KV cache: per layer [max_seqs * max_len, hkv, 128] for K and for V (slot s owns rows s*max_len ..)
-        size_t kv_elems = (size_t)max_seqs * max_len * cfg.hkv * FA_D;
+        // 2) KV cache: per layer a block pool [n_blocks * KV_BLOCK, hkv, 128] for K and for V; block tables
+        //    [max_seqs, max_blocks] (host copy = the truth, device copy uploaded when a table changes). Zeroed once, so
+        //    a block that was never written holds finite values.
+        size_t kv_elems = (size_t)n_blocks * KV_BLOCK * cfg.hkv * FA_D;
         for (int l = 0; l < cfg.layers; ++l) {
             kcache_.push_back(alloc<bf16>(kv_elems));
             vcache_.push_back(alloc<bf16>(kv_elems));
+            CK(cudaMemset(kcache_.back(), 0, kv_elems * sizeof(bf16)));
+            CK(cudaMemset(vcache_.back(), 0, kv_elems * sizeof(bf16)));
         }
+        tables_.assign(max_seqs, {});
+        table_dirty_.assign(max_seqs, false);
+        for (int b = n_blocks - 1; b >= 0; --b) free_.push_back(b);   // pop_back hands out 0, 1, 2, ...
+        d_bt_ = alloc<int>((size_t)max_seqs * max_blocks);
+        CK(cudaMemset(d_bt_, 0, (size_t)max_seqs * max_blocks * sizeof(int)));
+        std::printf("KV cache: %d blocks of %d tokens = %lld tokens, %.2f GB (%d layers)\n", n_blocks, KV_BLOCK,
+                    (long long)n_blocks * KV_BLOCK, 2.0 * kv_elems * sizeof(bf16) * cfg.layers / 1e9, cfg.layers);
+        std::fflush(stdout);
 
         // 3) scratch buffers sized for the largest chunk
         size_t N = std::max(max_chunk, max_seqs), H = cfg.hidden, QD = (size_t)cfg.hq * FA_D, KD = (size_t)cfg.hkv * FA_D;
@@ -162,6 +184,32 @@ public:
         // 4) RoPE tables [max_len, 64] (cos, sin), built like HF: fp32 inverse frequencies, rounded to bf16
         build_rope_tables();
     }
+
+    // ---- block manager (PagedAttention) ---------------------------------------------------------------------------
+    // reserve(slot, n): make the slot's table cover positions 0..n-1, taking blocks from the free list on demand.
+    // All or nothing: false (nothing taken) if the pool or the table width is too small. release(slot): return all of
+    // the slot's blocks. The server decides who gets blocks (admission, preemption); forward() reserves the positions
+    // it writes and exits if that fails, so callers that share the pool must reserve first.
+    int free_blocks() const { return (int)free_.size(); }
+    int blocks_of(int slot) const { return (int)tables_[slot].size(); }
+    bool reserve(int slot, int n_tokens) {
+        if (slot < 0 || slot >= max_seqs) return false;
+        int need = (n_tokens + KV_BLOCK - 1) / KV_BLOCK;
+        std::vector<int>& t = tables_[slot];
+        if (need <= (int)t.size()) return true;
+        if (need > max_blocks || need - (int)t.size() > (int)free_.size()) return false;
+        while ((int)t.size() < need) { t.push_back(free_.back()); free_.pop_back(); }
+        table_dirty_[slot] = true;
+        return true;
+    }
+    void release(int slot) {
+        if (slot < 0 || slot >= max_seqs) return;
+        std::vector<int>& t = tables_[slot];
+        for (int i = (int)t.size() - 1; i >= 0; --i) free_.push_back(t[i]);
+        t.clear();
+    }
+    // pool row of position pos of the sequence in `slot` (the position must be reserved)
+    int kv_row(int slot, int pos) const { return tables_[slot][pos / KV_BLOCK] * KV_BLOCK + pos % KV_BLOCK; }
 
     // Prefill (or one chunk) of ONE sequence: `n` new tokens at positions start_pos .. start_pos+n-1 of cache slot `slot`
     // (earlier positions must already be in that slot). Returns device logits: [n, vocab] if all_logits (needs
@@ -247,15 +295,23 @@ private:
         const bool decode = h_slots != nullptr;
         const int H = cfg.hidden, HQ = cfg.hq, HKV = cfg.hkv, QD = HQ * FA_D, KD = HKV * FA_D;
         const int start_pos = decode ? 0 : h_pos[0];
+        // blocks for the positions written now (a no-op when the caller reserved them), then the pool row of each token
+        std::vector<int> kv_rows(n);
+        for (int i = 0; i < n; ++i) {
+            int s = decode ? h_slots[i] : slot;
+            if (!reserve(s, h_pos[i] + 1)) {
+                std::fprintf(stderr, "KV cache: no free block for slot %d position %d (%d free)\n", s, h_pos[i], free_blocks());
+                std::exit(2);
+            }
+            kv_rows[i] = kv_row(s, h_pos[i]);
+        }
+        upload_tables();
         CK(cudaMemcpy(d_tokens_, h_tokens, n * sizeof(int), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_pos_, h_pos, n * sizeof(int), cudaMemcpyHostToDevice));
-        if (decode) {
-            std::vector<int> rows(n);
-            for (int i = 0; i < n; ++i) rows[i] = h_slots[i] * max_len + h_pos[i];
-            CK(cudaMemcpy(d_slots_, h_slots, n * sizeof(int), cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(d_rows_, rows.data(), n * sizeof(int), cudaMemcpyHostToDevice));
-        }
-        const size_t slot_base = decode ? 0 : (size_t)slot * max_len * KD;   // first cache element of this sequence
+        CK(cudaMemcpy(d_rows_, kv_rows.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        if (decode) CK(cudaMemcpy(d_slots_, h_slots, n * sizeof(int), cudaMemcpyHostToDevice));
+        const int pool_rows = n_blocks * KV_BLOCK;
+        const int* seq_bt = decode ? nullptr : d_bt_ + (size_t)slot * max_blocks;   // prefill: this sequence's table
         const double nn = n;
         auto lin_bytes = [](double o, double i) { return o * i * 2.0; };                 // weight bytes of one linear layer
         auto lin_flops = [&](double o, double i) { return 2.0 * nn * o * i; };
@@ -275,19 +331,15 @@ private:
                 CKL(rmsnorm_rows(kraw_, L.kn, kn_, n * HKV, FA_D));
             });
             stage("rope", 2.0 * nn * (QD + KD) * 2, 0, [&] { CKL(rope_dispatch(qn_, kn_, d_cos_, d_sin_, d_pos_, n, max_len, HQ, HKV)); });
-            stage("kv_write", 2.0 * nn * KD * 2 * 2, 0, [&] {
-                if (decode) {   // every token goes to its own slot and position
-                    CKL(kv_scatter_dispatch(kn_, v_, kcache_[l], vcache_[l], d_rows_, n, max_seqs * max_len, HKV));
-                } else {        // one sequence, consecutive positions: one contiguous block of its slot
-                    CK(cudaMemcpyAsync(kcache_[l] + slot_base + (size_t)start_pos * KD, kn_, (size_t)n * KD * sizeof(bf16), cudaMemcpyDeviceToDevice));
-                    CK(cudaMemcpyAsync(vcache_[l] + slot_base + (size_t)start_pos * KD, v_, (size_t)n * KD * sizeof(bf16), cudaMemcpyDeviceToDevice));
-                }
+            stage("kv_write", 2.0 * nn * KD * 2 * 2, 0, [&] {   // every token to its pool row (blocks are not contiguous)
+                CKL(kv_scatter_dispatch(kn_, v_, kcache_[l], vcache_[l], d_rows_, n, pool_rows, HKV));
             });
             stage("attention", 2.0 * kv_read * KD * 2, 4.0 * HQ * FA_D * pairs, [&] {
                 if (decode)
-                    CKL(attention_decode(qn_, kcache_[l], vcache_[l], attn_, n, d_slots_, d_pos_, h_slots, h_pos, max_len, HQ, HKV, dec_ws_));
+                    CKL(attention_decode(qn_, kcache_[l], vcache_[l], attn_, n, d_slots_, d_pos_, h_slots, h_pos, d_bt_,
+                                         max_blocks, pool_rows, HQ, HKV, dec_ws_));
                 else
-                    CKL(attention_prefill(qn_, kcache_[l] + slot_base, vcache_[l] + slot_base, attn_, n, start_pos + n, HQ, HKV));
+                    CKL(attention_prefill(qn_, kcache_[l], vcache_[l], attn_, n, start_pos + n, seq_bt, pool_rows, HQ, HKV));
             });
             stage("o_proj", lin_bytes(H, QD), lin_flops(H, QD), [&] { CKL(launch_linear<bf16>(attn_, L.wo, o_, n, QD, H)); });
             stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H)); });
@@ -308,6 +360,14 @@ private:
         CK(cudaDeviceSynchronize());
         if (profile) prof_collect();
         return logits_;
+    }
+
+    void upload_tables() {   // device copy of the block tables that changed since the last forward
+        for (int s = 0; s < max_seqs; ++s) {
+            if (!table_dirty_[s]) continue;
+            CK(cudaMemcpy(d_bt_ + (size_t)s * max_blocks, tables_[s].data(), tables_[s].size() * sizeof(int), cudaMemcpyHostToDevice));
+            table_dirty_[s] = false;
+        }
     }
 
     cudaEvent_t ev(size_t i) {
@@ -338,6 +398,10 @@ private:
     std::map<std::string, DevTensor> weights_;
     std::vector<LayerWeights> layers_;
     std::vector<bf16*> kcache_, vcache_;
+    std::vector<std::vector<int>> tables_;   // block table of every slot (host)
+    std::vector<bool> table_dirty_;
+    std::vector<int> free_;                  // free physical blocks
+    int* d_bt_ = nullptr;                    // block tables on the device [max_seqs, max_blocks]
     const bf16 *embed_ = nullptr, *final_norm_ = nullptr, *lm_head_ = nullptr;
     int *d_tokens_ = nullptr, *d_pos_ = nullptr, *d_slots_ = nullptr, *d_rows_ = nullptr, *d_argmax_ = nullptr;
     bf16 *xa_, *xb_, *h_, *o_, *qraw_, *qn_, *attn_, *kraw_, *kn_, *v_, *mlp_h_, *logits_;

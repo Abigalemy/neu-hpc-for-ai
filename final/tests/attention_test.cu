@@ -9,7 +9,13 @@ static int run(int n_q, int n_kv, char** a) {
     size_t bytes = (size_t)n_q * HQ * FA_D * sizeof(T);
     T* o; CK(cudaMalloc(&o, bytes));
     if (n_q == 1 && tile_profile() == TileProfile::BIG) {
-        // the engine's decode path: batched split-KV kernel, here with one sequence in slot 0 of a cache of n_kv rows
+        // the engine's decode path: batched split-KV kernel over a paged cache, here one sequence in slot 0 whose block
+        // table is the identity (block i = rows i*128 .. of the n_kv-row cache; rows past n_kv are masked loads)
+        int n_blocks = (n_kv + KV_BLOCK - 1) / KV_BLOCK, *d_bt;
+        std::vector<int> bt(n_blocks);
+        for (int i = 0; i < n_blocks; ++i) bt[i] = i;
+        CK(cudaMalloc(&d_bt, n_blocks * sizeof(int)));
+        CK(cudaMemcpy(d_bt, bt.data(), n_blocks * sizeof(int), cudaMemcpyHostToDevice));
         BatchDecodeWorkspace ws;
         ws.max_parts = FD_SMAX + 1;
         CK(cudaMalloc(&ws.o, (size_t)ws.max_parts * HQ * FD_BR * FA_D * sizeof(float)));
@@ -19,7 +25,7 @@ static int run(int n_q, int n_kv, char** a) {
         CK(cudaMalloc(&d_slot, sizeof(int))); CK(cudaMalloc(&d_pos, sizeof(int)));
         CK(cudaMemcpy(d_slot, &h_slot, sizeof(int), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_pos, &h_pos, sizeof(int), cudaMemcpyHostToDevice));
-        CK((launch_flash_decode_batch<T, HQ, HKV>(q, k, v, o, 1, d_slot, d_pos, n_kv, n_kv, ws)));
+        CK((launch_flash_decode_batch<T, HQ, HKV>(q, k, v, o, 1, d_slot, d_pos, d_bt, n_blocks, n_kv, n_kv, ws)));
     } else {
         CK((launch_flash_attention<T, HQ, HKV>(q, k, v, o, n_q, n_kv)));
     }

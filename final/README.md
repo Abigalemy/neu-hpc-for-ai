@@ -6,22 +6,22 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 
 | Part | What | Status |
 |---|---|---|
-| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 2.51x (below); PagedAttention (Week 7) still to add |
+| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 2.51x (below); paged KV cache (Week 7) in, its benchmark still to run |
 | Part 2 | Two-GPU all-to-all mock | next |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | not started |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
 | Part 4 | Within 3x of vLLM; write-up | not started |
 
-Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100): TTFT 23.60 s vs vLLM 10.45 s (2.26x), ITL
-25.65 ms vs 10.43 ms (2.46x).
+Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100, measured 2026-11-18 with the paged KV cache):
+TTFT 23.37 s vs vLLM 10.45 s (2.24x), ITL 24.73 ms vs 10.43 ms (2.37x).
 
 ## What is here
 
 - `kernels/`: CUDA Tile kernels (`__tile_global__`): RMSNorm, RoPE, linear (GEMM), fused gate/up + SiLU, embedding,
-  argmax, residual add, KV-cache scatter, flash attention (causal GQA over the KV cache; prefill, and split-KV batched
-  decode over cache slots).
+  argmax, residual add, KV-cache scatter, flash attention (causal GQA over the paged KV cache: prefill, and split-KV
+  batched decode; both read the cache blocks in place through the block tables).
 - `engine/`: safetensors loader (weights copied to the GPU once), RoPE tables incl. YaRN, the 36-layer forward pass
-  with a per-slot KV cache (`qwen3_engine.cuh`), and a C API (`qwen3_capi.cu` -> `libqwen3engine.so`).
+  with a paged KV cache (block pool, block tables, block allocator; `qwen3_engine.cuh`), and a C API (`qwen3_capi.cu` -> `libqwen3engine.so`).
 - `server/`: OpenAI-compatible HTTP server (FastAPI, SSE streaming) with continuous batching; no PyTorch.
 - `tests/`, `gen_cases.py`, `run_tests.py`, `schema.sql`: unit tests per module against HF reference outputs stored
   in SQLite; `e2e_test.py` (whole model vs HF), `batch_test.cu` (batched vs alone), `server/test_server.py`.
@@ -39,8 +39,14 @@ Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100): TTFT 23.60 s
   (16-row query tile, 128 keys per tile, ~512 blocks in total, fp32 combine). On other GPUs the small tiles that were
   verified on the L4.
 - 128K: YaRN factor 4 over the original 32768 context = 131072 tokens for input plus output.
-- Server: 64 KV-cache slots of 4224 tokens for the workload suite; 128 slots of 2048 tokens for the Week 7 lecture
-  workload (the lecture's vLLM limits); 1 slot of 131072 tokens for 128K. Greedy only.
+- KV cache (PagedAttention, Week 7): per layer a pool of blocks of 128 tokens shared by all sequences; a sequence's
+  block table maps its logical blocks to physical ones, and the attention kernels read the blocks in place (block size
+  = the decode key tile). The server takes blocks on demand (first come, first served; a request starts when its
+  prompt fits) and, when the pool is empty, preempts the newest sequence and recomputes it later (as in vLLM /
+  nano-vllm). `--kv-tokens` sets the pool size, `--max-seqs` the most sequences decoded together.
+- Server limits used: workload suite 64 sequences, context 4224 (measured before paging, pool = 64 x 4224); Week 7
+  lecture workload 128 sequences, context 2048 (the lecture's vLLM limits; measured before paging); 128K: one sequence,
+  pool 131072 tokens (measured after paging). Greedy only.
 - Environment switches (for experiments only; none is set in the runs above): `QWEN3_TILES=small`,
   `QWEN3_ATTN=small`, `QWEN3_YARN=<factor>`, `QWEN3_DECODE_SPLITS=<n>` (fixed decode split count).
 
@@ -57,7 +63,7 @@ EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source:
 | balanced_c64 | 256 / 256, 64 | 270.13 / 387.44 | 1.43x | 6.35 / 15.01 | 2.36x | 8610 / 3873 |
 | prefill_heavy | 2048 / 32, 8 | 204.67 / 209.26 | 1.02x | 6.99 / 14.76 | 2.11x | 601 / 382 |
 | decode_heavy | 64 / 1024, 32 | 95.96 / 141.27 | 1.47x | 5.57 / 11.26 | 2.02x | 5639 / 2804 |
-| 128K (YaRN x4) | 130816 / 128, 1 | 10446.84 / 23604.25 | 2.26x | 10.43 / 25.65 | 2.46x | |
+| 128K (YaRN x4), paged KV | 130816 / 128, 1 | 10446.84 / 23366.57 | 2.24x | 10.43 / 24.73 | 2.37x | |
 | lecture_c100 (Week 7) | 1000 / 500, 100; 1000 requests | 453.13 / 1137.69 | 2.51x | 13.36 / 33.43 | 2.50x | 7015 / 2803 |
 
 Notes: `lecture_c100` is the AIPerf example from the Week 7 lecture ("Performance Evaluation": concurrency 100, 1000
@@ -73,26 +79,35 @@ is 130816 + 128 tokens because the chat template adds tokens and the YaRN contex
 
 - Unit tests per module against HF (SQLite cases, `modal_test_h100.py`): RMSNorm, RoPE, linear, MLP, embedding,
   argmax, attention (36 cases, prefill and decode, heads 32/8, 32/4, 16/8; bf16 bound derived from the arithmetic,
-  |d| <= 2^-8 (max|V| + 2|e|)). All pass on the H100 with the final tiles; attention was rerun after the last kernel
-  change (2026-11-17).
-- Whole model vs HF (`e2e_test.py`): Qwen3-0.6B with an 8192-token prompt and YaRN x4: top-1 60/64 (every mismatch an
+  |d| <= 2^-8 (max|V| + 2|e|)). All pass on the H100 with the final tiles; attention was rerun with the paged kernels
+  (2026-11-18).
+- Paged vs contiguous attention (`tests/paged_attention_test.cu`, H100, 2026-11-18): the same K/V once contiguous and
+  once in a shuffled block pool whose other rows hold large stale values; prefill (64x128 split-P and 16x16 fp32-P,
+  lengths 1-3000 incl. block edges 127/128/129, full and chunked) and batched decode (up to 100 sequences): 28/28
+  outputs bit-identical. Speed (`tests/paged_bench_test.cu`): decode 500 us vs 497 us per layer at 128K, prefill
+  16K 7.94 ms vs 7.65 ms, i.e. the block-table lookup costs nothing measurable.
+- Whole model vs HF (`e2e_test.py`, rerun with the paged KV cache on 2026-11-18, identical numbers): Qwen3-0.6B with an 8192-token prompt and YaRN x4: top-1 60/64 (every mismatch an
   HF near-tie, margin <= 0.062), min cosine prefill 0.999789 / decode 0.999687 (criterion > 0.999), greedy tokens 16/16,
   RoPE tables bit-identical. Qwen3-4B, 43 positions: criterion met (see the development log).
 - Batched decode vs decoding alone (`batch_check.py`, Qwen3-4B, 4 sequences of 27-3000 tokens, 16 steps): with a fixed
-  split count, 64/64 logits rows bit-identical.
-- Server (`server/test_server.py`, 11 tests, fake engine): stream format, exact lengths and usage, EOS handling,
-  rejections, batching equals running alone, more requests than slots, disconnects, engine errors, UTF-8 split over
-  tokens. AIPerf compatibility checked on a CPU against the fake-engine server.
+  split count, 64/64 logits rows bit-identical (rerun with the paged KV cache on 2026-11-18, same result).
+- Server (`server/test_server.py`, 14 tests, fake engine with the engine's block accounting): stream format, exact
+  lengths and usage, EOS handling, rejections, batching equals running alone, more requests than slots, disconnects,
+  engine errors, UTF-8 split over tokens; paging: four short requests run together in a pool of one max_len sequence,
+  preemption + recompute gives exactly the output of running alone with no block leaked, a request larger than the
+  pool is rejected. AIPerf compatibility checked on a CPU against the fake-engine server.
 
 ## Known limitations
 
-- The KV cache is one contiguous slot per sequence, sized for the longest request (no PagedAttention yet), so one
-  server configuration serves either many short sequences or a few long ones. Next: block pool + block table, read by
-  the decode kernel in place.
+- Paged KV cache: implemented and verified (see Correctness), but the benchmark that shows its capacity gain over
+  fixed per-sequence slots has not been run yet; the suite and lecture rows above were measured before paging.
+- Stale rows of a reused block are not zeroed: masked keys get P = 0 exactly, which needs finite stale values (the pool
+  is zeroed at start). Zeroing them in the attention loop cost 1.9x (decode) / 2.5x (prefill) and was removed
+  (`tests/paged_bench_test.cu`).
 - A prefill stalls the decode of the other running sequences (no chunked-prefill interleaving).
 - Greedy only (`temperature` > 0 is rejected); `min_tokens` does not mask EOS like vLLM.
 - Closest to the Part 4 limit (3x): the lecture workload at concurrency 100 (TTFT 2.51x, ITL 2.50x), long-context
-  decode (2.46x) and ITL at concurrency 64 (2.36x); decode attention still dominates the 128K step.
+  decode (2.37x) and ITL at concurrency 64 (2.36x); decode attention still dominates the 128K step.
 - The old 64x128 attention kernel was less accurate for a single query (decode); the default decode path now uses
   the split-KV kernel, which meets the criterion. The root cause in the old kernel was not identified.
 

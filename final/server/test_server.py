@@ -15,8 +15,9 @@ from server import Detokenizer, FakeBackend, FakeTokenizer, create_app  # noqa: 
 TOK = FakeTokenizer()
 
 
-def make(eos_after=None, max_len=4096, max_seqs=4, delay=0.0):
-    be = FakeBackend(max_len=max_len, eos=TOK.eos_token_id, eos_after=eos_after, max_seqs=max_seqs, delay=delay)
+def make(eos_after=None, max_len=4096, max_seqs=4, delay=0.0, block_size=128, num_blocks=None):
+    be = FakeBackend(max_len=max_len, eos=TOK.eos_token_id, eos_after=eos_after, max_seqs=max_seqs, delay=delay,
+                     block_size=block_size, num_blocks=num_blocks)
     return be, create_app(be, TOK, "Qwen/Qwen3-4B", [TOK.eos_token_id])
 
 
@@ -168,6 +169,55 @@ async def test_engine_error_fails_only_that_request():
     assert sorted(app.state.scheduler.free) == [0, 1], app.state.scheduler.free   # no slot leaked
 
 
+async def completion_tokens(c, prompt_ids, n):
+    """Streamed /v1/completions with token ids; returns (text, finish reasons, usage)."""
+    ev, done = await sse(c, "/v1/completions", {"prompt": prompt_ids, "max_tokens": n, "stream": True,
+                                                "ignore_eos": True, "stream_options": {"include_usage": True}})
+    assert done
+    text = "".join(e["choices"][0]["text"] for e in ev if e["choices"])
+    return text, [e["choices"][0]["finish_reason"] for e in ev if e["choices"]], ev[-1]["usage"]
+
+
+async def test_paged_blocks_admit_more_than_contiguous():
+    # a pool of exactly ONE max_len sequence (64 tokens = 16 blocks of 4): reserving max_len per sequence (contiguous
+    # slots) would run one request at a time; with blocks taken on demand all four short requests run together
+    be, app = make(max_len=64, max_seqs=8, delay=0.005, block_size=4, num_blocks=16)
+    async with client_for(app) as c:
+        alone = await completion_tokens(c, [11, 12, 13], 4)
+        res = await asyncio.gather(*[completion_tokens(c, [11, 12, 13], 4) for _ in range(4)])
+    sched = app.state.scheduler
+    assert all(r[0] == alone[0] for r in res), "batched output must equal the output alone"
+    assert max(sched.batch_sizes) == 4, sched.batch_sizes
+    assert sched.preemptions == 0 and be.free_blocks() == 16 and not be.blocks, be.blocks   # nothing leaked
+
+
+async def test_preemption_by_recompute():
+    # 5 requests of 3 + 8 tokens need 3 blocks each (15) but the pool has 6: sequences are preempted when they need a
+    # new block, recomputed later from prompt + generated tokens, and every stream still gets exactly the output alone
+    be, app = make(max_len=64, max_seqs=8, delay=0.002, block_size=4, num_blocks=6)
+    async with client_for(app) as c:
+        alone = await completion_tokens(c, [11, 12, 13], 8)
+        res = await asyncio.gather(*[completion_tokens(c, [11, 12, 13], 8) for _ in range(5)])
+    sched = app.state.scheduler
+    for text, fins, usage in res:
+        assert text == alone[0], (text, alone[0])
+        assert fins[-1] == "length" and all(f is None for f in fins[:-1]), fins
+        assert usage["completion_tokens"] == 8, usage
+    assert sched.preemptions > 0, "the pool is too small for all five: some sequence must have been preempted"
+    recomputes = [c for c in be.calls if c[0] == "prefill" and c[2] > 3]   # prefill of prompt + generated tokens
+    assert len(recomputes) == sched.preemptions, (recomputes, sched.preemptions)
+    assert be.free_blocks() == 6 and not be.blocks and sorted(sched.free) == list(range(8)), (be.blocks, sched.free)
+
+
+async def test_request_larger_than_kv_pool():
+    _, app = make(max_len=64, max_seqs=2, block_size=4, num_blocks=4)   # 16 tokens of KV cache
+    async with client_for(app) as c:
+        r = await c.post("/v1/completions", json={"prompt": [11, 12, 13], "max_tokens": 14})
+        assert r.status_code == 400 and "exceeds the KV cache" in r.json()["detail"], r.text
+        r = await c.post("/v1/completions", json={"prompt": [11, 12, 13], "max_tokens": 13})   # 16 tokens: fits
+        assert r.status_code == 200 and r.json()["usage"]["completion_tokens"] == 13, r.text
+
+
 def test_detokenizer_utf8():
     class ByteTok:   # each id is one byte: a 3-byte character split over 3 tokens must not leak U+FFFD
         def decode(self, ids, skip_special_tokens=True):
@@ -184,7 +234,8 @@ async def main():
     tests = [test_health_models, test_chat_stream_exact_length_and_usage, test_eos_stops_without_ignore_eos,
              test_max_completion_tokens_wins_and_non_stream, test_completions_string_and_ids, test_rejections,
              test_requests_are_batched, test_more_requests_than_slots, test_disconnect_frees_slot,
-             test_engine_error_fails_only_that_request]
+             test_engine_error_fails_only_that_request, test_paged_blocks_admit_more_than_contiguous,
+             test_preemption_by_recompute, test_request_larger_than_kv_pool]
     for t in tests:
         await t()
         print("ok  ", t.__name__)

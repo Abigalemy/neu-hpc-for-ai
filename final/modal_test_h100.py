@@ -17,9 +17,16 @@ IMAGE = "nvidia/cuda:13.5.0-devel-ubuntu24.04"
 TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention"]
 
 
+# self-checking binaries without SQLite cases (exit code 0 = pass): `--tests paged` runs the PagedAttention test
+SELF_CHECKING = ["paged_attention", "paged_bench"]   # paged_bench: timings only (`--tests paged_bench`)
+
+
 def build_cmd(arch):
-    return "cd /root/final && mkdir -p build && " + " && ".join(
-        f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{t}_test.cu -o build/{t}_test" for t in TESTS)
+    # compiled in parallel: one after another, the binaries no longer fit the image-build time limit (seen 2026-11-18);
+    # xargs exits non-zero if any compile fails, which fails the build before a GPU is started
+    names = " ".join(TESTS + SELF_CHECKING)
+    return (f"cd /root/final && mkdir -p build && printf '%s\\n' {names} | xargs -P 8 -I{{}} "
+            f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{{}}_test.cu -o build/{{}}_test")
 
 
 app = modal.App("final-tile-test-h100")
@@ -36,13 +43,20 @@ PRICE_H100 = 3.95
 def run_all(tests: list):
     import subprocess
     subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
-    r = subprocess.run(["python", "run_tests.py", "test_cases.db", "build"] + tests, cwd="/root/final")
-    return r.returncode
+    rc = 0
+    db_tests = [t for t in tests if t in TESTS]
+    if db_tests:
+        rc |= subprocess.run(["python", "run_tests.py", "test_cases.db", "build"] + db_tests, cwd="/root/final").returncode
+    if "paged" in tests:
+        rc |= subprocess.run(["build/paged_attention_test"], cwd="/root/final").returncode
+    if "paged_bench" in tests:
+        rc |= subprocess.run(["build/paged_bench_test"], cwd="/root/final").returncode
+    return rc
 
 
 @app.local_entrypoint()
 def main(tests: str = "all", yes: bool = False):
-    chosen = TESTS if tests == "all" else tests.split(",")
+    chosen = TESTS + ["paged"] if tests == "all" else tests.split(",")
     print(f"PLAN: unit tests {chosen} on 1x H100, hard cap 15 min -> at most ~${15 / 60 * PRICE_H100:.2f} of shared credit")
     if not yes:
         print("Dry run only. Pass --yes to start.")

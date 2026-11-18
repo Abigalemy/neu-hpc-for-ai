@@ -47,6 +47,13 @@ SUITE_MAX_LEN = max(i + o for _, i, o, _, _ in SUITE) + 128
 LECTURE = [("lecture_c100", 1000, 500, 100, 1000)]
 LECTURE_MAX_SEQS, LECTURE_MAX_LEN = 128, 2048
 LECTURE_WARMUP = (16, 8)   # (requests, concurrency)
+# The "paged" configuration of modal_aipref.py: one server with a 32K context limit, the lecture workload and long prompts.
+LONG = ("long_c8", 16000, 256, 8, 16)
+CONFIGS = {   # mode: (workloads, max-model-len, max-num-seqs)
+    "suite": (SUITE, SUITE_MAX_LEN, SUITE_MAX_SEQS),
+    "lecture": (LECTURE, LECTURE_MAX_LEN, LECTURE_MAX_SEQS),
+    "paged": (LECTURE + [LONG], 32768, 128),
+}
 
 YARN_CONTEXT = 32768 * 4         # Qwen3 static YaRN, factor 4: input + output must fit in 131072 tokens
 CHAT_TEMPLATE_MARGIN = 128       # the chat endpoint wraps the prompt in role tokens; keep room for them
@@ -168,14 +175,14 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
 
 
 @app.function(image=vllm_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=25 * 60)   # hard cap
-def run_suite(model: str, max_minutes: int, lecture: bool = False):
+def run_suite(model: str, max_minutes: int, mode: str = "suite"):
     """All SUITE workloads against ONE vLLM server (max 64 sequences, prefix caching off), one after another, with the
     same AIPerf settings as modal_aipref.py; with lecture=True the Week 7 lecture workload with the lecture's limits."""
-    works, max_len, max_seqs = (LECTURE, LECTURE_MAX_LEN, LECTURE_MAX_SEQS) if lecture else (SUITE, SUITE_MAX_LEN, SUITE_MAX_SEQS)
-    tag = "lecture" if lecture else "suite"
+    works, max_len, max_seqs = CONFIGS[mode]
+    tag = mode
     cmd = ["vllm", "serve", model, "--dtype", "bfloat16", "--max-model-len", str(max_len),
            "--max-num-seqs", str(max_seqs), "--no-enable-prefix-caching", "--port", str(PORT)]
-    if lecture:
+    if mode != "suite":
         cmd += ["--gpu-memory-utilization", "0.90"]
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
@@ -191,7 +198,7 @@ def run_suite(model: str, max_minutes: int, lecture: bool = False):
             out = f"/tmp/{tag}_vllm/{name}"
             print(f"=== WORKLOAD {name}: {isl} in / {osl} out, concurrency {conc}, {reqs} requests", flush=True)
             warm = (["--warmup-request-count", str(LECTURE_WARMUP[0]), "--warmup-concurrency", str(LECTURE_WARMUP[1])]
-                    if lecture else ["--warmup-request-count", str(max(2, conc))])
+                    if name.startswith("lecture") else ["--warmup-request-count", str(max(2, conc))])
             aiperf = ["aiperf", "profile", "--model", model, "--url", f"http://localhost:{PORT}",
                       "--endpoint-type", "chat", "--streaming", "--tokenizer", model,
                       "--extra-inputs", '{"ignore_eos": true, "temperature": 0}',
@@ -214,13 +221,17 @@ def run_suite(model: str, max_minutes: int, lecture: bool = False):
 
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False,
-         requests: int = 5, max_minutes: int = 25, suite: bool = False, lecture: bool = False, yes: bool = False):
+         requests: int = 5, max_minutes: int = 25, suite: bool = False, lecture: bool = False, mode: str = "",
+         yes: bool = False):
     if lecture:
-        print(f"PLAN: vLLM {model}, 1 H100, Week 7 lecture workload {LECTURE} (--max-model-len {LECTURE_MAX_LEN} "
-              f"--max-num-seqs {LECTURE_MAX_SEQS}), benchmark cap {min(max_minutes, 15)} min, container hard cap 25 min "
+        mode = "lecture"
+    if mode:
+        works, max_len, max_seqs = CONFIGS[mode]
+        print(f"PLAN: vLLM {model}, 1 H100, mode {mode}: workloads {works} (--max-model-len {max_len} --max-num-seqs "
+              f"{max_seqs}), benchmark cap {min(max_minutes, 15)} min, container hard cap 25 min "
               f"-> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
         if yes:
-            run_suite.remote(model, min(max_minutes, 15), True)
+            run_suite.remote(model, min(max_minutes, 15), mode)
         else:
             print("Dry run only. Pass --yes to start.")
         return

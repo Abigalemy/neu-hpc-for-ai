@@ -33,8 +33,8 @@ image = (
         "cd /root/final && mkdir -p build && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 -shared -Xcompiler -fPIC "
         "engine/qwen3_capi.cu -o build/libqwen3engine.so",
         "cd /root/final && nm -D --defined-only build/libqwen3engine.so "
-        "| grep -E ' qe_(create|prefill|decode_batch|vocab|max_len|max_chunk|max_seqs)$' "
-        "| tee /dev/stderr | test $(wc -l) -eq 7",                 # the C interface (engine/qwen3_capi.cu) is exported
+        "| grep -E ' qe_(create|prefill|decode_batch|vocab|max_len|max_chunk|max_seqs|block_size|num_blocks|free_blocks"
+        "|reserve|release)$' | tee /dev/stderr | test $(wc -l) -eq 12",   # the C interface (engine/qwen3_capi.cu)
         "cd /root/final && python server/test_server.py",          # server logic, fake engine (CPU)
     )
 )
@@ -58,6 +58,21 @@ SUITE_MAX_LEN = max(i + o for _, i, o, _, _ in SUITE) + 128
 LECTURE = [("lecture_c100", 1000, 500, 100, 1000)]
 LECTURE_MAX_SEQS, LECTURE_MAX_LEN = 128, 2048
 LECTURE_WARMUP = (16, 8)   # (requests, concurrency)
+# PagedAttention, with and without (Week 7 assignment: "with and without the KVCache+PagedAttention+ContinuousBatching
+# optimization"): ONE server configuration with a 32K context limit and a fixed KV budget of 262144 tokens (38.7 GB,
+# the memory the 128 x 2048 lecture slots used), serving the lecture workload and long prompts.
+#   paged:  128 sequences share the block pool (blocks taken on demand).
+#   slots8: the same pool, but at most 8 sequences, i.e. what contiguous per-sequence slots of 32768 tokens give with
+#           the same memory (8 x 32768 = 262144): the "without PagedAttention" capacity. Fewer lecture requests there,
+#           because only 8 run at a time.
+PAGED_MAX_LEN, PAGED_KV_TOKENS = 32768, 262144
+LONG = ("long_c8", 16000, 256, 8, 16)   # long prompts at moderate concurrency (8 x 16.3K tokens fit the pool)
+CONFIGS = {   # mode: (workloads, max_len, max_seqs, kv_tokens)
+    "suite": (SUITE, SUITE_MAX_LEN, SUITE_MAX_SEQS, 0),
+    "lecture": (LECTURE, LECTURE_MAX_LEN, LECTURE_MAX_SEQS, 0),
+    "paged": (LECTURE + [LONG], PAGED_MAX_LEN, 128, PAGED_KV_TOKENS),
+    "slots8": ([("lecture_c100", 1000, 500, 100, 200), LONG], PAGED_MAX_LEN, 8, PAGED_KV_TOKENS),
+}
 YARN_CONTEXT = 32768 * 4
 CHAT_TEMPLATE_MARGIN = 128
 
@@ -128,19 +143,19 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
 
 
 @app.function(image=image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=25 * 60)  # hard cap
-def run_suite(model: str, max_minutes: int, lecture: bool = False):
-    """All SUITE workloads against ONE server instance (64 KV-cache slots), one after another; with lecture=True the
-    Week 7 lecture workload instead, with the lecture's server limits (2048 tokens, 128 sequences)."""
+def run_suite(model: str, max_minutes: int, mode: str = "suite"):
+    """The workloads of CONFIGS[mode] against ONE server instance, one after another (suite: 64 sequences; lecture:
+    the Week 7 lecture workload with the lecture's limits, 2048 tokens x 128 sequences; paged / slots8: see CONFIGS)."""
     import urllib.request
 
     from huggingface_hub import snapshot_download
     os.chdir("/root/final")
     snap = snapshot_download(model, local_files_only=True)
-    works, max_len, max_seqs = (LECTURE, LECTURE_MAX_LEN, LECTURE_MAX_SEQS) if lecture else (SUITE, SUITE_MAX_LEN, SUITE_MAX_SEQS)
-    tag = "lecture" if lecture else "suite"
+    works, max_len, max_seqs, kv_tokens = CONFIGS[mode]
+    tag = mode
     cmd = ["python", "server/server.py", "--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
            "--max-len", str(max_len), "--max-chunk", str(max(i for _, i, _, _, _ in works) + CHAT_TEMPLATE_MARGIN),
-           "--max-seqs", str(max_seqs)]
+           "--max-seqs", str(max_seqs), "--kv-tokens", str(kv_tokens)]
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
     stamp = int(time.time())
@@ -165,7 +180,7 @@ def run_suite(model: str, max_minutes: int, lecture: bool = False):
             out = f"/tmp/{tag}_ours/{name}"
             print(f"=== WORKLOAD {name}: {isl} in / {osl} out, concurrency {conc}, {reqs} requests", flush=True)
             rc = subprocess.run(["timeout", str(left)] + aiperf_cmd(model, f"http://localhost:{PORT}", isl, osl, reqs, out,
-                                                                     conc, LECTURE_WARMUP if lecture else None)).returncode
+                                                                     conc, LECTURE_WARMUP if name.startswith("lecture") else None)).returncode
             print(f"=== {name}: aiperf exit code {rc}", flush=True)
     finally:
         server.terminate()
@@ -208,13 +223,17 @@ def compat_check():
 
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False, requests: int = 5,
-         max_minutes: int = 18, compat: bool = False, suite: bool = False, lecture: bool = False, yes: bool = False):
+         max_minutes: int = 18, compat: bool = False, suite: bool = False, lecture: bool = False, mode: str = "",
+         yes: bool = False):
     if lecture:
-        print(f"PLAN: our server, {model}, 1 H100, Week 7 lecture workload {LECTURE} (max {LECTURE_MAX_SEQS} sequences of "
-              f"{LECTURE_MAX_LEN} tokens), benchmark cap {max_minutes} min, container hard cap 25 min -> at most "
-              f"~${25 / 60 * PRICE_H100:.2f} of shared credit")
+        mode = "lecture"
+    if mode:
+        works, max_len, max_seqs, kv_tokens = CONFIGS[mode]
+        print(f"PLAN: our server, {model}, 1 H100, mode {mode}: workloads {works}, max {max_seqs} sequences, context "
+              f"{max_len}, KV pool {kv_tokens or max_seqs * max_len} tokens; benchmark cap {max_minutes} min, container "
+              f"hard cap 25 min -> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
         if yes:
-            run_suite.remote(model, max_minutes, True)
+            run_suite.remote(model, max_minutes, mode)
         else:
             print("Dry run only. Pass --yes to start.")
         return
