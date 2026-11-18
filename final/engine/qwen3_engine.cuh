@@ -32,6 +32,7 @@
 #include "../kernels/qwen3_kv_scatter_tile.cuh"
 #include "../kernels/qwen3_linear_tile.cuh"
 #include "../kernels/qwen3_mlp_tile.cuh"
+#include "../kernels/qwen3_moe_tile.cuh"
 #include "../kernels/qwen3_rmsnorm_tile.cuh"
 #include "../kernels/qwen3_rope_tile.cuh"
 
@@ -104,7 +105,46 @@ static cudaError_t kv_scatter_dispatch(const bf16* k, const bf16* v, bf16* kc, b
 }
 
 struct LayerWeights {
-    const bf16 *ln1, *ln2, *wq, *wk, *wv, *wo, *qn, *kn, *wg, *wu, *wd;
+    const bf16 *ln1, *ln2, *wq, *wk, *wv, *wo, *qn, *kn, *wg, *wu, *wd;   // wg/wu/wd: dense MLP (nullptr in an MoE layer)
+    const bf16* router = nullptr;                                         // MoE layer: [E, H] router
+    const bf16 *ewg = nullptr, *ewu = nullptr, *ewd = nullptr;            //   packed experts [E, I, H], [E, I, H], [E, H, I]
+};
+
+// Packed MoE expert weights: per layer one buffer each for gate, up [E, I, H] and down [E, H, I], filled while loading
+// (load_weights_to_gpu's place callback copies every expert tensor straight into its slot: one copy on the GPU).
+struct MoePack {
+    int E = 0, I = 0, H = 0;
+    int first_layer = 0;          // buffers hold layers first_layer .. first_layer + g.size() - 1 (a test loads one)
+    std::vector<bf16*> g, u, d;
+    long long placed = 0;
+    void alloc(int layers, int E_, int I_, int H_) {
+        E = E_; I = I_; H = H_;
+        const size_t elems = (size_t)E * I * H;
+        for (int l = 0; l < layers; ++l)
+            for (auto* v : {&g, &u, &d}) {
+                void* ptr;
+                if (cudaMalloc(&ptr, elems * sizeof(bf16)) != cudaSuccess) { std::fprintf(stderr, "out of GPU memory for experts\n"); std::exit(2); }
+                v->push_back((bf16*)ptr);
+            }
+    }
+    // "model.layers.<l>.mlp.experts.<e>.<gate|up|down>_proj.weight" -> its slot; anything else -> DEFAULT
+    Placement place(const std::string& name, const std::vector<int64_t>& shape, size_t bytes, void** dst) {
+        int l = -1, e = -1;
+        char which[8] = {0};
+        if (std::sscanf(name.c_str(), "model.layers.%d.mlp.experts.%d.%7[a-z]_proj.weight", &l, &e, which) != 3) return Placement::DEFAULT;
+        std::string w = which;
+        const bool down = w == "down";
+        l -= first_layer;
+        if (l < 0 || l >= (int)g.size() || e < 0 || e >= E || !(down || w == "gate" || w == "up") || shape.size() != 2 ||
+            shape[0] != (down ? H : I) || shape[1] != (down ? I : H) || bytes != (size_t)I * H * sizeof(bf16)) {
+            std::fprintf(stderr, "unexpected expert tensor %s\n", name.c_str());
+            std::exit(2);
+        }
+        bf16* base = down ? d[l] : w == "gate" ? g[l] : u[l];
+        *dst = base + (size_t)e * I * H;
+        ++placed;
+        return Placement::PLACED;
+    }
 };
 
 class Qwen3Engine {
@@ -133,18 +173,48 @@ public:
         if (yarn_factor <= 0 && std::getenv("QWEN3_YARN")) yarn_factor = std::atof(std::getenv("QWEN3_YARN"));
         if (yarn_factor > 0) { cfg.yarn = true; cfg.yarn_factor = yarn_factor; }
 
-        // 1) weights to the GPU, once
-        weights_ = load_weights_to_gpu(dir);
+        // 1) weights to the GPU, once (MoE experts straight into their packed per-layer buffers)
+        if (cfg.experts > 0) {
+            if (cfg.experts != 128 || cfg.top_k != 8 || cfg.sparse_step != 1 || cfg.has_mlp_only_layers || cfg.moe_inter % 64 ||
+                cfg.hidden % 256) {
+                std::fprintf(stderr, "MoE config not supported (compiled for 128 experts, top-8, every layer MoE)\n");
+                std::exit(2);
+            }
+            moe_.alloc(cfg.layers, cfg.experts, cfg.moe_inter, cfg.hidden);
+            weights_ = load_weights_to_gpu(dir, [&](const std::string& n, const std::vector<int64_t>& sh, size_t b, void** dst) {
+                return moe_.place(n, sh, b, dst);
+            });
+            if (moe_.placed != (long long)cfg.layers * cfg.experts * 3) {
+                std::fprintf(stderr, "found %lld expert tensors, expected %d\n", moe_.placed, cfg.layers * cfg.experts * 3);
+                std::exit(2);
+            }
+        } else {
+            weights_ = load_weights_to_gpu(dir);
+        }
         embed_ = W("model.embed_tokens.weight");
         final_norm_ = W("model.norm.weight");
         lm_head_ = weights_.count("lm_head.weight") ? W("lm_head.weight") : embed_;
         for (int l = 0; l < cfg.layers; ++l) {
             std::string p = "model.layers." + std::to_string(l) + ".";
-            layers_.push_back({W(p + "input_layernorm.weight"), W(p + "post_attention_layernorm.weight"),
-                               W(p + "self_attn.q_proj.weight"), W(p + "self_attn.k_proj.weight"),
-                               W(p + "self_attn.v_proj.weight"), W(p + "self_attn.o_proj.weight"),
-                               W(p + "self_attn.q_norm.weight"), W(p + "self_attn.k_norm.weight"),
-                               W(p + "mlp.gate_proj.weight"), W(p + "mlp.up_proj.weight"), W(p + "mlp.down_proj.weight")});
+            const bool moe = cfg.is_moe_layer(l);
+            LayerWeights L{W(p + "input_layernorm.weight"), W(p + "post_attention_layernorm.weight"),
+                           W(p + "self_attn.q_proj.weight"), W(p + "self_attn.k_proj.weight"),
+                           W(p + "self_attn.v_proj.weight"), W(p + "self_attn.o_proj.weight"),
+                           W(p + "self_attn.q_norm.weight"), W(p + "self_attn.k_norm.weight"),
+                           moe ? nullptr : W(p + "mlp.gate_proj.weight"), moe ? nullptr : W(p + "mlp.up_proj.weight"),
+                           moe ? nullptr : W(p + "mlp.down_proj.weight")};
+            if (moe) {
+                L.router = W(p + "mlp.gate.weight");
+                L.ewg = moe_.g[l]; L.ewu = moe_.u[l]; L.ewd = moe_.d[l];
+            }
+            layers_.push_back(L);
+        }
+        {
+            size_t wb = 0;
+            for (auto& kv : weights_) wb += kv.second.bytes;
+            if (cfg.experts > 0) wb += (size_t)cfg.layers * 3 * cfg.experts * cfg.moe_inter * cfg.hidden * sizeof(bf16);
+            std::printf("weights: %.2f GB on the GPU (%s)\n", wb / 1e9, cfg.experts > 0 ? "MoE, experts packed per layer" : "dense");
+            std::fflush(stdout);
         }
 
         // 2) KV cache: per layer a block pool [n_blocks * KV_BLOCK, hkv, 128] for K and for V; block tables
@@ -173,7 +243,19 @@ public:
         xa_ = alloc<bf16>(N * H); xb_ = alloc<bf16>(N * H); h_ = alloc<bf16>(N * H); o_ = alloc<bf16>(N * H);
         qraw_ = alloc<bf16>(N * QD); qn_ = alloc<bf16>(N * QD); attn_ = alloc<bf16>(N * QD);
         kraw_ = alloc<bf16>(N * KD); kn_ = alloc<bf16>(N * KD); v_ = alloc<bf16>(N * KD);
-        mlp_h_ = alloc<bf16>(N * cfg.inter);
+        if (cfg.experts > 0) {
+            // one MoE workspace shared by all layers, for N tokens: A = N * K assignments
+            const size_t A = N * (size_t)cfg.top_k;
+            moe_ws_.max_tokens = (int)N;
+            moe_ws_.idx = alloc<int>(A); moe_ws_.w = alloc<bf16>(A);
+            moe_ws_.count = alloc<int>(cfg.experts); moe_ws_.off = alloc<int>(cfg.experts);
+            moe_ws_.sorted = alloc<int>(A); moe_ws_.inv = alloc<int>(A);
+            moe_ws_.hbuf = alloc<bf16>(A * cfg.moe_inter); moe_ws_.ysorted = alloc<bf16>(A * H);
+            std::printf("MoE workspace: %zu tokens, %.2f GB\n", N, (A * (cfg.moe_inter + H) * sizeof(bf16) + A * 16) / 1e9);
+            std::fflush(stdout);
+        } else {
+            mlp_h_ = alloc<bf16>(N * cfg.inter);
+        }
         logits_ = alloc<bf16>((size_t)max_logit_rows * cfg.vocab);
         // split-KV decode workspace (fp32 partial softmax states). B sequences x n_splits <= ~512/HQ + B <= FD_SMAX + B.
         dec_ws_.max_parts = FD_SMAX + max_seqs;
@@ -349,10 +431,17 @@ private:
             stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H)); });
             std::swap(x, other);
             stage("rmsnorm", 2.0 * nn * H * 2, 0, [&] { CKL(rmsnorm_rows(x, L.ln2, h_, n, H)); });
-            stage("mlp_gate_up_silu", 2.0 * lin_bytes(cfg.inter, H), 2.0 * lin_flops(cfg.inter, H),
-                  [&] { CKL(launch_mlp_gate_up<bf16>(h_, L.wg, L.wu, mlp_h_, n, H, cfg.inter)); });
-            stage("mlp_down", lin_bytes(H, cfg.inter), lin_flops(H, cfg.inter),
-                  [&] { CKL(launch_mlp_down<bf16>(mlp_h_, L.wd, o_, n, H, cfg.inter)); });
+            if (L.router) {   // MoE layer: K of E experts per token (bytes: the experts that can be touched, flops: K)
+                const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
+                stage("moe", ex_bytes, 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H), [&] {
+                    CKL((launch_moe<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk, moe_ws_)));
+                });
+            } else {
+                stage("mlp_gate_up_silu", 2.0 * lin_bytes(cfg.inter, H), 2.0 * lin_flops(cfg.inter, H),
+                      [&] { CKL(launch_mlp_gate_up<bf16>(h_, L.wg, L.wu, mlp_h_, n, H, cfg.inter)); });
+                stage("mlp_down", lin_bytes(H, cfg.inter), lin_flops(H, cfg.inter),
+                      [&] { CKL(launch_mlp_down<bf16>(mlp_h_, L.wd, o_, n, H, cfg.inter)); });
+            }
             stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H)); });
             std::swap(x, other);
         }
@@ -411,6 +500,8 @@ private:
     bf16 *xa_, *xb_, *h_, *o_, *qraw_, *qn_, *attn_, *kraw_, *kn_, *v_, *mlp_h_, *logits_;
     bf16 *d_cos_ = nullptr, *d_sin_ = nullptr;
     BatchDecodeWorkspace dec_ws_;
+    MoePack moe_;
+    MoeWorkspace<bf16> moe_ws_;
 
     template <typename X>
     X* alloc(size_t n) {

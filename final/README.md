@@ -137,8 +137,21 @@ tokens and 1 block token are bf16 ties (equal logits) where `torch.topk` picks t
 tie token's y was left out of the comparison; the runner now recomputes its terms for the experts the GPU chose and
 compares every token (checked locally with fakes, not yet rerun on a GPU). What this covers: the router at its real shape, the
 block at 16 experts of width 128 and up to 128 tokens (both row-tile sizes, several sort tiles); NOT yet the
-production shape (128 experts of width 768) or long prefills: a single real layer of Qwen3-30B-A3B is the next test.
-Log: `results/part1/moe_unit_h100_2026-11-18.txt`. `tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
+production shape (128 experts of width 768) or long prefills. Log: `results/part1/moe_unit_h100_2026-11-18.txt`.
+
+Production shape, real weights (`part1/modal_moe_layer.py`: `tests/moe_layer_test.cu` loads one layer's router and
+128 experts with the engine's own packer, `tools/moe_layer_check.py` recomputes the layer with numpy from the
+safetensors files; a different expert choice is accepted only when the swapped experts' fp32 logits are within 2 bf16
+ulps). H100, 2026-11-18, layers 0 and 47 x 1 / 33 / 1024 tokens: all 6 pass, every token the same 8 experts, y within
+10-22% of the bound. Time of one MoE layer: 0.135 ms (1 token), 0.52-0.55 ms (33), 2.41 ms (1024 tokens), i.e. about
+6.5 ms of MoE per decode step over 48 layers. (The first run of layer 0 / 1024 stopped at the checker's own
+self-check, whose tolerance was too strict for numpy's summation order; fixed and rerun.) Log:
+`results/part1/moe_layer_real_h100_2026-11-18.txt`.
+
+The engine now runs MoE layers (`engine/qwen3_engine.cuh`): expert tensors are copied from the mmap'ed checkpoint
+straight into packed per-layer buffers [E, I, H] / [E, H, I] (one copy on the GPU; every expert tensor's shape is
+checked and the count must be 48 x 128 x 3), one MoE workspace is shared by all layers, and unsupported MoE configs
+stop with an error. Whole-model check and the server on Qwen3-30B-A3B are next. `tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
 the GPU's own intermediates: all exact or within 0.3% on 4 cases.
 
 Two findings on the way: `gather_scatter_view` takes element offsets (not tile coordinates) in every dimension other

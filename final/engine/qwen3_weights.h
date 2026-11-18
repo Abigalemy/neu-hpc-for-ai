@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,8 +147,15 @@ static Qwen3Config load_config(const std::string& dir) {
     return c;
 }
 
-// Loads every *.safetensors file in `dir` to the GPU (BF16 only). Called once at start-up.
-static std::map<std::string, DevTensor> load_weights_to_gpu(const std::string& dir) {
+// Where a tensor goes while loading: DEFAULT = its own device allocation in the returned map; PLACED = copied to the
+// device address the callback stored in *dst (e.g. its slot in a packed [experts, ...] buffer; the callback checks the
+// size); SKIP = not loaded at all.
+enum class Placement { DEFAULT, PLACED, SKIP };
+using PlaceFn = std::function<Placement(const std::string& name, const std::vector<int64_t>& shape, size_t bytes, void** dst)>;
+
+// Loads every *.safetensors file in `dir` to the GPU (BF16 only), once at start-up, straight from the mmap'ed file
+// (no second copy on the host or on the device).
+static std::map<std::string, DevTensor> load_weights_to_gpu(const std::string& dir, const PlaceFn& place = nullptr) {
     std::vector<std::string> files;
     if (DIR* d = opendir(dir.c_str())) {
         while (dirent* e = readdir(d)) {
@@ -177,6 +185,16 @@ static std::map<std::string, DevTensor> load_weights_to_gpu(const std::string& d
             DevTensor dt;
             for (auto& s : t.get("shape")->arr) dt.shape.push_back((int64_t)s.num);
             dt.bytes = e - b;
+            void* dst = nullptr;
+            Placement where = place ? place(kv.first, dt.shape, dt.bytes, &dst) : Placement::DEFAULT;
+            if (where == Placement::SKIP) continue;
+            if (where == Placement::PLACED) {
+                if (cudaMemcpy(dst, data + b, dt.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    std::fprintf(stderr, "copy of %s to its packed slot failed\n", kv.first.c_str());
+                    std::exit(2);
+                }
+                continue;
+            }
             if (cudaMalloc(&dt.ptr, dt.bytes) != cudaSuccess) { std::fprintf(stderr, "out of GPU memory loading %s\n", kv.first.c_str()); std::exit(2); }
             if (cudaMemcpy(dt.ptr, data + b, dt.bytes, cudaMemcpyHostToDevice) != cudaSuccess) std::exit(2);
             out[kv.first] = dt;
