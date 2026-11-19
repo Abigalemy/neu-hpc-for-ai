@@ -2,14 +2,14 @@
 
 Goal (from the assignment): approach vLLM performance without PyTorch in the serving path.
 
-## Status (2026-11-18)
+## Status (2026-11-19)
 
 | Part | What | Status |
 |---|---|---|
 | Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
 | Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done** (2026-11-18): whole model matches HF under the frozen MoE rule on a held-out prompt; on 1x H200 every suite workload within 5.56x of vLLM (below) |
-| Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
+| Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | **in progress**: expert-parallel MoE layer bit-exact vs one GPU, and the whole model on 2x H100 gives logits and tokens identical to 1 GPU; multi-rank server (launcher, coordinator, load balancer) tested on CPU; AIPerf benchmark on 2x H200 pending |
 | Part 4 | Within 3x of vLLM; write-up | not started |
 
 Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100, measured 2026-11-18 with the paged KV cache):

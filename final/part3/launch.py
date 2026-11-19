@@ -27,15 +27,19 @@ sys.path.insert(0, os.path.join(HERE, "server"))
 from ep_link import Coordinator  # noqa: E402
 
 
-def nccl_unique_id(lib: str) -> str:
-    """ncclGetUniqueId through the engine library, in a child process that sees no GPU (nothing allocated here)."""
+def nccl_unique_id(lib: str):
+    """ncclGetUniqueId through the engine library, in a child process that sees no GPU (nothing allocated here).
+    ncclGetUniqueId also starts NCCL's bootstrap root in the calling process, and every rank's ncclCommInitRank
+    connects to it: the child must stay alive while the ranks start. It prints the id, then waits for its stdin to
+    close, i.e. it lives exactly as long as the launcher. Returns (id hex, the child process)."""
     code = ("import ctypes, sys; lib = ctypes.CDLL(sys.argv[1]); n = lib.qe_nccl_id_bytes(); b = ctypes.create_string_buffer(n); "
-            "assert lib.qe_nccl_unique_id(b) == 1; print(b.raw[:n].hex())")
-    out = subprocess.run([sys.executable, "-c", code, lib], capture_output=True, text=True,
+            "assert lib.qe_nccl_unique_id(b) == 1; print(b.raw[:n].hex(), flush=True); sys.stdin.read()")
+    p = subprocess.Popen([sys.executable, "-c", code, lib], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                          env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
-    if out.returncode:
-        raise RuntimeError(f"could not make an NCCL id: {out.stderr[-2000:]}")
-    return out.stdout.strip()
+    hexid = p.stdout.readline().strip()
+    if not hexid:
+        raise RuntimeError(f"could not make an NCCL id (exit code {p.wait()})")
+    return hexid, p
 
 
 def make_balancer(ports, coord, procs):
@@ -115,8 +119,9 @@ def main():
     key = secrets.token_bytes(16)
     coord = Coordinator(a.world, key)
     env = {**os.environ, "QWEN3_COORD_KEY": key.hex()}
+    id_holder = None                       # keeps NCCL's bootstrap root alive (see nccl_unique_id)
     if not a.fake:
-        env["QWEN3_NCCL_ID"] = nccl_unique_id(a.lib)
+        env["QWEN3_NCCL_ID"], id_holder = nccl_unique_id(a.lib)
     ports = [a.port + 1 + r for r in range(a.world)]
     procs = []
     for r in range(a.world):
@@ -140,6 +145,8 @@ def main():
                 p.wait(timeout=max(0.1, deadline - time.time()))
             except subprocess.TimeoutExpired:
                 p.kill()
+        if id_holder is not None:
+            id_holder.kill()
         os._exit(1)
 
     def watchdog():
@@ -149,6 +156,8 @@ def main():
                     stop_all(f"rank {r} exited with code {p.returncode}")
             if coord.error:
                 stop_all(coord.error)
+            if id_holder is not None and id_holder.poll() is not None:
+                stop_all(f"the NCCL id process exited with code {id_holder.returncode}")
             time.sleep(0.2)
 
     threading.Thread(target=watchdog, daemon=True).start()
