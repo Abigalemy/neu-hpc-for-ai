@@ -75,7 +75,7 @@ image = (
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases.db"], copy=True)
     .run_commands(
         "cd /root/final && mkdir -p build && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 -shared -Xcompiler -fPIC "
-        "engine/qwen3_capi.cu -o build/libqwen3engine.so",
+        "engine/qwen3_capi.cu -o build/libqwen3engine.so -lnccl",
         "cd /root/final && nm -D --defined-only build/libqwen3engine.so "
         "| grep -E ' qe_(create|prefill|decode_batch|vocab|max_len|max_chunk|max_seqs|block_size|num_blocks|free_blocks"
         "|reserve|release)$' | tee /dev/stderr | test $(wc -l) -eq 12",   # the C interface (engine/qwen3_capi.cu)

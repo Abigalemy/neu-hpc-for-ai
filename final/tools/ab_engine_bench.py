@@ -30,8 +30,8 @@ image = (
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases.db", "results"], copy=True)
     .add_local_dir(OLD_DIR, "/root/old", copy=True)
     .run_commands(f"cd /root/final && mkdir -p build && "
-                  f"({NVCC} -I/root/old/final tools/ab_decode_bench.cu -o build/ab_old & "
-                  f"{NVCC} -I/root/final tools/ab_decode_bench.cu -o build/ab_new & wait) && "
+                  f"({NVCC} -I/root/old/final tools/ab_decode_bench.cu -o build/ab_old -lnccl & "
+                  f"{NVCC} -I/root/final tools/ab_decode_bench.cu -o build/ab_new -lnccl & wait) && "
                   f"test -x build/ab_old && test -x build/ab_new")
 )
 PRICE_H100 = 3.95

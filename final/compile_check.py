@@ -24,16 +24,16 @@ def build() -> int:
     import subprocess
     os.chdir("/root/final")
     os.makedirs("build", exist_ok=True)
-    jobs = [f"{NVCC} -shared -Xcompiler -fPIC engine/qwen3_capi.cu -o build/libqwen3engine.so"]
+    jobs = [f"{NVCC} -shared -Xcompiler -fPIC engine/qwen3_capi.cu -o build/libqwen3engine.so -lnccl"]
     for src in sorted(glob.glob("tests/*.cu")):
-        jobs.append(f"{NVCC} {src} -o build/{os.path.basename(src)[:-3]}")
+        jobs.append(f"{NVCC} {src} -o build/{os.path.basename(src)[:-3]} -lnccl")
     procs = [(j, subprocess.Popen(j, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)) for j in jobs]
     failed = 0
     for j, p in procs:
         out = p.communicate()[0]
         ok = p.returncode == 0
         failed += not ok
-        print(("ok    " if ok else "FAIL  ") + j.split()[-1])
+        print(("ok    " if ok else "FAIL  ") + j.split()[j.split().index("-o") + 1])   # the output file
         if not ok:
             print(out[-6000:])
     syms = subprocess.run("nm -D --defined-only build/libqwen3engine.so | grep -o ' qe_[a-z_]*$'", shell=True,

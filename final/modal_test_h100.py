@@ -27,7 +27,7 @@ def build_cmd(arch):
     # xargs exits non-zero if any compile fails, which fails the build before a GPU is started
     names = " ".join(TESTS + MOE + SELF_CHECKING)
     return (f"cd /root/final && mkdir -p build && printf '%s\\n' {names} | xargs -P 8 -I{{}} "
-            f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{{}}_test.cu -o build/{{}}_test")
+            f"nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/{{}}_test.cu -o build/{{}}_test -lnccl")
 
 
 app = modal.App("final-tile-test-h100")

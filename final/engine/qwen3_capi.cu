@@ -28,6 +28,25 @@ void* qe_create(const char* model_dir, int max_len, int max_chunk, double yarn_f
     return new Qwen3Engine(model_dir, max_len, max_chunk, 1, yarn_factor, max_seqs, kv_tokens);
 }
 
+// Expert parallelism (Part 3), one process per GPU: every rank calls qe_create_ep with the same id (from
+// qe_nccl_unique_id in one process, passed to the others) and its rank; rank r holds experts
+// [floor(r*128/world), floor((r+1)*128/world)). A rank without work must keep calling qe_idle_tick while any rank has
+// work (every forward pass is a collective); it returns 0 once no rank has work.
+int qe_nccl_id_bytes() { return (int)sizeof(ncclUniqueId); }
+int qe_nccl_unique_id(unsigned char* out) {
+    ncclUniqueId id;
+    if (ncclGetUniqueId(&id) != ncclSuccess) return 0;
+    std::memcpy(out, &id, sizeof id);
+    return 1;
+}
+void* qe_create_ep(const char* model_dir, int max_len, int max_chunk, double yarn_factor, int max_seqs, long long kv_tokens,
+                   int rank, int world, const unsigned char* nccl_id) {
+    return new Qwen3Engine(model_dir, max_len, max_chunk, 1, yarn_factor, max_seqs, kv_tokens, rank, world, nccl_id);
+}
+int qe_idle_tick(void* e) { return static_cast<Qwen3Engine*>(e)->idle_tick(); }
+int qe_world(void* e) { return static_cast<Qwen3Engine*>(e)->world(); }
+int qe_rank(void* e) { return static_cast<Qwen3Engine*>(e)->rank(); }
+
 int qe_vocab(void* e) { return static_cast<Qwen3Engine*>(e)->cfg.vocab; }
 int qe_max_len(void* e) { return static_cast<Qwen3Engine*>(e)->max_len; }
 int qe_max_chunk(void* e) { return static_cast<Qwen3Engine*>(e)->max_chunk; }

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <map>
 #include <numeric>
@@ -33,6 +34,7 @@
 #include "../kernels/qwen3_linear_tile.cuh"
 #include "../kernels/qwen3_mlp_tile.cuh"
 #include "../kernels/qwen3_moe_tile.cuh"
+#include "qwen3_ep.cuh"
 #include "../kernels/qwen3_rmsnorm_tile.cuh"
 #include "../kernels/qwen3_rope_tile.cuh"
 
@@ -113,13 +115,14 @@ struct LayerWeights {
 // Packed MoE expert weights: per layer one buffer each for gate, up [E, I, H] and down [E, H, I], filled while loading
 // (load_weights_to_gpu's place callback copies every expert tensor straight into its slot: one copy on the GPU).
 struct MoePack {
-    int E = 0, I = 0, H = 0;
+    int E = 0, I = 0, H = 0;      // E = experts held here: e0 .. e0 + E - 1 of E_total (expert parallelism: a range)
+    int e0 = 0, E_total = 0;
     int first_layer = 0;          // buffers hold layers first_layer .. first_layer + g.size() - 1 (a test loads one)
     std::vector<bf16*> g, u, d;
     long long placed = 0;
     std::vector<char> seen;       // (layer, expert, projection) slots written: each exactly once
-    void alloc(int layers, int E_, int I_, int H_) {
-        E = E_; I = I_; H = H_;
+    void alloc(int layers, int E_, int I_, int H_, int e0_ = 0, int E_total_ = -1) {
+        E = E_; I = I_; H = H_; e0 = e0_; E_total = E_total_ < 0 ? E_ : E_total_;
         const size_t elems = (size_t)E * I * H;
         for (int l = 0; l < layers; ++l)
             for (auto* v : {&g, &u, &d}) {
@@ -140,11 +143,13 @@ struct MoePack {
         const std::string exact = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + "." + w + "_proj.weight";
         if (name != exact) return Placement::DEFAULT;   // sscanf matched a prefix only: not an expert tensor
         l -= first_layer;
-        if (l < 0 || l >= (int)g.size() || e < 0 || e >= E || !(down || w == "gate" || w == "up") || shape.size() != 2 ||
+        if (l < 0 || l >= (int)g.size() || e < 0 || e >= E_total || !(down || w == "gate" || w == "up") || shape.size() != 2 ||
             shape[0] != (down ? H : I) || shape[1] != (down ? I : H) || bytes != (size_t)I * H * sizeof(bf16)) {
             std::fprintf(stderr, "unexpected expert tensor %s\n", name.c_str());
             std::exit(2);
         }
+        if (e < e0 || e >= e0 + E) return Placement::SKIP;   // another rank's expert: not loaded here
+        e -= e0;                                              // local slot
         bf16* base = down ? d[l] : w == "gate" ? g[l] : u[l];
         *dst = base + (size_t)e * I * H;
         char& slot = seen[((size_t)l * E + e) * 3 + (w == "gate" ? 0 : w == "up" ? 1 : 2)];
@@ -168,9 +173,22 @@ public:
     // max_seqs: number of slots, i.e. sequences that can be decoded together (continuous batching). A slot is only a
     // row of the block table; the KV memory is the pool of kv_tokens tokens (rounded up to whole blocks) shared by all
     // slots (PagedAttention). kv_tokens <= 0: max_seqs * max_len, i.e. enough for every slot at full length.
+    // rank / world / nccl_id (ncclUniqueId bytes): expert parallelism over `world` processes, one GPU each (Part 3);
+    // world == 1: the single-GPU engine of Part 1, unchanged.
     Qwen3Engine(const std::string& dir, int max_len_, int max_chunk_, int max_logit_rows_ = 1, double yarn_factor = 0,
-                int max_seqs_ = 1, long long kv_tokens = 0)
+                int max_seqs_ = 1, long long kv_tokens = 0, int rank = 0, int world = 1, const void* nccl_id = nullptr)
         : max_len(max_len_), max_chunk(max_chunk_), max_logit_rows(std::max(max_logit_rows_, max_seqs_)), max_seqs(max_seqs_) {
+        ep_.rank = rank; ep_.world = world;
+        if (world < 1 || world > 8 || rank < 0 || rank >= world || (world > 1 && !nccl_id)) {
+            std::fprintf(stderr, "expert parallelism: rank %d of world %d (1..8, needs an NCCL id)\n", rank, world);
+            std::exit(2);
+        }
+        if (world > 1) {
+            ncclUniqueId id;
+            std::memcpy(&id, nccl_id, sizeof id);
+            NCK(ncclCommInitRank(&ep_.comm, world, id, rank));
+            CK(cudaMalloc(&d_tick_, sizeof(int)));
+        }
         max_blocks = (max_len + KV_BLOCK - 1) / KV_BLOCK;
         long long want = kv_tokens > 0 ? (kv_tokens + KV_BLOCK - 1) / KV_BLOCK : (long long)max_seqs * max_blocks;
         if (want * KV_BLOCK > 0x7fffffffLL) { std::fprintf(stderr, "KV pool too large for 32-bit row indices\n"); std::exit(2); }
@@ -181,6 +199,7 @@ public:
         if (yarn_factor <= 0 && std::getenv("QWEN3_YARN")) yarn_factor = std::atof(std::getenv("QWEN3_YARN"));
         if (yarn_factor > 0) { cfg.yarn = true; cfg.yarn_factor = yarn_factor; }
 
+        if (world > 1 && cfg.experts == 0) { std::fprintf(stderr, "expert parallelism needs an MoE model\n"); std::exit(2); }
         // 1) weights to the GPU, once (MoE experts straight into their packed per-layer buffers)
         if (cfg.experts > 0) {
             if (cfg.experts != 128 || cfg.top_k != 8 || cfg.sparse_step != 1 || cfg.has_mlp_only_layers || cfg.moe_inter % 64 ||
@@ -188,13 +207,19 @@ public:
                 std::fprintf(stderr, "MoE config not supported (compiled for 128 experts, top-8, every layer MoE)\n");
                 std::exit(2);
             }
-            moe_.alloc(cfg.layers, cfg.experts, cfg.moe_inter, cfg.hidden);
+            ep_.first = EpGroup::table(cfg.experts, world);
+            moe_.alloc(cfg.layers, ep_.e_local(), cfg.moe_inter, cfg.hidden, ep_.e0(), cfg.experts);
             weights_ = load_weights_to_gpu(dir, [&](const std::string& n, const std::vector<int64_t>& sh, size_t b, void** dst) {
                 return moe_.place(n, sh, b, dst);
             });
-            if (moe_.placed != (long long)cfg.layers * cfg.experts * 3 || !moe_.complete()) {
-                std::fprintf(stderr, "found %lld expert tensors, expected %d\n", moe_.placed, cfg.layers * cfg.experts * 3);
+            if (moe_.placed != (long long)cfg.layers * ep_.e_local() * 3 || !moe_.complete()) {
+                std::fprintf(stderr, "found %lld expert tensors, expected %d\n", moe_.placed, cfg.layers * ep_.e_local() * 3);
                 std::exit(2);
+            }
+            if (world > 1) {
+                std::printf("expert parallelism: rank %d of %d holds experts %d..%d (%d of %d per layer)\n", rank, world,
+                            ep_.e0(), ep_.e0() + ep_.e_local() - 1, ep_.e_local(), cfg.experts);
+                std::fflush(stdout);
             }
         } else {
             weights_ = load_weights_to_gpu(dir);
@@ -224,7 +249,7 @@ public:
         {
             size_t wb = 0;
             for (auto& kv : weights_) wb += kv.second.bytes;
-            if (cfg.experts > 0) wb += (size_t)cfg.layers * 3 * cfg.experts * cfg.moe_inter * cfg.hidden * sizeof(bf16);
+            if (cfg.experts > 0) wb += (size_t)cfg.layers * 3 * moe_.E * cfg.moe_inter * cfg.hidden * sizeof(bf16);
             std::printf("weights: %.2f GB on the GPU (%s)\n", wb / 1e9, cfg.experts > 0 ? "MoE, experts packed per layer" : "dense");
             std::fflush(stdout);
         }
@@ -264,6 +289,12 @@ public:
             moe_ws_.sorted = alloc<int>(A); moe_ws_.inv = alloc<int>(A);
             moe_ws_.hbuf = alloc<bf16>(A * cfg.moe_inter); moe_ws_.ysorted = alloc<bf16>(A * H);
             std::printf("MoE workspace: %zu tokens, %.2f GB\n", N, (A * (cfg.moe_inter + H) * sizeof(bf16) + A * 16) / 1e9);
+            if (world > 1) {
+                size_t eb = 0;
+                alloc_ep_workspace(ep_ws_, (int)N, cfg.top_k, cfg.experts, (int)H, cfg.moe_inter, world, &eb);
+                std::printf("EP workspace: up to %d received rows (%d ranks x %zu tokens x %d), %.2f GB\n", ep_ws_.max_recv,
+                            world, N, cfg.top_k, eb / 1e9);
+            }
             std::fflush(stdout);
         } else {
             mlp_h_ = alloc<bf16>(N * cfg.inter);
@@ -335,6 +366,25 @@ public:
         return run(h_tokens, B, h_pos, h_slots, -1, true);
     }
 
+    // Expert parallelism (Part 3): every rank takes part in every MoE layer of every forward pass. A forward pass with
+    // local tokens starts with tick(1) (in run()); a rank without work calls idle_tick() instead, which runs the pass
+    // with 0 local tokens if any rank has work. Returns the max over the ranks: 0 = nobody had work (the caller may
+    // then park until woken, see server.py), 1 = a pass ran. world == 1: always 0 (nothing to serve).
+    int idle_tick() {
+        if (ep_.world == 1) return 0;
+        if (!tick(0)) return 0;
+        for (int l = 0; l < cfg.layers; ++l) {
+            const LayerWeights& L = layers_[l];
+            if (L.router)
+                moe_ep_layer<bf16, 128, 8>(nullptr, L.router, L.ewg, L.ewu, L.ewd, nullptr, 0, cfg.hidden, cfg.moe_inter,
+                                           cfg.norm_topk, moe_ws_, ep_ws_, ep_, 0, ncclBfloat16);
+        }
+        CK(cudaDeviceSynchronize());
+        return 1;
+    }
+    int world() const { return ep_.world; }
+    int rank() const { return ep_.rank; }
+
     // Greedy tokens of `rows` logits rows (device pointer).
     std::vector<int> argmax_rows(const bf16* logits, int rows) {
         CKL(launch_argmax<bf16>(logits, d_argmax_, rows, cfg.vocab));
@@ -381,6 +431,15 @@ public:
     }
 
 private:
+    // all-reduce(max) of "this rank has work" over the ranks (one int; the host waits for the answer)
+    int tick(int have) {
+        CK(cudaMemcpy(d_tick_, &have, sizeof(int), cudaMemcpyHostToDevice));
+        NCK(ncclAllReduce(d_tick_, d_tick_, 1, ncclInt32, ncclMax, ep_.comm, 0));
+        int any = 0;
+        CK(cudaMemcpy(&any, d_tick_, sizeof(int), cudaMemcpyDeviceToHost));
+        return any;
+    }
+
     struct ProfAcc { double ms = 0, bytes = 0, flops = 0; int calls = 0; };
     struct ProfEntry { cudaEvent_t a, b; const char* name; double bytes, flops; };
     std::map<std::string, ProfAcc> prof_;
@@ -393,6 +452,7 @@ private:
         const bool decode = h_slots != nullptr;
         const int H = cfg.hidden, HQ = cfg.hq, HKV = cfg.hkv, QD = HQ * FA_D, KD = HKV * FA_D;
         const int start_pos = decode ? 0 : h_pos[0];
+        if (ep_.world > 1) tick(1);   // this rank has work: every rank runs this pass (idle ones via idle_tick)
         // blocks for the positions written now (a no-op when the caller reserved them), then the pool row of each token
         std::vector<int> kv_rows(n);
         for (int i = 0; i < n; ++i) {
@@ -446,7 +506,11 @@ private:
             if (L.router) {   // MoE layer: K of E experts per token (bytes: the experts that can be touched, flops: K)
                 const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
                 stage("moe", ex_bytes, 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H), [&] {
-                    CKL((launch_moe<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk, moe_ws_)));
+                    if (ep_.world > 1)
+                        moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
+                                                   moe_ws_, ep_ws_, ep_, 0, ncclBfloat16);
+                    else
+                        CKL((launch_moe<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk, moe_ws_)));
                 });
                 if (moe_dump_) dump_routing(l, n, h_pos);
             } else {
@@ -528,6 +592,9 @@ private:
     BatchDecodeWorkspace dec_ws_;
     MoePack moe_;
     MoeWorkspace<bf16> moe_ws_;
+    EpGroup ep_;                  // expert parallelism (world 1: unused)
+    EpWorkspace<bf16> ep_ws_;
+    int* d_tick_ = nullptr;
 
     template <typename X>
     X* alloc(size_t n) {

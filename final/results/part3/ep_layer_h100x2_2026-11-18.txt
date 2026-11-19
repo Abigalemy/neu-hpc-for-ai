@@ -1,0 +1,26 @@
+PLAN: 2x H100, one real MoE layer with expert parallelism, layers 0,47, hard cap 10 min -> at most ~$1.32 of shared credit
+0, NVIDIA H100 80GB HBM3, GPU-8229c0b9-0f67-c20c-0b8a-a3c5583950a7
+1, NVIDIA H100 80GB HBM3, GPU-36c12fb6-8ba9-e398-2723-13e62f59a6c5
+=== layer 0
+NCCL version 2.32.3+cuda13.4
+[2026-11-19 04:45:14] modal:28:31 [0] misc/ibvwrap.cc:190 (wrap_ibv_alloc_pd) NCCL WARN lib wrapper not initialized.
+[2026-11-19 04:45:14] modal:28:31 [0] transport/rma_socket.cc:32 (ncclRmaSocketProxyInit) NCCL WARN RMA/Socket : rma_socket requires GDRCopy; and GDR Copy is not available
+one_token_each     tokens 1 1 | rows received per rank 7 9 | bit-exact (0 of 4096 values differ, max |diff| 0)
+only_rank0_33      tokens 33 0 | rows received per rank 116 148 | bit-exact (0 of 67584 values differ, max |diff| 0)
+only_last_33       tokens 0 33 | rows received per rank 127 137 | bit-exact (0 of 67584 values differ, max |diff| 0)
+uneven_5_vs_1000   tokens 5 1000 | rows received per rank 3685 4355 | bit-exact (0 of 2058240 values differ, max |diff| 0)
+full_1024_each     tokens 1024 1024 | rows received per rank 7591 8793 | bit-exact (0 of 4194304 values differ, max |diff| 0)
+hot_1024_each      tokens 1024 1024 | rows received per rank 16384 0 | bit-exact (0 of 4194304 values differ, max |diff| 0)
+EP LAYER: all 6 cases bit-exact vs the single-GPU layer on 2 GPUs
+=== layer 47
+NCCL version 2.32.3+cuda13.4
+[2026-11-19 04:45:22] modal:42:46 [1] misc/ibvwrap.cc:190 (wrap_ibv_alloc_pd) NCCL WARN lib wrapper not initialized.
+[2026-11-19 04:45:22] modal:42:46 [1] transport/rma_socket.cc:32 (ncclRmaSocketProxyInit) NCCL WARN RMA/Socket : rma_socket requires GDRCopy; and GDR Copy is not available
+one_token_each     tokens 1 1 | rows received per rank 9 7 | bit-exact (0 of 4096 values differ, max |diff| 0)
+only_rank0_33      tokens 33 0 | rows received per rank 129 135 | bit-exact (0 of 67584 values differ, max |diff| 0)
+only_last_33       tokens 0 33 | rows received per rank 124 140 | bit-exact (0 of 67584 values differ, max |diff| 0)
+uneven_5_vs_1000   tokens 5 1000 | rows received per rank 3929 4111 | bit-exact (0 of 2058240 values differ, max |diff| 0)
+full_1024_each     tokens 1024 1024 | rows received per rank 7879 8505 | bit-exact (0 of 4194304 values differ, max |diff| 0)
+hot_1024_each      tokens 1024 1024 | rows received per rank 16384 0 | bit-exact (0 of 4194304 values differ, max |diff| 0)
+EP LAYER: all 6 cases bit-exact vs the single-GPU layer on 2 GPUs
+ALL EP LAYER CHECKS PASS

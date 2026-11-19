@@ -22,7 +22,7 @@ image = (
     modal.Image.from_registry(IMAGE, add_python="3.12")
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases.db"], copy=True)
     .run_commands("cd /root/final && mkdir -p build && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 tests/batch_test.cu "
-                  "-o build/batch_test")
+                  "-o build/batch_test -lnccl")
 )
 PRICE_H100 = 3.95
 

@@ -28,7 +28,7 @@ image = (
     .pip_install("numpy", "transformers", "torch", extra_index_url="https://download.pytorch.org/whl/cpu")
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases*.db", "results"], copy=True)
     .run_commands("cd /root/final && mkdir -p build && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 tests/engine_test.cu "
-                  "-o build/engine_test && test -x build/engine_test")
+                  "-o build/engine_test -lnccl && test -x build/engine_test")
 )
 PROMPTS = {   # "tiling" is the prompt the MoE rule was written from; "heldout" checks the frozen rule on new data
     "tiling": ("Explain in two sentences why tiling a matrix multiplication in GPU shared memory makes it faster. "

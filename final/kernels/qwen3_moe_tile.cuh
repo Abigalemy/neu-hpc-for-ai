@@ -156,14 +156,16 @@ template <typename T, int K, int BM, int BN, int BK>
 __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, const T* __restrict__ WG,
                                         const T* __restrict__ WU, const int* __restrict__ COUNT,
                                         const int* __restrict__ OFF, const int* __restrict__ SORTED,
-                                        T* __restrict__ HBUF, int _hid, int _inter) {
+                                        T* __restrict__ HBUF, int _hid, int _inter, int e_base) {
     using namespace ct::literals;
     using acc_t = ct::tile<float, ct::shape<BM, BN>>;
     using i32_m = ct::tile<int, ct::shape<BM>>;
     auto hid = ct::assume_divisible(_hid, 16_ic);
     auto inter = ct::assume_divisible(_inter, 16_ic);
     auto [e_u, mb_u, nb_u] = ct::bid();
-    int e = static_cast<int>(e_u), mb = static_cast<int>(mb_u), nb = static_cast<int>(nb_u);
+    // block x = local expert (its weights), e = its global id (COUNT / OFF); e_base = 0 on one GPU
+    int el = static_cast<int>(e_u), mb = static_cast<int>(mb_u), nb = static_cast<int>(nb_u);
+    int e = e_base + el;
     int off = OFF[e], cnt = COUNT[e];
     int k_all = (hid + BK - 1) / BK;
     int k_blocks = cnt - mb * BM > 0 ? k_all : 0;               // a tile past the expert's rows does no work
@@ -172,7 +174,7 @@ __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, 
     auto r = mb * BM + ct::iota<i32_m>();
     auto tok = ct::select(r < cnt, pSort.load_masked(mb) / K, ct::full<i32_m>(n_tokens));   // token of each row
     auto gX = ct::gather_scatter_view{ct::tensor_span{_X, ct::extents{n_tokens, hid}}, ct::shape<BM, BK>{}, ct::integral_constant<0>{}};
-    const size_t wofs = (size_t)e * _inter * _hid;
+    const size_t wofs = (size_t)el * _inter * _hid;
     auto pWG = ct::partition_view{ct::tensor_span{WG + wofs, ct::extents{inter, hid}}, ct::shape<BN, BK>{}};
     auto pWU = ct::partition_view{ct::tensor_span{WU + wofs, ct::extents{inter, hid}}, ct::shape<BN, BK>{}};
 
@@ -194,18 +196,19 @@ __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, 
 
 template <typename T, int BM, int BN, int BK>
 __tile_global__ void moe_down_kernel(const T* __restrict__ HBUF, const T* __restrict__ WD, const int* __restrict__ COUNT,
-                                     const int* __restrict__ OFF, T* __restrict__ YS, int _hid, int _inter) {
+                                     const int* __restrict__ OFF, T* __restrict__ YS, int _hid, int _inter, int e_base) {
     using namespace ct::literals;
     using acc_t = ct::tile<float, ct::shape<BM, BN>>;
     auto hid = ct::assume_divisible(_hid, 16_ic);
     auto inter = ct::assume_divisible(_inter, 16_ic);
     auto [e_u, mb_u, nb_u] = ct::bid();
-    int e = static_cast<int>(e_u), mb = static_cast<int>(mb_u), nb = static_cast<int>(nb_u);
+    int el = static_cast<int>(e_u), mb = static_cast<int>(mb_u), nb = static_cast<int>(nb_u);
+    int e = e_base + el;
     int off = OFF[e], cnt = COUNT[e];
     int k_all = (inter + BK - 1) / BK;
     int k_blocks = cnt - mb * BM > 0 ? k_all : 0;
     auto pH = ct::partition_view{ct::tensor_span{HBUF + (size_t)off * _inter, ct::extents{cnt, inter}}, ct::shape<BM, BK>{}};
-    auto pW = ct::partition_view{ct::tensor_span{WD + (size_t)e * _hid * _inter, ct::extents{hid, inter}}, ct::shape<BN, BK>{}};
+    auto pW = ct::partition_view{ct::tensor_span{WD + (size_t)el * _hid * _inter, ct::extents{hid, inter}}, ct::shape<BN, BK>{}};
     auto acc = ct::zeros<acc_t>();
     for (auto kb : ct::irange(0, k_blocks)) {
         ct::tile<T, ct::shape<BM, BK>> h = pH.load_masked(mb, kb);
@@ -214,6 +217,37 @@ __tile_global__ void moe_down_kernel(const T* __restrict__ HBUF, const T* __rest
     }
     auto pY = ct::partition_view{ct::tensor_span{YS + (size_t)off * _hid, ct::extents{cnt, hid}}, ct::shape<BM, BN>{}};
     pY.store_masked(ct::element_cast<T>(acc), mb, nb);
+}
+
+// ---- expert parallelism (Part 3): the send buffer in sorted order ------------------------------------------------
+// Y[i] = X[SORTED[i] / K]: the rows of the assignments in sorted (= expert = destination worker) order, i < A
+template <typename T, int K, int BR, int BN>
+__tile_global__ void moe_gather_rows_kernel(const T* __restrict__ X, int n_tokens, const int* __restrict__ SORTED,
+                                            int n_assign, T* __restrict__ Y, int _hid) {
+    using i32_r = ct::tile<int, ct::shape<BR>>;
+    auto hid = ct::assume_divisible(_hid, ct::integral_constant<16>{});
+    auto [rb_u, nb_u, dummy] = ct::bid();
+    int rb = static_cast<int>(rb_u), nb = static_cast<int>(nb_u);
+    auto pS = ct::partition_view{ct::tensor_span{SORTED, ct::extents{n_assign}}, ct::shape<BR>{}};
+    auto r = rb * BR + ct::iota<i32_r>();
+    auto tok = ct::select(r < n_assign, pS.load_masked(rb) / K, ct::full<i32_r>(n_tokens));
+    auto gX = ct::gather_scatter_view{ct::tensor_span{X, ct::extents{n_tokens, hid}}, ct::shape<BR, BN>{}, ct::integral_constant<0>{}};
+    auto pY = ct::partition_view{ct::tensor_span{Y, ct::extents{n_assign, hid}}, ct::shape<BR, BN>{}};
+    pY.store_masked(gX.load_masked(tok, nb * BN), rb, nb);       // element offset in the non-gathered dimension
+}
+
+// OUT[i] = IDX[SORTED[i]]: the expert id of every row of the send buffer
+template <int BA>
+__tile_global__ void moe_gather_ids_kernel(const int* __restrict__ IDX, const int* __restrict__ SORTED, int n_assign,
+                                           int* __restrict__ OUT) {
+    using i32_a = ct::tile<int, ct::shape<BA>>;
+    int b = static_cast<int>(ct::bid().x);
+    auto pS = ct::partition_view{ct::tensor_span{SORTED, ct::extents{n_assign}}, ct::shape<BA>{}};
+    auto r = b * BA + ct::iota<i32_a>();
+    auto a = ct::select(r < n_assign, pS.load_masked(b), ct::full<i32_a>(n_assign));
+    auto gI = ct::gather_scatter_view{ct::tensor_span{IDX, ct::extents{n_assign}}, ct::shape<BA>{}, ct::integral_constant<0>{}};
+    auto pO = ct::partition_view{ct::tensor_span{OUT, ct::extents{n_assign}}, ct::shape<BA>{}};
+    pO.store_masked(gI.load_masked(a), b);
 }
 
 // ---- 6. weighted combine -------------------------------------------------------------------------------------------
@@ -251,7 +285,49 @@ cudaError_t launch_moe_router(const T* x, const T* wr, int* idx, T* w, int n, in
     return cudaGetLastError();
 }
 
-// The whole block: y [n, hid] = MoE(x). wg, wu [E, inter, hid], wd [E, hid, inter] packed per layer.
+// Steps 1-3: router, count, stable sort by expert (ws.idx, ws.w, ws.count, ws.off, ws.sorted, ws.inv for n tokens).
+template <typename T, int E, int K>
+cudaError_t moe_route(const T* x, const T* wr, int n, int hid, bool norm_topk, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
+    cudaError_t e = launch_moe_router<T, E, K>(x, wr, ws.idx, ws.w, n, hid, norm_topk, s);
+    if (e != cudaSuccess) return e;
+    moe_count_kernel<E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count);
+    moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count, ws.sorted, ws.inv, ws.off);
+    return cudaGetLastError();
+}
+
+// Steps 4-5 for the experts e_base .. e_base + e_local - 1 (weights wg, wu, wd hold exactly those, packed): the rows of
+// x [n_rows, hid] listed in SORTED (row = SORTED[i] / KDIV), grouped by expert with COUNT / OFF (global expert ids),
+// into ysorted. max_rows: an upper bound of any one expert's rows (the grid covers it); avg_rows picks the row tile.
+template <typename T, int KDIV>
+cudaError_t moe_experts(const T* x, int n_rows, const T* wg, const T* wu, const T* wd, const int* count, const int* off,
+                        const int* sorted, T* hbuf, T* ysorted, int e_base, int e_local, int max_rows, long long avg_rows,
+                        int hid, int inter, cudaStream_t s = 0) {
+    if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
+    if (e_local <= 0 || max_rows <= 0) return cudaSuccess;
+    auto grouped = [&](auto bm) {
+        constexpr int BM = decltype(bm)::value;
+        const int mt = (max_rows + BM - 1) / BM;
+        moe_gate_up_kernel<T, KDIV, BM, 64, 64><<<dim3(e_local, mt, inter / 64), 1, 0, s>>>(x, n_rows, wg, wu, count, off,
+                                                                                          sorted, hbuf, hid, inter, e_base);
+        moe_down_kernel<T, BM, 128, 64><<<dim3(e_local, mt, hid / 128), 1, 0, s>>>(hbuf, wd, count, off, ysorted, hid,
+                                                                                  inter, e_base);
+    };
+    if (avg_rows > 32) grouped(std::integral_constant<int, 64>{});      // small batches: small row tiles
+    else grouped(std::integral_constant<int, 16>{});
+    return cudaGetLastError();
+}
+
+// Step 6: y[t] = sum_j w[t,j] * ysorted[inv[t*K+j]] for n tokens (K = 1, w = 1: a pure permutation, exact).
+template <typename T, int K>
+cudaError_t moe_combine(const T* ysorted, int n_assign, const int* inv, const T* w, T* y, int n, int hid, cudaStream_t s = 0) {
+    constexpr int BR = 16, BN = 256;
+    if (n <= 0) return cudaSuccess;
+    moe_combine_kernel<T, K, BR, BN><<<dim3((n + BR - 1) / BR, (hid + BN - 1) / BN, 1), 1, 0, s>>>(ysorted, n_assign, inv,
+                                                                                            w, y, n, hid);
+    return cudaGetLastError();
+}
+
+// The whole block on one GPU: y [n, hid] = MoE(x). wg, wu [E, inter, hid], wd [E, hid, inter] packed per layer.
 template <typename T, int E, int K>
 cudaError_t launch_moe(const T* x, const T* wr, const T* wg, const T* wu, const T* wd, T* y, int n, int hid, int inter,
                        bool norm_topk, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
@@ -259,25 +335,11 @@ cudaError_t launch_moe(const T* x, const T* wr, const T* wg, const T* wu, const 
     if ((long long)n * K > 0x7fffffffLL) { std::fprintf(stderr, "moe: %d x %d assignments overflow int\n", n, K); return cudaErrorInvalidValue; }
     if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
     const int A = n * K;
-    cudaError_t e = launch_moe_router<T, E, K>(x, wr, ws.idx, ws.w, n, hid, norm_topk, s);
+    cudaError_t e = moe_route<T, E, K>(x, wr, n, hid, norm_topk, ws, s);
     if (e != cudaSuccess) return e;
-    moe_count_kernel<E><<<E, 1, 0, s>>>(ws.idx, A, ws.count);
-    moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ws.idx, A, ws.count, ws.sorted, ws.inv, ws.off);
-    if ((e = cudaGetLastError()) != cudaSuccess) return e;
-    // rows per expert: at most n (a token picks an expert once). Small batches: small row tiles.
-    auto grouped = [&](auto bm) {
-        constexpr int BM = decltype(bm)::value;
-        const int mt = (n + BM - 1) / BM;
-        moe_gate_up_kernel<T, K, BM, 64, 64><<<dim3(E, mt, inter / 64), 1, 0, s>>>(x, n, wg, wu, ws.count, ws.off,
-                                                                                   ws.sorted, ws.hbuf, hid, inter);
-        moe_down_kernel<T, BM, 128, 64><<<dim3(E, mt, hid / 128), 1, 0, s>>>(ws.hbuf, wd, ws.count, ws.off, ws.ysorted,
-                                                                             hid, inter);
-    };
-    if ((long long)A / E > 32) grouped(std::integral_constant<int, 64>{});
-    else grouped(std::integral_constant<int, 16>{});
-    if ((e = cudaGetLastError()) != cudaSuccess) return e;
-    constexpr int BR = 16, BN = 256;
-    moe_combine_kernel<T, K, BR, BN><<<dim3((n + BR - 1) / BR, (hid + BN - 1) / BN, 1), 1, 0, s>>>(ws.ysorted, A, ws.inv,
-                                                                                            ws.w, y, n, hid);
-    return cudaGetLastError();
+    // rows per expert: at most n (a token picks an expert once)
+    e = moe_experts<T, K>(x, n, wg, wu, wd, ws.count, ws.off, ws.sorted, ws.hbuf, ws.ysorted, 0, E, n, (long long)A / E, hid,
+                          inter, s);
+    if (e != cudaSuccess) return e;
+    return moe_combine<T, K>(ws.ysorted, A, ws.inv, ws.w, y, n, hid, s);
 }

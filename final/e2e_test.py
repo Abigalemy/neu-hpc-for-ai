@@ -46,7 +46,7 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     os.chdir("/root/final")
-    r = subprocess.run(f"mkdir -p build && nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/engine_test.cu -o build/engine_test",
+    r = subprocess.run(f"mkdir -p build && nvcc --enable-tile -std=c++20 -arch={arch} -O2 tests/engine_test.cu -o build/engine_test -lnccl",
                        shell=True, capture_output=True, text=True)
     print("compile exit code:", r.returncode, "arch", arch)
     if r.returncode:

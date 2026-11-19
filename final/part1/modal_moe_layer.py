@@ -20,8 +20,8 @@ image = (
     modal.Image.from_registry("nvidia/cuda:13.5.0-devel-ubuntu24.04", add_python="3.12")
     .pip_install("numpy")
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases*.db", "results"], copy=True)
-    .run_commands(f"cd /root/final && mkdir -p build && ({NVCC} tests/moe_layer_test.cu -o build/moe_layer_test & "
-                  f"{NVCC} -shared -Xcompiler -fPIC engine/qwen3_capi.cu -o build/libqwen3engine.so & wait) && "
+    .run_commands(f"cd /root/final && mkdir -p build && ({NVCC} tests/moe_layer_test.cu -o build/moe_layer_test -lnccl & "
+                  f"{NVCC} -shared -Xcompiler -fPIC engine/qwen3_capi.cu -o build/libqwen3engine.so -lnccl & wait) && "
                   f"test -x build/moe_layer_test && test -f build/libqwen3engine.so")
 )
 PRICE_H100 = 3.95

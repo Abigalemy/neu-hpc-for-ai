@@ -29,7 +29,7 @@ image = (
     .pip_install("numpy")
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases.db"], copy=True)
     .run_commands("cd /root/final && mkdir -p build && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 "
-                  "tests/engine_bench_test.cu -o build/engine_bench")
+                  "tests/engine_bench_test.cu -o build/engine_bench -lnccl")
 )
 PRICE_H100 = 3.95
 
