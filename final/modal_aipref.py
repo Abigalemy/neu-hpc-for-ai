@@ -1,7 +1,7 @@
 """AIPerf against OUR HTTP server, with exactly the same AIPerf settings as modal_vllm_aipref.py (the vLLM baseline).
 
   modal run modal_aipref.py                                          # plan only; builds the image on CPU
-  modal run modal_aipref.py --compat                                 # CPU only: AIPerf vs the fake-engine server
+  modal run modal_aipref.py --compat [--model M]                     # CPU only: AIPerf vs the fake-engine server
   modal run modal_aipref.py --yes --suite                            # all SUITE workloads, one server instance
   modal run modal_aipref.py --yes                                    # Qwen3-4B, 1x H100, 3072 in / 1024 out
   modal run modal_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2   # 128K context (YaRN factor 4)
@@ -23,6 +23,45 @@ app = modal.App("final-our-server-aiperf")
 hf_cache = modal.Volume.from_name("qwen3-hf-cache", create_if_missing=False)
 results_vol = modal.Volume.from_name("final-results", create_if_missing=True)   # ours (created 2026-11-16)
 HF_DIR, RES_DIR, PORT = "/hf_cache", "/results_store", 8000
+
+
+# Revisions the results were measured with: a cached refs/main that points elsewhere is an error, not a silent switch.
+PINNED = {"Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+          "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca"}
+
+
+def local_snapshot(model: str) -> str:
+    """Path of the cached snapshot refs/main points at, checked for what the ENGINE reads (newer huggingface_hub
+    rejects snapshot_download(local_files_only=True) when README / LICENSE are absent, which the engine never reads):
+    the revision is the pinned one (if pinned); config and tokenizer exist; the .safetensors files in the directory
+    (the loader loads EVERY one there) are exactly the index's shards; and each file is long enough for the last data
+    range its header declares (catches a broken link or a truncated download from the headers alone)."""
+    import json
+    import struct
+    base = f"{HF_DIR}/hub/models--{model.replace('/', '--')}"
+    rev = open(f"{base}/refs/main").read().strip()
+    if model in PINNED and rev != PINNED[model]:
+        raise RuntimeError(f"{model}: cached refs/main is {rev}, results are pinned to {PINNED[model]}")
+    snap = f"{base}/snapshots/{rev}"
+    missing = [f for f in ("config.json", "tokenizer.json") if not os.path.exists(f"{snap}/{f}")]
+    on_disk = sorted(f for f in os.listdir(snap) if f.endswith(".safetensors"))
+    idx = f"{snap}/model.safetensors.index.json"
+    want = sorted(set(json.load(open(idx))["weight_map"].values())) if os.path.exists(idx) else ["model.safetensors"]
+    missing += [f for f in want if f not in on_disk]
+    if missing or on_disk != want:
+        raise FileNotFoundError(f"snapshot {rev} of {model}: missing {missing}, safetensors on disk {on_disk}, "
+                                f"index wants {want}")
+    for f in want:
+        with open(f"{snap}/{f}", "rb") as fh:
+            (hlen,) = struct.unpack("<Q", fh.read(8))
+            header = json.loads(fh.read(hlen))
+        end = 8 + hlen + max(v["data_offsets"][1] for k, v in header.items() if k != "__metadata__")
+        if os.path.getsize(f"{snap}/{f}") < end:
+            raise IOError(f"{f}: {os.path.getsize(f'{snap}/{f}')} bytes, header needs {end}")
+    print(f"weights: {snap} (revision {rev}, {len(want)} shard(s) checked)", flush=True)
+    return snap
+
+
 IMAGE = "nvidia/cuda:13.5.0-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE, add_python="3.12")
@@ -39,6 +78,7 @@ image = (
     )
 )
 PRICE_H100 = 3.95
+PRICES = {"h100": 3.95, "h200": 4.54}   # $/hour, approximate; check modal.com/pricing
 
 # The workload suite (keep identical in modal_aipref.py and modal_vllm_aipref.py):
 #   (name, input tokens, output tokens, concurrency, requests)
@@ -104,9 +144,8 @@ def lengths(isl: int, osl: int, yarn: bool):
 def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: int):
     import urllib.request
 
-    from huggingface_hub import snapshot_download
     os.chdir("/root/final")
-    snap = snapshot_download(model, local_files_only=True)
+    snap = local_snapshot(model)
     max_len = lengths(isl, osl, yarn)
     max_chunk = min(isl + CHAT_TEMPLATE_MARGIN, max_len)   # the whole prompt in one chunk, as in bench_modal.py
     cmd = ["python", "server/server.py", "--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
@@ -148,11 +187,10 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
     the Week 7 lecture workload with the lecture's limits, 2048 tokens x 128 sequences; paged / slots8: see CONFIGS)."""
     import urllib.request
 
-    from huggingface_hub import snapshot_download
     os.chdir("/root/final")
-    snap = snapshot_download(model, local_files_only=True)
+    snap = local_snapshot(model)
     works, max_len, max_seqs, kv_tokens = CONFIGS[mode]
-    tag = mode
+    tag = mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}"
     cmd = ["python", "server/server.py", "--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
            "--max-len", str(max_len), "--max-chunk", str(max(i for _, i, _, _, _ in works) + CHAT_TEMPLATE_MARGIN),
            "--max-seqs", str(max_seqs), "--kv-tokens", str(kv_tokens)]
@@ -194,13 +232,23 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
 
 
 @app.function(image=image, volumes={HF_DIR: hf_cache}, timeout=15 * 60)   # CPU only
-def compat_check():
-    """AIPerf, with the same settings shape, against server.py --fake on a CPU: checks that AIPerf accepts our responses
-    (streaming format, usage, fields) before any GPU is used. Token counts are meaningless here (fake tokenizer)."""
+def compat_check(model: str = "Qwen/Qwen3-4B"):
+    """AIPerf, with the same settings shape, against server.py --fake on a CPU, in the SAME image and cache as the GPU
+    runs: checks that AIPerf accepts our responses (streaming format, usage, fields) and that both consumers of the
+    cache resolve `model` offline to the same revision: the engine's path (local_snapshot) and AIPerf's (the tokenizer
+    by repo name, through huggingface_hub with HF_HUB_OFFLINE=1). Token counts are meaningless (fake engine)."""
+    import importlib.metadata as md
     import urllib.request
+    from huggingface_hub import snapshot_download
+    print("versions:", {p: md.version(p) for p in ("aiperf", "huggingface_hub", "transformers")}, flush=True)
+    engine_path = local_snapshot(model)
+    aiperf_path = snapshot_download(model, local_files_only=True)     # what AutoTokenizer.from_pretrained(name) uses
+    print(f"AIPerf resolves {model} -> {aiperf_path}", flush=True)
+    if os.path.realpath(aiperf_path) != os.path.realpath(engine_path):
+        raise RuntimeError(f"engine uses {engine_path} but AIPerf resolves {aiperf_path}")
     os.chdir("/root/final")
     server = subprocess.Popen(["python", "server/server.py", "--fake", "--port", str(PORT), "--max-len", "8192",
-                               "--max-seqs", "8"])
+                               "--max-seqs", "8", "--served-model-name", model])
     try:
         for _ in range(60):
             try:
@@ -212,7 +260,7 @@ def compat_check():
         # one sequence, a batch of 8 through the continuous batcher, and the lecture's warm-up flags with more
         # connections (12) than slots (8), so some requests wait for a free slot
         for conc, reqs, warm in ((1, 3, None), (8, 24, None), (12, 36, LECTURE_WARMUP)):
-            r = subprocess.run(aiperf_cmd("Qwen/Qwen3-4B", f"http://localhost:{PORT}", 64, 16, reqs,
+            r = subprocess.run(aiperf_cmd(model, f"http://localhost:{PORT}", 64, 16, reqs,
                                           f"/tmp/aiperf_compat_c{conc}", conc, warm))
             print(f"=== concurrency {conc} warmup {warm}: aiperf exit code {r.returncode}", flush=True)
             rcs.append(r.returncode)
@@ -224,34 +272,34 @@ def compat_check():
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False, requests: int = 5,
          max_minutes: int = 18, compat: bool = False, suite: bool = False, lecture: bool = False, mode: str = "",
-         yes: bool = False):
+         gpu: str = "h100", yes: bool = False):
     if lecture:
         mode = "lecture"
     if mode:
         works, max_len, max_seqs, kv_tokens = CONFIGS[mode]
-        print(f"PLAN: our server, {model}, 1 H100, mode {mode}: workloads {works}, max {max_seqs} sequences, context "
+        print(f"PLAN: our server, {model}, 1 {gpu.upper()}, mode {mode}: workloads {works}, max {max_seqs} sequences, context "
               f"{max_len}, KV pool {kv_tokens or max_seqs * max_len} tokens; benchmark cap {max_minutes} min, container "
-              f"hard cap 25 min -> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
+              f"hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
         if yes:
-            run_suite.remote(model, max_minutes, mode)
+            run_suite.with_options(gpu=gpu.upper()).remote(model, max_minutes, mode)
         else:
             print("Dry run only. Pass --yes to start.")
         return
     if suite:
-        print(f"PLAN: our server, {model}, 1 H100, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
-              f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
+        print(f"PLAN: our server, {model}, 1 {gpu.upper()}, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
+              f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
         if yes:
-            run_suite.remote(model, max_minutes)
+            run_suite.with_options(gpu=gpu.upper()).remote(model, max_minutes)
         else:
             print("Dry run only. Pass --yes to start.")
         return
     if compat:
-        print("CPU-only: AIPerf against the server with the fake engine (a few cents)")
-        raise SystemExit(compat_check.remote())
+        print(f"CPU-only: AIPerf ({model} tokenizer, offline) against the server with the fake engine (a few cents)")
+        raise SystemExit(compat_check.remote(model))
     lengths(isl, osl, yarn)   # fails here, locally, before any GPU is started
-    print(f"PLAN: our server, {model}, 1 H100, single sequence {isl} in / {osl} out, {requests} requests, YaRN={yarn}, "
-          f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
+    print(f"PLAN: our server, {model}, 1 {gpu.upper()}, single sequence {isl} in / {osl} out, {requests} requests, YaRN={yarn}, "
+          f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
     if not yes:
         print("Dry run only. Pass --yes to start.")
         return
-    run.remote(model, isl, osl, yarn, requests, max_minutes)
+    run.with_options(gpu=gpu.upper()).remote(model, isl, osl, yarn, requests, max_minutes)

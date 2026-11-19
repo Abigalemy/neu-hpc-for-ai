@@ -11,3 +11,9 @@ paged/lecture_c100,1000,500,100,862.99,1156.66,1.34,10.21,35.21,3.45,8370,2668,0
 paged/long_c8,16000,256,8,1444.62,3188.59,2.21,12.79,34.49,2.7,433,171,0.0,paged_ours_1795030271/long_c8,paged_vllm_1795029909/long_c8
 slots8/lecture_c100,1000,500,100,862.99,39790.6,46.11,10.21,9.06,0.89,8370,868,0.0,slots8_ours_1795030663/lecture_c100,paged_vllm_1795029909/lecture_c100
 slots8/long_c8,16000,256,8,1444.62,3178.04,2.2,12.79,34.14,2.67,433,172,0.0,slots8_ours_1795030663/long_c8,paged_vllm_1795029909/long_c8
+30B/baseline,128,128,1,67.61,42.34,0.63,4.0,11.02,2.76,222,89,0.0,suite_Qwen3-30B-A3B_ours_1795057331/baseline,suite_Qwen3-30B-A3B_vllm_1795049169/baseline
+30B/long_out,3072,1024,1,80.65,377.01,4.67,4.15,12.28,2.96,236,79,0.0,suite_Qwen3-30B-A3B_ours_1795057331/long_out,suite_Qwen3-30B-A3B_vllm_1795049169/long_out
+30B/balanced_c16,256,256,16,149.95,513.76,3.43,8.46,21.66,2.56,1771,678,0.0,suite_Qwen3-30B-A3B_ours_1795057331/balanced_c16,suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c16
+30B/balanced_c64,256,256,64,467.52,1930.17,4.13,12.74,43.21,3.39,4396,1264,0.0,suite_Qwen3-30B-A3B_ours_1795057331/balanced_c64,suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c64
+30B/prefill_heavy,2048,32,8,245.02,1141.38,4.66,8.24,45.87,5.56,507,100,0.0,suite_Qwen3-30B-A3B_ours_1795057331/prefill_heavy,suite_Qwen3-30B-A3B_vllm_1795049169/prefill_heavy
+30B/decode_heavy,64,1024,32,1064.34,491.96,0.46,10.26,27.73,2.7,2830,1135,0.0,suite_Qwen3-30B-A3B_ours_1795057331/decode_heavy,suite_Qwen3-30B-A3B_vllm_1795049169/decode_heavy

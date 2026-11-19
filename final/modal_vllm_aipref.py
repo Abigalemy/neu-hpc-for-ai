@@ -28,7 +28,8 @@ vllm_image = (
     .env({"HF_HOME": HF_DIR, "VLLM_USE_FLASHINFER_SAMPLER": "0"})
 )
 
-PRICE_H100 = 3.95  # $/hour, approximate; check modal.com/pricing
+PRICE_H100 = 3.95
+PRICES = {"h100": 3.95, "h200": 4.54}   # $/hour, approximate; check modal.com/pricing  # $/hour, approximate; check modal.com/pricing
 
 # The workload suite (keep identical in modal_aipref.py and modal_vllm_aipref.py):
 #   (name, input tokens, output tokens, concurrency, requests)
@@ -179,8 +180,12 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
     """All SUITE workloads against ONE vLLM server (max 64 sequences, prefix caching off), one after another, with the
     same AIPerf settings as modal_aipref.py; with lecture=True the Week 7 lecture workload with the lecture's limits."""
     works, max_len, max_seqs = CONFIGS[mode]
-    tag = mode
-    cmd = ["vllm", "serve", model, "--dtype", "bfloat16", "--max-model-len", str(max_len),
+    tag = mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}"
+    # serve the cached snapshot by path (the same files as our server; nothing fetched), under the model's name
+    from huggingface_hub import snapshot_download
+    serve_path = snapshot_download(model, local_files_only=True)
+    print("weights:", serve_path, flush=True)
+    cmd = ["vllm", "serve", serve_path, "--served-model-name", model, "--dtype", "bfloat16", "--max-model-len", str(max_len),
            "--max-num-seqs", str(max_seqs), "--no-enable-prefix-caching", "--port", str(PORT)]
     if mode != "suite":
         cmd += ["--gpu-memory-utilization", "0.90"]
@@ -222,33 +227,33 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False,
          requests: int = 5, max_minutes: int = 25, suite: bool = False, lecture: bool = False, mode: str = "",
-         yes: bool = False):
+         gpu: str = "h100", yes: bool = False):
     if lecture:
         mode = "lecture"
     if mode:
         works, max_len, max_seqs = CONFIGS[mode]
-        print(f"PLAN: vLLM {model}, 1 H100, mode {mode}: workloads {works} (--max-model-len {max_len} --max-num-seqs "
+        print(f"PLAN: vLLM {model}, 1 {gpu.upper()}, mode {mode}: workloads {works} (--max-model-len {max_len} --max-num-seqs "
               f"{max_seqs}), benchmark cap {min(max_minutes, 15)} min, container hard cap 25 min "
-              f"-> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
+              f"-> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
         if yes:
-            run_suite.remote(model, min(max_minutes, 15), mode)
+            run_suite.with_options(gpu=gpu.upper()).remote(model, min(max_minutes, 15), mode)
         else:
             print("Dry run only. Pass --yes to start.")
         return
     if suite:
-        print(f"PLAN: vLLM {model}, 1 H100, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
-              f"benchmark cap {min(max_minutes, 18)} min, container hard cap 25 min -> at most ~${25 / 60 * PRICE_H100:.2f} of shared credit")
+        print(f"PLAN: vLLM {model}, 1 {gpu.upper()}, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
+              f"benchmark cap {min(max_minutes, 18)} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
         if yes:
-            run_suite.remote(model, min(max_minutes, 18))
+            run_suite.with_options(gpu=gpu.upper()).remote(model, min(max_minutes, 18))
         else:
             print("Dry run only. Pass --yes to start.")
         return
     if yarn:
         check_yarn_lengths(isl, osl)   # fails here, locally, before any GPU is started
-    est = 25 / 60 * PRICE_H100
-    print(f"PLAN: vLLM {model}, 1 H100, single sequence {isl} in / {osl} out, {requests} requests, "
+    est = 25 / 60 * PRICES[gpu]
+    print(f"PLAN: vLLM {model}, 1 {gpu.upper()}, single sequence {isl} in / {osl} out, {requests} requests, "
           f"YaRN={yarn}, benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${est:.2f} of shared credit")
     if not yes:
         print("Dry run only. Pass --yes to start.")
         return
-    run.remote(model, isl, osl, yarn, requests, max_minutes)
+    run.with_options(gpu=gpu.upper()).remote(model, isl, osl, yarn, requests, max_minutes)

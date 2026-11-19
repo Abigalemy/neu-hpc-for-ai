@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
         return n == pre + "gate.weight" ? Placement::DEFAULT : Placement::SKIP;
     });
     double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    if (pack.placed != E * 3 || !w.count(pre + "gate.weight")) { std::fprintf(stderr, "layer %d: %lld expert tensors\n", layer, pack.placed); return 2; }
+    if (pack.placed != E * 3 || !pack.complete() || !w.count(pre + "gate.weight")) { std::fprintf(stderr, "layer %d: %lld expert tensors\n", layer, pack.placed); return 2; }
     std::printf("layer %d: router + %lld expert tensors loaded in %.1f s\n", layer, pack.placed, load_s);
 
     std::mt19937 rng(1000 + T);

@@ -187,7 +187,12 @@ class GenRequest:
         self.cancelled = False       # set by the HTTP side when the client goes away
 
     def emit(self, tok: int, finish: Optional[str]):
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, (tok, finish))
+        """Hand one event to the request's event loop. Never raises: if that loop is already closed (the client and
+        its loop are gone), the request is just marked cancelled, so the scheduler's cleanup of OTHER requests goes on."""
+        try:
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, (tok, finish))
+        except RuntimeError:
+            self.cancelled = True
 
 
 class Scheduler:
@@ -208,17 +213,22 @@ class Scheduler:
             self.waiting.append(req)
             self.cv.notify()
 
-    def _accept(self, req: GenRequest, tok: int) -> bool:
-        """Deliver one generated token; True when the request is finished."""
+    def _accept(self, req: GenRequest, tok: int):
+        """Deliver one generated token. Order when the request ends: update the request, release its slot and blocks,
+        THEN emit the final event, so a client that has seen the end of its stream never finds them still held. The
+        caller must not release the request again (it is out of self.running once finished)."""
         if tok in self.eos and not req.ignore_eos and req.n_gen >= req.min_new:
+            self._release(req)               # a final EOS is not counted as generated
             req.emit(tok, "stop")
-            return True
-        last = req.n_gen == req.max_new - 1
-        req.emit(tok, "length" if last else None)
+            return
         req.n_gen += 1
         req.gen.append(tok)
         req.last_tok = tok
-        return last
+        if req.n_gen == req.max_new:
+            self._release(req)
+            req.emit(tok, "length")
+        else:
+            req.emit(tok, None)
 
     def _release(self, req: GenRequest):
         self.running.remove(req)
@@ -243,8 +253,8 @@ class Scheduler:
                 traceback.print_exc()
                 with self.cv:
                     for r in list(self.running):
+                        self._release(r)        # release first, then tell the client (same order as _accept)
                         r.emit(-1, "error")
-                        self._release(r)
 
     def _iteration(self):
         with self.cv:
@@ -268,8 +278,7 @@ class Scheduler:
             tok = self.backend.prefill(r.slot, ids)
             with self.cv:
                 r.pos = len(ids)
-                if self._accept(r, tok):
-                    self._release(r)
+                self._accept(r, tok)            # releases r itself when it finishes
         with self.cv:
             for r in [r for r in self.running if r.cancelled]:
                 self._release(r)
@@ -286,8 +295,7 @@ class Scheduler:
         with self.cv:
             for r, tok in zip(batch, outs):
                 r.pos += 1
-                if self._accept(r, tok):
-                    self._release(r)
+                self._accept(r, tok)            # releases r itself when it finishes
 
     async def tokens(self, prompt_ids: List[int], max_new: int, min_new: int, ignore_eos: bool):
         """Async generator of (token_id, finish_reason or None) for one request."""

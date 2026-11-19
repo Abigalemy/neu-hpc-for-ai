@@ -171,8 +171,12 @@ static std::map<std::string, DevTensor> load_weights_to_gpu(const std::string& d
     for (auto& path : files) {
         int fd = open(path.c_str(), O_RDONLY);
         struct stat st; fstat(fd, &st);
-        const uint8_t* base = (const uint8_t*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 8) { std::fprintf(stderr, "cannot read %s\n", path.c_str()); std::exit(2); }
+        void* mp = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mp == MAP_FAILED) { std::fprintf(stderr, "mmap of %s failed\n", path.c_str()); std::exit(2); }
+        const uint8_t* base = (const uint8_t*)mp;
         uint64_t hlen; std::memcpy(&hlen, base, 8);
+        if (hlen > (uint64_t)st.st_size - 8) { std::fprintf(stderr, "%s: bad header length\n", path.c_str()); std::exit(2); }
         std::string header((const char*)base + 8, hlen);
         const char* p = header.c_str();
         JV j = json_parse(p);
@@ -182,6 +186,10 @@ static std::map<std::string, DevTensor> load_weights_to_gpu(const std::string& d
             const JV& t = kv.second;
             if (t.get("dtype")->str != "BF16") { std::fprintf(stderr, "%s: only BF16 supported\n", kv.first.c_str()); std::exit(2); }
             size_t b = (size_t)t.get("data_offsets")->arr[0].num, e = (size_t)t.get("data_offsets")->arr[1].num;
+            if (b > e || e > (size_t)st.st_size - 8 - hlen) {
+                std::fprintf(stderr, "%s: data_offsets of %s outside the file\n", path.c_str(), kv.first.c_str());
+                std::exit(2);
+            }
             DevTensor dt;
             for (auto& s : t.get("shape")->arr) dt.shape.push_back((int64_t)s.num);
             dt.bytes = e - b;

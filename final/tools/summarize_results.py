@@ -32,6 +32,13 @@ PAIRS = [
     ("paged/long_c8", "paged_ours_1795030271/long_c8", "paged_vllm_1795029909/long_c8"),
     ("slots8/lecture_c100", "slots8_ours_1795030663/lecture_c100", "paged_vllm_1795029909/lecture_c100"),
     ("slots8/long_c8", "slots8_ours_1795030663/long_c8", "paged_vllm_1795029909/long_c8"),
+    # Part 1 (2026-11-18): Qwen3-30B-A3B (MoE), 1x H200, same 6-workload suite, both at revision ad44e777
+    ("30B/baseline", "suite_Qwen3-30B-A3B_ours_1795057331/baseline", "suite_Qwen3-30B-A3B_vllm_1795049169/baseline"),
+    ("30B/long_out", "suite_Qwen3-30B-A3B_ours_1795057331/long_out", "suite_Qwen3-30B-A3B_vllm_1795049169/long_out"),
+    ("30B/balanced_c16", "suite_Qwen3-30B-A3B_ours_1795057331/balanced_c16", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c16"),
+    ("30B/balanced_c64", "suite_Qwen3-30B-A3B_ours_1795057331/balanced_c64", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c64"),
+    ("30B/prefill_heavy", "suite_Qwen3-30B-A3B_ours_1795057331/prefill_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/prefill_heavy"),
+    ("30B/decode_heavy", "suite_Qwen3-30B-A3B_ours_1795057331/decode_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/decode_heavy"),
 ]
 
 

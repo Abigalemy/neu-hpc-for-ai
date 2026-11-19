@@ -117,6 +117,7 @@ struct MoePack {
     int first_layer = 0;          // buffers hold layers first_layer .. first_layer + g.size() - 1 (a test loads one)
     std::vector<bf16*> g, u, d;
     long long placed = 0;
+    std::vector<char> seen;       // (layer, expert, projection) slots written: each exactly once
     void alloc(int layers, int E_, int I_, int H_) {
         E = E_; I = I_; H = H_;
         const size_t elems = (size_t)E * I * H;
@@ -126,7 +127,9 @@ struct MoePack {
                 if (cudaMalloc(&ptr, elems * sizeof(bf16)) != cudaSuccess) { std::fprintf(stderr, "out of GPU memory for experts\n"); std::exit(2); }
                 v->push_back((bf16*)ptr);
             }
+        seen.assign((size_t)layers * E * 3, 0);
     }
+    bool complete() const { return std::all_of(seen.begin(), seen.end(), [](char c) { return c == 1; }); }
     // "model.layers.<l>.mlp.experts.<e>.<gate|up|down>_proj.weight" -> its slot; anything else -> DEFAULT
     Placement place(const std::string& name, const std::vector<int64_t>& shape, size_t bytes, void** dst) {
         int l = -1, e = -1;
@@ -134,6 +137,8 @@ struct MoePack {
         if (std::sscanf(name.c_str(), "model.layers.%d.mlp.experts.%d.%7[a-z]_proj.weight", &l, &e, which) != 3) return Placement::DEFAULT;
         std::string w = which;
         const bool down = w == "down";
+        const std::string exact = "model.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + "." + w + "_proj.weight";
+        if (name != exact) return Placement::DEFAULT;   // sscanf matched a prefix only: not an expert tensor
         l -= first_layer;
         if (l < 0 || l >= (int)g.size() || e < 0 || e >= E || !(down || w == "gate" || w == "up") || shape.size() != 2 ||
             shape[0] != (down ? H : I) || shape[1] != (down ? I : H) || bytes != (size_t)I * H * sizeof(bf16)) {
@@ -142,6 +147,9 @@ struct MoePack {
         }
         bf16* base = down ? d[l] : w == "gate" ? g[l] : u[l];
         *dst = base + (size_t)e * I * H;
+        char& slot = seen[((size_t)l * E + e) * 3 + (w == "gate" ? 0 : w == "up" ? 1 : 2)];
+        if (slot) { std::fprintf(stderr, "expert tensor %s appears twice\n", name.c_str()); std::exit(2); }
+        slot = 1;
         ++placed;
         return Placement::PLACED;
     }
@@ -184,7 +192,7 @@ public:
             weights_ = load_weights_to_gpu(dir, [&](const std::string& n, const std::vector<int64_t>& sh, size_t b, void** dst) {
                 return moe_.place(n, sh, b, dst);
             });
-            if (moe_.placed != (long long)cfg.layers * cfg.experts * 3) {
+            if (moe_.placed != (long long)cfg.layers * cfg.experts * 3 || !moe_.complete()) {
                 std::fprintf(stderr, "found %lld expert tensors, expected %d\n", moe_.placed, cfg.layers * cfg.experts * 3);
                 std::exit(2);
             }
@@ -193,6 +201,10 @@ public:
         }
         embed_ = W("model.embed_tokens.weight");
         final_norm_ = W("model.norm.weight");
+        if (!cfg.tie_embeddings && !weights_.count("lm_head.weight")) {
+            std::fprintf(stderr, "untied embeddings but no lm_head.weight in the checkpoint\n");
+            std::exit(2);
+        }
         lm_head_ = weights_.count("lm_head.weight") ? W("lm_head.weight") : embed_;
         for (int l = 0; l < cfg.layers; ++l) {
             std::string p = "model.layers." + std::to_string(l) + ".";

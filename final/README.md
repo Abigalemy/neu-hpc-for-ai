@@ -8,7 +8,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 |---|---|---|
 | Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
 | Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
-| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | in progress: MoE kernels pass their unit tests (below); engine, server, H200 benchmark next |
+| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | in progress: MoE in the engine and server; on 1x H200 every suite workload within 5.56x of vLLM (below); the whole-model check under the frozen rule on a held-out prompt is still to run |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
 | Part 4 | Within 3x of vLLM; write-up | not started |
 
@@ -163,17 +163,64 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
   them are primary (not explained by a difference at a lower layer at the same or an earlier position, through
   causal attention), and all 6 are ties in HF's own bf16 router logits (0-2 ulps apart, mostly exactly equal). HF
   rounds the router logits to bf16 before the softmax, so equal logits among 128 experts are common, and which tied
-  expert is taken is arbitrary (`torch.topk`'s order vs our lowest id); the token then drifts, and later tokens
-  with it. Every position with cosine < 0.999 traces back to such a tie. No primary difference is a non-tie, i.e.
-  no sign of a bug.
-- the MoE pass rule is therefore: top-1 mismatches only at near ties, greedy identical, mean cosine > 0.999, and every
-  primary routing difference a tie (the minimum cosine is reported). This run meets it (the rule was added after the
-  run, from its numbers; logs `results/part1/moe_e2e_h100_2026-11-18.txt`, `moe_e2e_routing_h100_2026-11-18.txt`).
+  expert is taken is arbitrary (`torch.topk`'s order vs our lowest id). What the data show is compatible with that:
+  every position with cosine < 0.999 lies within reach of a routing difference (at that position or an earlier
+  one), and none of the 6 primary differences is far from HF's top-8 boundary. "Within reach" is not proof that the
+  later differences were caused by the ties; a test that forces the engine to use HF's experts would be.
+- this run, as logged, FAILED the dense rule (minimum cosine) - both committed logs end in FAIL. An MoE rule was then
+  written from this run's numbers. A review found two holes in the first version of that rule (the top-1 check
+  looked at HF's own top-2 gap instead of the engine's token, and a high minimum cosine skipped the greedy and
+  routing checks); `part1/moe_e2e.py` now has a single verdict, tested locally on clean and adversarial synthetic
+  cases: top-1 mismatches only where the ENGINE's token is < 0.5 below HF's best, greedy identical, mean cosine >
+  0.999, full routing coverage, every primary difference within 2 bf16 steps of HF's logits, and every position with
+  cosine <= 0.999 within reach of a routing difference. It has not been run on the GPU yet; it will be, frozen, on a
+  second prompt that played no part in writing it ("heldout"). Logs `results/part1/moe_e2e_h100_2026-11-18.txt`,
+  `moe_e2e_routing_h100_2026-11-18.txt`.
 - the same run checked the dense path after the MoE changes: Qwen3-0.6B top-1 43/43, min cosine 0.99961, greedy 16/16.
 - engine-only timing (single sequence, this prompt; not comparable with vLLM through AIPerf yet): TTFT 22.6 ms, ITL
   11.0 ms.
 
-The server on Qwen3-30B-A3B and the AIPerf comparison with vLLM on one H200 are next. `tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
+### Server on Qwen3-30B-A3B vs vLLM, 1x H200 (2026-11-18)
+
+Same 6-workload suite and AIPerf settings as Part 0 (`modal_aipref.py --suite --model Qwen/Qwen3-30B-A3B --gpu h200`
+vs `modal_vllm_aipref.py`, same flags); both servers serve the same snapshot (revision `ad44e777`), and our runner
+stops unless the cached `refs/main` is that revision. Mean TTFT / ITL in ms, ratio = ours / vLLM, 0% errors on both:
+
+| Workload | ours TTFT | vLLM TTFT | TTFT x | ours ITL | vLLM ITL | ITL x |
+|---|---|---|---|---|---|---|
+| baseline (128 / 128, c1) | 42.3 | 67.6 | 0.63 | 11.02 | 4.00 | 2.76 |
+| long_out (3072 / 1024, c1) | 377 | 80.7 | 4.67 | 12.28 | 4.15 | 2.96 |
+| balanced_c16 (256 / 256) | 514 | 150 | 3.43 | 21.66 | 8.46 | 2.56 |
+| balanced_c64 (256 / 256) | 1930 | 468 | 4.13 | 43.21 | 12.74 | 3.39 |
+| prefill_heavy (2048 / 32, c8) | 1141 | 245 | 4.66 | 45.87 | 8.24 | **5.56** |
+| decode_heavy (64 / 1024, c32) | 492 | 1064 | 0.46 | 27.73 | 10.26 | 2.70 |
+
+Raw results: `results/aiperf/suite_Qwen3-30B-A3B_ours_1795057331`, `suite_Qwen3-30B-A3B_vllm_1795049169`. What I
+think the numbers say (not yet measured stage by stage):
+- single-sequence decode is about 2.8x slower (baseline, long_out ITL). The MoE block is six kernels per layer, and
+  the grouped gate/up and down launch blocks for all 128 experts whether a given expert has rows or not (the real
+  layer took 0.135 ms for one token, about 6.5 ms of the 11 ms step over 48 layers). Launching only the row tiles that
+  have work is the first Part 4 item.
+- prefill_heavy ITL is the worst ratio: our scheduler runs every newly admitted prefill (2048 tokens) before the next
+  decode step, so running sequences stall; vLLM mixes prefill chunks into the decode batch under a token budget
+  (chunked prefill), which keeps its ITL flat.
+- the two TTFT ratios below 1 are the same trade-off seen from the other side (new requests first), not a faster
+  engine.
+
+Getting this run to start took three tries, none of which reached the benchmark: (1) newer `huggingface_hub` rejects
+a cached snapshot without README / LICENSE / .gitattributes (`snapshot_download(local_files_only=True)`), so the runner
+now resolves `refs/main` itself and checks what the engine reads (`local_snapshot`: pinned revision, the
+`.safetensors` in the directory = the index's shards, each file at least as long as its header declares); (2) AIPerf
+loads the tokenizer by repo name offline, through the same check, so the three small files were fetched at the pinned
+revision (`part1/download_moe.py --complete`, which then loads the tokenizer by name offline in a fresh process); (3)
+the image build stopped at a flaky server test: a finished request emitted its last token before releasing its
+slot and blocks, so a client could see the end of its stream before the blocks were back. The scheduler now
+releases first, on the error path too, and a test checks the order at the moment the final event is emitted
+(it fails on the old code every time). `modal_aipref.py --compat --model ...` now runs AIPerf with that model's
+tokenizer in the same image and checks that the engine and AIPerf resolve the same snapshot; it passed before the
+H200 run.
+
+`tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
 the GPU's own intermediates: all exact or within 0.3% on 4 cases.
 
 Two findings on the way: `gather_scatter_view` takes element offsets (not tile coordinates) in every dimension other
@@ -267,6 +314,10 @@ modal run part1/modal_moe_layer.py --yes           # Part 1: one real MoE layer,
 modal run part1/moe_e2e.py --ref --yes             # Part 1: HF reference of the whole model (CPU), with routing
 modal run part1/moe_e2e.py --yes                   # Part 1: engine vs that reference on 1x H100 (+ dense 0.6B)
 modal run modal_test_h100.py --yes --tests moe,moe_debug   # Part 1: MoE unit tests + stage-by-stage check
+modal run part1/download_moe.py --complete         # Part 1: small non-weight files + offline tokenizer check (CPU)
+modal run modal_aipref.py --compat --model Qwen/Qwen3-30B-A3B            # CPU: AIPerf + snapshot check for 30B
+modal run modal_vllm_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200   # Part 1: vLLM suite
+modal run modal_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200        # Part 1: ours, suite
 modal run part2/modal_a2a.py --yes                 # Part 2: all-to-all mock on 2x H100
 modal run hw_check.py --yes                        # 2x H200 available? peer access, NCCL in the image
 modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container

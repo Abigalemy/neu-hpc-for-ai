@@ -10,7 +10,8 @@ import sys
 import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from server import Detokenizer, FakeBackend, FakeTokenizer, create_app  # noqa: E402
+import server as server_mod  # noqa: E402
+from server import Detokenizer, FakeBackend, FakeTokenizer, GenRequest, create_app  # noqa: E402
 
 TOK = FakeTokenizer()
 
@@ -252,12 +253,64 @@ def test_detokenizer_utf8():
     assert d.push(0, True) == ""   # an EOS adds no text
 
 
+async def test_final_event_after_release():
+    # the ORDER itself, observed at the moment the final event is handed to the client (inside the scheduler thread,
+    # under its lock): the request must already be out of `running`, its slot back in `free` exactly once and its
+    # blocks returned. Covers "length" ending at prefill (1 token) and in decode, "stop", and "error" with two
+    # requests in flight (both released, and the scheduler still serves the next request).
+    seen, orig_emit = [], GenRequest.emit
+    def spy(req, tok, finish):
+        if finish is not None:
+            seen.append((finish, req in sched.running, sched.free.count(req.slot), be.blocks.get(req.slot, 0)))
+        orig_emit(req, tok, finish)
+    GenRequest.emit = spy
+    try:
+        for max_new, eos_after, want in ((1, None, "length"), (4, None, "length"), (4, 2, "stop")):
+            seen.clear()
+            be, app = make(eos_after=eos_after, max_seqs=2, block_size=4, num_blocks=8)
+            sched = app.state.scheduler
+            out = [t async for t in sched.tokens([11, 12, 13], max_new, 0, eos_after is None)]
+            assert out[-1][1] == want and seen == [(want, False, 1, 0)], (max_new, want, out, seen)
+        seen.clear()
+        be, app = make(max_seqs=2, delay=0.002, block_size=4, num_blocks=8)
+        sched, good = app.state.scheduler, be.decode_batch
+        calls = []
+        def broken(*a):
+            calls.append(len(a[0]))
+            if len(a[0]) == 2:                  # fail once both requests are in the same decode step
+                raise RuntimeError("simulated engine failure")
+            return good(*a)
+        be.decode_batch = broken
+        res = await asyncio.gather(*[collect(sched.tokens([11, 12, 13], 8, 0, True)) for _ in range(2)])
+        assert all(r[-1][1] == "error" for r in res), res
+        assert seen == [("error", False, 1, 0)] * 2, seen
+        be.decode_batch = good
+        out = [t async for t in sched.tokens([11, 12, 13], 3, 0, True)]
+        assert out[-1][1] == "length" and sorted(sched.free) == [0, 1] and not be.blocks, (out, sched.free, be.blocks)
+    finally:
+        GenRequest.emit = orig_emit
+
+
+async def collect(gen):
+    return [t async for t in gen]
+
+
+def test_emit_to_closed_loop_does_not_raise():
+    # the scheduler's error cleanup emits to every failed request; one whose event loop is gone must not stop it
+    loop = asyncio.new_event_loop()
+    req = GenRequest([1], 1, 0, True, loop)
+    loop.close()
+    req.emit(-1, "error")
+    assert req.cancelled
+
+
 async def main():
     tests = [test_health_models, test_chat_stream_exact_length_and_usage, test_eos_stops_without_ignore_eos,
              test_max_completion_tokens_wins_and_non_stream, test_completions_string_and_ids, test_rejections,
              test_requests_are_batched, test_more_requests_than_slots, test_disconnect_frees_slot,
              test_engine_error_fails_only_that_request, test_paged_blocks_admit_more_than_contiguous,
-             test_preemption_by_recompute, test_request_larger_than_kv_pool, test_bad_token_ids_rejected]
+             test_preemption_by_recompute, test_request_larger_than_kv_pool, test_bad_token_ids_rejected,
+             test_final_event_after_release]
     for t in tests:
         await t()
         print("ok  ", t.__name__)
@@ -265,6 +318,8 @@ async def main():
     print("ok   test_detokenizer_utf8")
     test_fake_backend_depends_on_history()
     print("ok   test_fake_backend_depends_on_history")
+    test_emit_to_closed_loop_does_not_raise()
+    print("ok   test_emit_to_closed_loop_does_not_raise")
     print("ALL SERVER TESTS PASSED")
 
 
