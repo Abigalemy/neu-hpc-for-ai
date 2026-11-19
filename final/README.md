@@ -8,7 +8,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 |---|---|---|
 | Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
 | Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
-| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | in progress: MoE in the engine and server; on 1x H200 every suite workload within 5.56x of vLLM (below); the whole-model check under the frozen rule on a held-out prompt is still to run |
+| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done** (2026-11-18): whole model matches HF under the frozen MoE rule on a held-out prompt; on 1x H200 every suite workload within 5.56x of vLLM (below) |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | not started |
 | Part 4 | Within 3x of vLLM; write-up | not started |
 
@@ -113,7 +113,7 @@ needed. Source: `results/comparison.csv` (rows `paged/*`, `slots8/*`).
 - Ours in this configuration: lecture ITL 3.45x vLLM, above the Part 4 limit (3x); the batched decode at 100
   sequences is the next thing to optimise (Part 4).
 
-## Part 1 (in progress): Qwen3-30B-A3B on one GPU
+## Part 1: Qwen3-30B-A3B on one GPU
 
 Continued from the Part 0 server (commit `ba38271`); one code base serves both models, chosen by the checkpoint's
 config (`num_experts > 0` -> MoE layers). Weights: `Qwen/Qwen3-30B-A3B` bf16 at revision
@@ -173,9 +173,17 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
   routing checks); `part1/moe_e2e.py` now has a single verdict, tested locally on clean and adversarial synthetic
   cases: top-1 mismatches only where the ENGINE's token is < 0.5 below HF's best, greedy identical, mean cosine >
   0.999, full routing coverage, every primary difference within 2 bf16 steps of HF's logits, and every position with
-  cosine <= 0.999 within reach of a routing difference. It has not been run on the GPU yet; it will be, frozen, on a
-  second prompt that played no part in writing it ("heldout"). Logs `results/part1/moe_e2e_h100_2026-11-18.txt`,
+  cosine <= 0.999 within reach of a routing difference. Logs of the first run: `results/part1/moe_e2e_h100_2026-11-18.txt`,
   `moe_e2e_routing_h100_2026-11-18.txt`.
+- the frozen rule, run unchanged on 1x H100 (2026-11-18, log `results/part1/moe_e2e_frozen_h100_2026-11-18.txt`):
+  "tiling" (the prompt the rule was written from) PASS, with the same numbers as before (top-1 42/43, greedy 16/16,
+  mean cosine 0.99921, 6 primary routing differences, all exact ties); the mismatch at position 35 is now checked
+  against the engine's own token: it is tied with HF's best (0.000 below it). "heldout" (a second prompt, 30 tokens,
+  reference made on a CPU after the rule was frozen, with the snapshot recorded) PASS: top-1 46/46, greedy 16/16,
+  mean cosine 0.99936, minimum 0.99464; 288 of 2208 (layer, position) pairs differ, 5 primary, all 5 exact ties (0
+  bf16 steps) in HF's router logits; every position with cosine <= 0.999 within reach of one of them. Dense 0.6B in the
+  same run: PASS (top-1 43/43, min cosine 0.99961). The engine's logits and routing of these runs are kept on the
+  volume (`final-results:/results/moe_e2e_runs/`). Still not a causal proof: forcing HF's experts would be.
 - the same run checked the dense path after the MoE changes: Qwen3-0.6B top-1 43/43, min cosine 0.99961, greedy 16/16.
 - engine-only timing (single sequence, this prompt; not comparable with vLLM through AIPerf yet): TTFT 22.6 ms, ITL
   11.0 ms.
@@ -312,7 +320,8 @@ modal run part1/download_moe.py --yes              # Part 1: Qwen3-30B-A3B weigh
 modal run part1/gen_moe_cases.py                   # Part 1: MoE reference cases -> test_cases_moe.db (CPU)
 modal run part1/modal_moe_layer.py --yes           # Part 1: one real MoE layer, production shape, vs numpy
 modal run part1/moe_e2e.py --ref --yes             # Part 1: HF reference of the whole model (CPU), with routing
-modal run part1/moe_e2e.py --yes                   # Part 1: engine vs that reference on 1x H100 (+ dense 0.6B)
+modal run part1/moe_e2e.py --ref --yes --prompts heldout   # Part 1: HF reference of the held-out prompt (CPU)
+modal run part1/moe_e2e.py --yes --prompts tiling,heldout  # Part 1: engine vs both references on 1x H100 (+ dense 0.6B)
 modal run modal_test_h100.py --yes --tests moe,moe_debug   # Part 1: MoE unit tests + stage-by-stage check
 modal run part1/download_moe.py --complete         # Part 1: small non-weight files + offline tokenizer check (CPU)
 modal run modal_aipref.py --compat --model Qwen/Qwen3-30B-A3B            # CPU: AIPerf + snapshot check for 30B
