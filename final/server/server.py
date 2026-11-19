@@ -187,8 +187,9 @@ class GenRequest:
         self.cancelled = False       # set by the HTTP side when the client goes away
 
     def emit(self, tok: int, finish: Optional[str]):
-        """Hand one event to the request's event loop. Never raises: if that loop is already closed (the client and
-        its loop are gone), the request is just marked cancelled, so the scheduler's cleanup of OTHER requests goes on."""
+        """Hand one event to the request's event loop. If that loop is already closed (RuntimeError: the client and its
+        loop are gone), the request is marked cancelled instead of raising, so the scheduler's cleanup of OTHER requests
+        goes on; other exceptions are not caught here."""
         try:
             self.loop.call_soon_threadsafe(self.queue.put_nowait, (tok, finish))
         except RuntimeError:

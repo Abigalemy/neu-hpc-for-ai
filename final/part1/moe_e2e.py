@@ -40,6 +40,7 @@ N_GEN = 16
 REF_DIR = "/results/moe_e2e_ref"
 RUN_DIR = "/results/moe_e2e_runs"
 PRICE_H100 = 3.95
+LEGACY_REFS = {("Qwen/Qwen3-30B-A3B", "tiling"), ("Qwen/Qwen3-0.6B", "tiling")}   # made before meta had "snapshot"
 REVISIONS = {"Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",     # README: the weights in use
              "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca"}
 
@@ -216,13 +217,20 @@ def compare(model, prompt_id="tiling"):
     d = ref_dir(model, prompt_id)
     meta = json.load(open(f"{d}/meta.json"))
     snap = snapshot(model)
-    if meta.get("snapshot") not in (None, os.path.basename(snap)):
+    if meta.get("snapshot") is None:
+        # references made before the snapshot was recorded; the cache held only this one snapshot of each model then
+        if (model, prompt_id) not in LEGACY_REFS:
+            print("reference has no snapshot recorded: regenerate it")
+            return 1
+        print(f"legacy reference (snapshot not recorded; the cache held only {os.path.basename(snap)[:8]} then)")
+    elif meta["snapshot"] != os.path.basename(snap):
         print(f"reference made with snapshot {meta['snapshot']}, engine would use {os.path.basename(snap)}: stop")
         return 1
     n_prompt, n_total, keep, V = meta["n_prompt"], meta["n_total"], meta["keep"], meta["vocab"]
     ref = np.fromfile(f"{d}/logits.f32", np.float32).reshape(keep, V)
     toks = np.fromfile(f"{d}/tokens.bin", np.int32)
-    moe = json.load(open(f"{snap}/config.json")).get("num_experts", 0) > 0
+    cfg = json.load(open(f"{snap}/config.json"))
+    moe = cfg.get("num_experts", 0) > 0
     if moe and not os.path.exists(f"{d}/route_idx.i32"):
         print("MoE model but the reference has no routing record: regenerate it")
         return 1
@@ -243,12 +251,15 @@ def compare(model, prompt_id="tiling"):
     mine = (np.fromfile("/tmp/logits.bin", np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(keep, V)
     routing = None
     if moe:
-        T = n_total
+        # the expected shape comes from the model's config, not from the reference file's length: a reference that
+        # lost a layer would otherwise shrink the coverage check with it
+        T, L, E, K = n_total, cfg["num_hidden_layers"], cfg["num_experts"], cfg["num_experts_per_tok"]
         hidx = np.fromfile(f"{d}/route_idx.i32", np.int32)
         hlog = np.fromfile(f"{d}/route_logits.f32", np.float32)
-        L = hidx.size // (T * 8)
-        E = hlog.size // (L * T)
-        routing = routing_analysis(hidx.reshape(L, T, 8), hlog.reshape(L, T, E), read_dump("/tmp/route.bin", 8), E)
+        if hidx.size != L * T * K or hlog.size != L * T * E:
+            print(f"reference routing has {hidx.size} / {hlog.size} values, config wants [{L},{T},{K}] / [{L},{T},{E}]")
+            return 1
+        routing = routing_analysis(hidx.reshape(L, T, K), hlog.reshape(L, T, E), read_dump("/tmp/route.bin", K), E)
     ok, lines = verdict(ref, mine, n_prompt, n_total - keep, np.fromfile("/tmp/gen.bin", np.int32), toks[n_prompt:], routing)
     print(f"{model} [{prompt_id}, snapshot {os.path.basename(snap)[:8]}], engine side saved to final-results:{out}")
     for line in lines:

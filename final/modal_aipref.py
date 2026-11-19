@@ -62,6 +62,11 @@ def local_snapshot(model: str) -> str:
     return snap
 
 
+def print_versions(pkgs=("aiperf", "huggingface_hub", "transformers")):
+    import importlib.metadata as md
+    print("versions:", {p: md.version(p) for p in pkgs}, flush=True)
+
+
 IMAGE = "nvidia/cuda:13.5.0-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE, add_python="3.12")
@@ -188,6 +193,7 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
     import urllib.request
 
     os.chdir("/root/final")
+    print_versions()
     snap = local_snapshot(model)
     works, max_len, max_seqs, kv_tokens = CONFIGS[mode]
     tag = mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}"
@@ -196,7 +202,7 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
            "--max-seqs", str(max_seqs), "--kv-tokens", str(kv_tokens)]
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
-    stamp = int(time.time())
+    stamp, failed = int(time.time()), []
     try:
         t0 = time.time()
         while True:
@@ -214,21 +220,26 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
             left = int(deadline - time.time())
             if left < 30:
                 print(f"=== {name}: skipped, benchmark time cap reached")
+                failed.append(f"{name}: skipped")
                 continue
             out = f"/tmp/{tag}_ours/{name}"
             print(f"=== WORKLOAD {name}: {isl} in / {osl} out, concurrency {conc}, {reqs} requests", flush=True)
             rc = subprocess.run(["timeout", str(left)] + aiperf_cmd(model, f"http://localhost:{PORT}", isl, osl, reqs, out,
                                                                      conc, LECTURE_WARMUP if name.startswith("lecture") else None)).returncode
             print(f"=== {name}: aiperf exit code {rc}", flush=True)
+            if rc != 0:
+                failed.append(f"{name}: aiperf exit code {rc}")
     finally:
         server.terminate()
         try:
             server.wait(timeout=30)
         except subprocess.TimeoutExpired:
             server.kill()
-    subprocess.run(["cp", "-r", f"/tmp/{tag}_ours", f"{RES_DIR}/{tag}_ours_{stamp}"], check=False)
+    subprocess.run(["cp", "-r", f"/tmp/{tag}_ours", f"{RES_DIR}/{tag}_ours_{stamp}"], check=True)
     results_vol.commit()
     print(f"raw results saved to volume final-results:{RES_DIR}/{tag}_ours_{stamp}")
+    if failed:   # what ran is saved above; the run as a whole is NOT a complete suite (see tools/check_suite.py)
+        raise RuntimeError(f"incomplete suite: {failed}")
 
 
 @app.function(image=image, volumes={HF_DIR: hf_cache}, timeout=15 * 60)   # CPU only
@@ -237,10 +248,9 @@ def compat_check(model: str = "Qwen/Qwen3-4B"):
     runs: checks that AIPerf accepts our responses (streaming format, usage, fields) and that both consumers of the
     cache resolve `model` offline to the same revision: the engine's path (local_snapshot) and AIPerf's (the tokenizer
     by repo name, through huggingface_hub with HF_HUB_OFFLINE=1). Token counts are meaningless (fake engine)."""
-    import importlib.metadata as md
     import urllib.request
     from huggingface_hub import snapshot_download
-    print("versions:", {p: md.version(p) for p in ("aiperf", "huggingface_hub", "transformers")}, flush=True)
+    print_versions()
     engine_path = local_snapshot(model)
     aiperf_path = snapshot_download(model, local_files_only=True)     # what AutoTokenizer.from_pretrained(name) uses
     print(f"AIPerf resolves {model} -> {aiperf_path}", flush=True)
@@ -256,6 +266,8 @@ def compat_check(model: str = "Qwen/Qwen3-4B"):
                 break
             except Exception:
                 time.sleep(1)
+        else:
+            raise TimeoutError("the fake-engine server never became ready")
         rcs = []
         # one sequence, a batch of 8 through the continuous batcher, and the lecture's warm-up flags with more
         # connections (12) than slots (8), so some requests wait for a free slot
@@ -264,7 +276,7 @@ def compat_check(model: str = "Qwen/Qwen3-4B"):
                                           f"/tmp/aiperf_compat_c{conc}", conc, warm))
             print(f"=== concurrency {conc} warmup {warm}: aiperf exit code {r.returncode}", flush=True)
             rcs.append(r.returncode)
-        return max(rcs)
+        return 0 if all(rc == 0 for rc in rcs) else 1      # a signal (rc < 0) is a failure too
     finally:
         server.terminate()
 

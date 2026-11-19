@@ -158,7 +158,7 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
 `e2e_test.py`, 16 greedy tokens, 43 positions (27 prefill, 16 KV-cache decode), 2026-11-18:
 - greedy tokens 16/16 identical to HF; top-1 42/43, the one mismatch at a position where HF's own top-2 margin is
   0.000; mean cosine 0.99921; minimum cosine 0.9953 (below the dense criterion 0.999).
-- why the minimum is lower: the per-layer expert choices of both sides were recorded (hooks on HF's routers,
+- an explanation compatible with the data, not established as the cause: the per-layer expert choices of both sides were recorded (hooks on HF's routers,
   `QWEN3_MOE_DUMP` in the engine). 300 of 2064 (layer, position) pairs take a different expert set, but only 6 of
   them are primary (not explained by a difference at a lower layer at the same or an earlier position, through
   causal attention), and all 6 are ties in HF's own bf16 router logits (0-2 ulps apart, mostly exactly equal). HF
@@ -166,7 +166,8 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
   expert is taken is arbitrary (`torch.topk`'s order vs our lowest id). What the data show is compatible with that:
   every position with cosine < 0.999 lies within reach of a routing difference (at that position or an earlier
   one), and none of the 6 primary differences is far from HF's top-8 boundary. "Within reach" is not proof that the
-  later differences were caused by the ties; a test that forces the engine to use HF's experts would be.
+  later differences were caused by the ties; a test that forces the engine to use HF's experts would measure how much
+  of the difference the routing accounts for.
 - this run, as logged, FAILED the dense rule (minimum cosine) - both committed logs end in FAIL. An MoE rule was then
   written from this run's numbers. A review found two holes in the first version of that rule (the top-1 check
   looked at HF's own top-2 gap instead of the engine's token, and a high minimum cosine skipped the greedy and
@@ -183,7 +184,11 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
   mean cosine 0.99936, minimum 0.99464; 288 of 2208 (layer, position) pairs differ, 5 primary, all 5 exact ties (0
   bf16 steps) in HF's router logits; every position with cosine <= 0.999 within reach of one of them. Dense 0.6B in the
   same run: PASS (top-1 43/43, min cosine 0.99961). The engine's logits and routing of these runs are kept on the
-  volume (`final-results:/results/moe_e2e_runs/`). Still not a causal proof: forcing HF's experts would be.
+  volume (`final-results:/results/moe_e2e_runs/`). How much the "within reach" condition shows: little in these two
+  runs, because both have a routing difference at position 0 ("tiling": layer 3; "heldout": layer 2), which puts every
+  later position within reach. The informative results are top-1, greedy, full coverage and the primary differences
+  all being exact ties; they do not rule out an independent error in later layers. A forced-routing A/B would measure
+  the routing's share of the difference, not prove it is the only cause.
 - the same run checked the dense path after the MoE changes: Qwen3-0.6B top-1 43/43, min cosine 0.99961, greedy 16/16.
 - engine-only timing (single sequence, this prompt; not comparable with vLLM through AIPerf yet): TTFT 22.6 ms, ITL
   11.0 ms.
@@ -191,8 +196,13 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
 ### Server on Qwen3-30B-A3B vs vLLM, 1x H200 (2026-11-18)
 
 Same 6-workload suite and AIPerf settings as Part 0 (`modal_aipref.py --suite --model Qwen/Qwen3-30B-A3B --gpu h200`
-vs `modal_vllm_aipref.py`, same flags); both servers serve the same snapshot (revision `ad44e777`), and our runner
-stops unless the cached `refs/main` is that revision. Mean TTFT / ITL in ms, ratio = ours / vLLM, 0% errors on both:
+vs `modal_vllm_aipref.py`, same flags); both servers serve the same snapshot (revision `ad44e777`: our runner checks
+it, vLLM's log prints the path it served, and its runner now checks it too). `tools/check_suite.py` accepts the pair:
+all 6 workloads complete on both sides, planned request counts, no errors, every prompt and every server-reported
+completion (usage) exactly the target length, the same AIPerf version (0.13.0) and input configuration, and the same
+prompt tokens per request counted by both servers (AIPerf's own re-tokenised output length differs by a few tokens on
+both sides and is not used). The servers themselves are compared as they come: memory pool and scheduling are each
+server's own (vLLM's chunked-prefill budget is its default, not pinned). Mean TTFT / ITL in ms, ratio = ours / vLLM:
 
 | Workload | ours TTFT | vLLM TTFT | TTFT x | ours ITL | vLLM ITL | ITL x |
 |---|---|---|---|---|---|---|
@@ -206,19 +216,28 @@ stops unless the cached `refs/main` is that revision. Mean TTFT / ITL in ms, rat
 Raw results: `results/aiperf/suite_Qwen3-30B-A3B_ours_1795057331`, `suite_Qwen3-30B-A3B_vllm_1795049169`. What I
 think the numbers say (not yet measured stage by stage):
 - single-sequence decode is about 2.8x slower (baseline, long_out ITL). The MoE block is six kernels per layer, and
-  the grouped gate/up and down launch blocks for all 128 experts whether a given expert has rows or not (the real
-  layer took 0.135 ms for one token, about 6.5 ms of the 11 ms step over 48 layers). Launching only the row tiles that
-  have work is the first Part 4 item.
+  the grouped gate/up and down launch blocks for all 128 experts whether a given expert has rows or not (one real
+  layer took 0.135 ms for one token on an H100, engine only; 48 layers would be about 6.5 ms of an 11 ms step, an
+  extrapolation, not a measurement on the H200). How much of the gap the empty blocks are is not measured; an A/B of
+  one layer, including the cost of building the work list, comes first.
 - prefill_heavy ITL is the worst ratio: our scheduler runs every newly admitted prefill (2048 tokens) before the next
   decode step, so running sequences stall; vLLM mixes prefill chunks into the decode batch under a token budget
   (chunked prefill), which keeps its ITL flat.
-- the two TTFT ratios below 1 are the same trade-off seen from the other side (new requests first), not a faster
-  engine.
+- decode_heavy TTFT below 1 (concurrency 32): our scheduler admits new requests ahead of the next decode step, so
+  first tokens come early and running sequences pay in ITL. baseline TTFT below 1 cannot be that (concurrency 1: no
+  other request is running); its end-to-end TTFT is lower, and where the difference comes from (HTTP, tokenisation,
+  prefill) is not broken down.
+- `long_out` TTFT (4.67x) is a single request: chunked prefill cannot help it, only a faster prefill can.
+
+Over 3x, i.e. the Part 4 list for this model (ratio of means): `long_out` TTFT (target <= 242 ms), `balanced_c16` TTFT
+(<= 450 ms), `balanced_c64` TTFT (<= 1403 ms) and ITL (<= 38.2 ms), `prefill_heavy` TTFT (<= 735 ms) and ITL (<= 24.7
+ms); for Qwen3-4B `balanced_c64` ITL (3.03x) and the paged lecture configuration ITL (3.45x).
 
 Getting this run to start took three tries, none of which reached the benchmark: (1) newer `huggingface_hub` rejects
 a cached snapshot without README / LICENSE / .gitattributes (`snapshot_download(local_files_only=True)`), so the runner
-now resolves `refs/main` itself and checks what the engine reads (`local_snapshot`: pinned revision, the
-`.safetensors` in the directory = the index's shards, each file at least as long as its header declares); (2) AIPerf
+now resolves `refs/main` itself and checks the revision, the file set and the lengths of what the engine reads
+(`local_snapshot`: pinned revision, the `.safetensors` in the directory = the index's shards, each file at least as
+long as its header declares; not the contents); (2) AIPerf
 loads the tokenizer by repo name offline, through the same check, so the three small files were fetched at the pinned
 revision (`part1/download_moe.py --complete`, which then loads the tokenizer by name offline in a fresh process); (3)
 the image build stopped at a flaky server test: a finished request emitted its last token before releasing its
@@ -332,6 +351,7 @@ modal run hw_check.py --yes                        # 2x H200 available? peer acc
 modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container
 modal run modal_test_h100.py --yes --tests paged,paged_bench   # paged vs contiguous attention: bits and timing
 python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf
+python tools/check_suite.py OURS_DIR VLLM_DIR      # accept a paired suite run before reporting it (no GPU)
 ```
 
 Weights come from the Modal volume `qwen3-hf-cache`; unit-test cases come from `modal run gen_cases.py`

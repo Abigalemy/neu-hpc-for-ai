@@ -20,6 +20,9 @@ app = modal.App("final-vllm-baseline")
 hf_cache = modal.Volume.from_name("qwen3-hf-cache", create_if_missing=False)
 results_vol = modal.Volume.from_name("final-results", create_if_missing=True)  # created by us on 2026-11-16
 HF_DIR, RES_DIR, PORT = "/hf_cache", "/results_store", 8000
+# keep identical to PINNED in modal_aipref.py (this file is mounted alone in its image, so it is copied, not imported)
+PINNED = {"Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+          "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca"}
 
 vllm_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -181,17 +184,23 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
     same AIPerf settings as modal_aipref.py; with lecture=True the Week 7 lecture workload with the lecture's limits."""
     works, max_len, max_seqs = CONFIGS[mode]
     tag = mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}"
-    # serve the cached snapshot by path (the same files as our server; nothing fetched), under the model's name
+    # serve the cached snapshot by path (the same files as our server; nothing fetched), under the model's name; the
+    # same pinned revision as our runner (PINNED in modal_aipref.py), checked here too, not only on our side
+    import importlib.metadata as md
     from huggingface_hub import snapshot_download
+    print("versions:", {p: md.version(p) for p in ("vllm", "aiperf", "huggingface_hub", "transformers")}, flush=True)
     serve_path = snapshot_download(model, local_files_only=True)
-    print("weights:", serve_path, flush=True)
+    rev = os.path.basename(os.path.realpath(serve_path))
+    if model in PINNED and rev != PINNED[model]:
+        raise RuntimeError(f"{model}: vLLM would serve revision {rev}, results are pinned to {PINNED[model]}")
+    print(f"weights: {serve_path} (revision {rev})", flush=True)
     cmd = ["vllm", "serve", serve_path, "--served-model-name", model, "--dtype", "bfloat16", "--max-model-len", str(max_len),
            "--max-num-seqs", str(max_seqs), "--no-enable-prefix-caching", "--port", str(PORT)]
     if mode != "suite":
         cmd += ["--gpu-memory-utilization", "0.90"]
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
-    stamp = int(time.time())
+    stamp, failed = int(time.time()), []
     try:
         _wait_ready(server)
         deadline = time.time() + max_minutes * 60
@@ -199,6 +208,7 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
             left = int(deadline - time.time())
             if left < 30:
                 print(f"=== {name}: skipped, benchmark time cap reached")
+                failed.append(f"{name}: skipped")
                 continue
             out = f"/tmp/{tag}_vllm/{name}"
             print(f"=== WORKLOAD {name}: {isl} in / {osl} out, concurrency {conc}, {reqs} requests", flush=True)
@@ -213,15 +223,19 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
                       "--random-seed", "0", "--artifact-dir", out]
             rc = subprocess.run(["timeout", str(left)] + aiperf).returncode
             print(f"=== {name}: aiperf exit code {rc}", flush=True)
+            if rc != 0:
+                failed.append(f"{name}: aiperf exit code {rc}")
     finally:
         server.terminate()
         try:
             server.wait(timeout=30)
         except subprocess.TimeoutExpired:
             server.kill()
-    subprocess.run(["cp", "-r", f"/tmp/{tag}_vllm", f"{RES_DIR}/{tag}_vllm_{stamp}"], check=False)
+    subprocess.run(["cp", "-r", f"/tmp/{tag}_vllm", f"{RES_DIR}/{tag}_vllm_{stamp}"], check=True)
     results_vol.commit()
     print(f"raw results saved to volume final-results:{RES_DIR}/{tag}_vllm_{stamp}")
+    if failed:   # what ran is saved above; the run as a whole is NOT a complete suite (see tools/check_suite.py)
+        raise RuntimeError(f"incomplete suite: {failed}")
 
 
 @app.local_entrypoint()
