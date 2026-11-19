@@ -125,7 +125,7 @@ void alloc_ep_workspace(EpWorkspace<T>& ep, int N, int K, int E, int hid, int in
         p = (std::remove_reference_t<decltype(p)>)q;
         *bytes += n * sizeof(*p);
     };
-    const size_t S = (size_t)N * K, R = (size_t)world * N * K;
+    const size_t S = (size_t)N * K, R = (size_t)world * N * K;   // N = the largest rank's tokens per pass
     if (R > 0x7fffffffULL) { std::fprintf(stderr, "EP workspace: %zu rows overflow int\n", R); std::exit(2); }
     ep.max_tokens = N; ep.max_recv = (int)R;
     A(ep.send_rows, S * hid); A(ep.send_ids, S);

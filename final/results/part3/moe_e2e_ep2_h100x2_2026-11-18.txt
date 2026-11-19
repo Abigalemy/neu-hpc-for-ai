@@ -1,0 +1,69 @@
+PLAN: 2x H100, expert parallelism, rank 0 = ('Qwen/Qwen3-30B-A3B', 'tiling'), rank 1 = ('Qwen/Qwen3-30B-A3B', 'heldout') at the same time, hard cap 20 min -> at most ~$2.63 of shared credit
+0, NVIDIA H100 80GB HBM3, GPU-3f4687d0-ae48-4813-f9c9-abaf99d670b6
+1, NVIDIA H100 80GB HBM3, GPU-ee91aeba-8358-0333-93c8-270a604ef4b5
+===== rank 0 of 2
+legacy reference (snapshot not recorded; the cache held only ad44e777 then)
+expert parallelism: rank 0 of 2 holds experts 0..63 (64 of 128 per layer)
+weights: 32.07 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1 blocks of 128 tokens = 128 tokens, 0.01 GB (48 layers)
+MoE workspace: 51 tokens, 0.00 GB
+EP workspace: up to 864 received rows (2 ranks x 54 tokens x 8), 0.01 GB
+config: hidden=2048 inter=6144 layers=48 heads=32/4 vocab=151936 tied=0
+LOAD_S 75.08 (weights go to the GPU once, here)
+LOGITS_KEPT rows=43 first_position=0
+TEACHER_FORCED prefill(27 tokens) 403.1 ms, decode steps 16, avg 14.8 ms
+GENERATE prompt=27 tokens: TTFT_MS 30.4  ITL_MS 15.0 (avg over 15 steps)
+RANK 0 of 2: own work done, then 0 passes for the other ranks
+Qwen/Qwen3-30B-A3B [tiling, snapshot ad44e777, rank 0 of 2], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_ep2r0_1795064603
+  43 positions (27 prefill, 16 KV-cache decode); top-1 42/43; mismatch at 35: engine's token is HF's #1, 0.000 below HF's best
+  min cosine prefill 0.995322, decode 0.995443, mean 0.999210
+  greedy: engine matches HF for 16/16 tokens
+  routing: 2064 (layer, position) pairs, 0 missing, 0 invalid; 300 with a different expert set
+  primary differences: 6: 6 exact ties (0 steps), 0 near the top-8 boundary (1-2 steps), 0 further apart
+    primary: layer 0 position 28: engine [105] vs HF [30], 0 bf16 steps apart in HF's logits
+    primary: layer 1 position 11: engine [57] vs HF [124], 0 bf16 steps apart in HF's logits
+    primary: layer 1 position 20: engine [113] vs HF [45], 0 bf16 steps apart in HF's logits
+    primary: layer 2 position 3: engine [70] vs HF [69], 0 bf16 steps apart in HF's logits
+    primary: layer 3 position 0: engine [29] vs HF [86], 0 bf16 steps apart in HF's logits
+    primary: layer 3 position 1: engine [47] vs HF [107], 0 bf16 steps apart in HF's logits
+    cosine 0.99652 at position 8: within reach of a routing difference (at or before this position)
+    cosine 0.99837 at position 9: within reach of a routing difference (at or before this position)
+    cosine 0.99532 at position 16: within reach of a routing difference (at or before this position)
+    cosine 0.99864 at position 30: within reach of a routing difference (at or before this position)
+    cosine 0.99808 at position 35: within reach of a routing difference (at or before this position)
+    cosine 0.99544 at position 37: within reach of a routing difference (at or before this position)
+    cosine 0.99834 at position 38: within reach of a routing difference (at or before this position)
+    cosine 0.99866 at position 41: within reach of a routing difference (at or before this position)
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+===== rank 1 of 2
+expert parallelism: rank 1 of 2 holds experts 64..127 (64 of 128 per layer)
+weights: 32.07 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1 blocks of 128 tokens = 128 tokens, 0.01 GB (48 layers)
+MoE workspace: 54 tokens, 0.00 GB
+EP workspace: up to 864 received rows (2 ranks x 54 tokens x 8), 0.01 GB
+config: hidden=2048 inter=6144 layers=48 heads=32/4 vocab=151936 tied=0
+LOAD_S 75.57 (weights go to the GPU once, here)
+LOGITS_KEPT rows=46 first_position=0
+TEACHER_FORCED prefill(30 tokens) 402.5 ms, decode steps 16, avg 14.8 ms
+GENERATE prompt=30 tokens: TTFT_MS 29.5  ITL_MS 15.0 (avg over 15 steps)
+RANK 1 of 2: own work done, then 0 passes for the other ranks
+Qwen/Qwen3-30B-A3B [heldout, snapshot ad44e777, rank 1 of 2], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_heldout_ep2r1_1795064603
+  46 positions (30 prefill, 16 KV-cache decode); top-1 46/46
+  min cosine prefill 0.996588, decode 0.994637, mean 0.999356
+  greedy: engine matches HF for 16/16 tokens
+  routing: 2208 (layer, position) pairs, 0 missing, 0 invalid; 288 with a different expert set
+  primary differences: 5: 5 exact ties (0 steps), 0 near the top-8 boundary (1-2 steps), 0 further apart
+    primary: layer 0 position 38: engine [7] vs HF [125], 0 bf16 steps apart in HF's logits
+    primary: layer 0 position 45: engine [46] vs HF [50], 0 bf16 steps apart in HF's logits
+    primary: layer 1 position 8: engine [63] vs HF [79], 0 bf16 steps apart in HF's logits
+    primary: layer 1 position 15: engine [92] vs HF [101], 0 bf16 steps apart in HF's logits
+    primary: layer 2 position 0: engine [102] vs HF [74], 0 bf16 steps apart in HF's logits
+    cosine 0.99659 at position 6: within reach of a routing difference (at or before this position)
+    cosine 0.99765 at position 32: within reach of a routing difference (at or before this position)
+    cosine 0.99665 at position 33: within reach of a routing difference (at or before this position)
+    cosine 0.99464 at position 35: within reach of a routing difference (at or before this position)
+    cosine 0.99779 at position 39: within reach of a routing difference (at or before this position)
+    cosine 0.99883 at position 42: within reach of a routing difference (at or before this position)
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+rank 0 [tiling]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_1795058657
+rank 1 [heldout]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_heldout_1795058683

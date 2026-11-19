@@ -40,11 +40,15 @@ class CBackend:
     """The real engine through the C interface of engine/qwen3_capi.cu."""
 
     def __init__(self, lib_path: str, model_dir: str, max_len: int, max_chunk: int, yarn: float, max_seqs: int,
-                 kv_tokens: int = 0):
+                 kv_tokens: int = 0, rank: int = 0, world: int = 1, nccl_id: bytes = b""):
         lib = ctypes.CDLL(lib_path)
         lib.qe_create.restype = ctypes.c_void_p
         lib.qe_create.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int,
                                   ctypes.c_longlong]
+        lib.qe_create_ep.restype = ctypes.c_void_p
+        lib.qe_create_ep.argtypes = lib.qe_create.argtypes + [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+        lib.qe_idle_tick.restype = ctypes.c_int
+        lib.qe_idle_tick.argtypes = [ctypes.c_void_p]
         for name in ("qe_vocab", "qe_max_len", "qe_max_chunk", "qe_max_seqs", "qe_block_size", "qe_num_blocks",
                      "qe_free_blocks"):
             getattr(lib, name).restype = ctypes.c_int
@@ -59,7 +63,11 @@ class CBackend:
         lib.qe_release.restype = None
         lib.qe_release.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.lib = lib
-        self.h = lib.qe_create(model_dir.encode(), max_len, max_chunk, yarn, max_seqs, kv_tokens)
+        self.world = world
+        if world > 1:        # expert parallelism: this process is rank `rank` of `world` (Part 3)
+            self.h = lib.qe_create_ep(model_dir.encode(), max_len, max_chunk, yarn, max_seqs, kv_tokens, rank, world, nccl_id)
+        else:
+            self.h = lib.qe_create(model_dir.encode(), max_len, max_chunk, yarn, max_seqs, kv_tokens)
         if not self.h:
             raise RuntimeError("qe_create failed")
         self.vocab = lib.qe_vocab(self.h)
@@ -70,6 +78,10 @@ class CBackend:
 
     def free_blocks(self) -> int:
         return self.lib.qe_free_blocks(self.h)
+
+    def idle_tick(self) -> int:
+        """No local work: take part in the other ranks' forward pass if there is one (1), else 0 (see ep_link.py)."""
+        return self.lib.qe_idle_tick(self.h)
 
     def reserve(self, slot: int, n_tokens: int) -> bool:
         return bool(self.lib.qe_reserve(self.h, slot, n_tokens))
@@ -96,7 +108,8 @@ class FakeBackend:
     (if set) is `eos`, once, so both stopping at EOS and ignoring it can be tested."""
 
     def __init__(self, vocab: int = 1000, max_len: int = 4096, eos: int = 2, eos_after: Optional[int] = None,
-                 max_seqs: int = 4, delay: float = 0.0, block_size: int = 128, num_blocks: Optional[int] = None):
+                 max_seqs: int = 4, delay: float = 0.0, block_size: int = 128, num_blocks: Optional[int] = None,
+                 link=None, world: int = 1):
         self.vocab, self.max_len, self.eos, self.eos_after, self.max_seqs = vocab, max_len, eos, eos_after, max_seqs
         self.delay = delay            # seconds per engine call, to let concurrent requests overlap in tests
         self.calls = []
@@ -108,6 +121,19 @@ class FakeBackend:
         self.num_blocks = num_blocks if num_blocks is not None else max_seqs * -(-max_len // block_size)
         self.blocks = {}              # slot -> number of blocks it holds
         self.min_free = self.num_blocks
+        # several ranks (Part 3): every engine call is a tick, answered by the coordinator like the engine's all-reduce
+        self.link, self.world, self.passes = link, world, 0
+
+    def _tick(self, have: int) -> int:
+        if self.world == 1:
+            return have
+        m = self.link.fake_tick(have)
+        if m:
+            self.passes += 1
+        return m
+
+    def idle_tick(self) -> int:
+        return self._tick(0)
 
     def free_blocks(self) -> int:
         return self.num_blocks - sum(self.blocks.values())
@@ -139,6 +165,7 @@ class FakeBackend:
         return 10 + h % (self.vocab - 10)
 
     def prefill(self, slot: int, ids: List[int]) -> int:
+        self._tick(1)
         time.sleep(self.delay)
         self._check_reserved(slot, len(ids))
         self.calls.append(("prefill", slot, len(ids)))
@@ -148,6 +175,7 @@ class FakeBackend:
         return self._next(slot)
 
     def decode_batch(self, slots: List[int], tokens: List[int], positions: List[int]) -> List[int]:
+        self._tick(1)
         time.sleep(self.delay)
         assert len(set(slots)) == len(slots), "a slot appears twice in one batch"
         for s_, p in zip(slots, positions):
@@ -199,8 +227,12 @@ class GenRequest:
 class Scheduler:
     """Owns the backend in one thread: admit -> prefill -> one batched decode step, repeated (see module docstring)."""
 
-    def __init__(self, backend, eos_ids: List[int]):
+    def __init__(self, backend, eos_ids: List[int], link=None):
         self.backend, self.eos = backend, set(eos_ids)
+        # several ranks (Part 3, ep_link.py): with no local work this thread keeps ticking (idle_tick) while any rank
+        # has work, and parks when none has; a new request wakes the group through the coordinator
+        self.world, self.link = getattr(backend, "world", 1), link
+        self.idle_passes = 0
         self.free = list(range(backend.max_seqs))
         self.running: List[GenRequest] = []   # in admission order (the last one is preempted first)
         self.waiting = collections.deque()
@@ -213,6 +245,8 @@ class Scheduler:
         with self.cv:
             self.waiting.append(req)
             self.cv.notify()
+        if self.link is not None:
+            self.link.want()
 
     def _accept(self, req: GenRequest, tok: int):
         """Deliver one generated token. Order when the request ends: update the request, release its slot and blocks,
@@ -259,10 +293,11 @@ class Scheduler:
 
     def _iteration(self):
         with self.cv:
-            while not self.waiting and not self.running:
+            while not self.waiting and not self.running and self.world == 1:
                 self.cv.wait()
+            idle = not self.waiting and not self.running       # only with several ranks
             admitted = []
-            while self.waiting and self.free:    # first come, first served: stop at the first request that must wait
+            while not idle and self.waiting and self.free:    # first come, first served: stop at the first that must wait
                 r = self.waiting[0]
                 if r.cancelled:
                     self.waiting.popleft()
@@ -274,6 +309,12 @@ class Scheduler:
                 r.slot = self.free.pop(0)
                 self.running.append(r)       # running from now on, so an exception below still frees its slot
                 admitted.append(r)
+        if idle:                             # no local work: serve the other ranks' pass, or park if nobody has work
+            if self.backend.idle_tick():
+                self.idle_passes += 1
+            else:
+                self.link.park()
+            return
         for r in admitted:                   # prefill: this request's first token = its TTFT
             ids = r.ids + r.gen
             tok = self.backend.prefill(r.slot, ids)
@@ -335,9 +376,9 @@ class Detokenizer:
 
 
 # ---------------------------------------------------------------- app
-def create_app(backend, tokenizer, model_name: str, eos_ids: List[int]) -> FastAPI:
+def create_app(backend, tokenizer, model_name: str, eos_ids: List[int], link=None) -> FastAPI:
     app = FastAPI()
-    sched = Scheduler(backend, eos_ids)
+    sched = Scheduler(backend, eos_ids, link)
     app.state.scheduler = sched
 
     def _check(body: dict, n_prompt: int, max_new: int):
@@ -452,6 +493,12 @@ def create_app(backend, tokenizer, model_name: str, eos_ids: List[int]) -> FastA
     async def health():
         return {"status": "ok"}
 
+    @app.get("/stats")
+    async def stats():   # for the launcher and tests: what this rank did
+        return {"world": sched.world, "batch_steps": len(sched.batch_sizes), "idle_passes": sched.idle_passes,
+                "parks": sched.link.parks if sched.link else 0, "running": len(sched.running),
+                "waiting": len(sched.waiting)}
+
     return app
 
 
@@ -468,10 +515,19 @@ def main():
     ap.add_argument("--kv-tokens", type=int, default=0,
                     help="KV-cache pool size in tokens, shared by all sequences (0: max-seqs x max-len)")
     ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--fake-delay", type=float, default=0.0, help="seconds per fake engine call")
+    ap.add_argument("--rank", type=int, default=0, help="this process's rank (expert parallelism, part3/launch.py)")
+    ap.add_argument("--world", type=int, default=1, help="number of ranks = GPUs; > 1 needs --coord")
+    ap.add_argument("--coord", default="", help="host:port of the launcher's coordinator (key in QWEN3_COORD_KEY)")
     a = ap.parse_args()
+    link = None
+    if a.world > 1:
+        from ep_link import EpLink
+        host, port = a.coord.rsplit(":", 1)
+        link = EpLink((host, int(port)), bytes.fromhex(os.environ["QWEN3_COORD_KEY"]), a.rank)
     if a.fake:
-        backend = FakeBackend(max_len=a.max_len, max_seqs=a.max_seqs,
-                              num_blocks=-(-a.kv_tokens // 128) if a.kv_tokens > 0 else None)
+        backend = FakeBackend(max_len=a.max_len, max_seqs=a.max_seqs, delay=a.fake_delay,
+                              num_blocks=-(-a.kv_tokens // 128) if a.kv_tokens > 0 else None, link=link, world=a.world)
         tok, eos = FakeTokenizer(), [FakeTokenizer.eos_token_id]
     else:
         from transformers import AutoTokenizer   # tokenizer only; PyTorch is not needed for it
@@ -481,12 +537,13 @@ def main():
         if os.path.exists(gc):
             e = json.load(open(gc)).get("eos_token_id")
             eos += e if isinstance(e, list) else ([e] if e is not None else [])
-        backend = CBackend(a.lib, a.model_dir, a.max_len, a.max_chunk, a.yarn, a.max_seqs, a.kv_tokens)
+        backend = CBackend(a.lib, a.model_dir, a.max_len, a.max_chunk, a.yarn, a.max_seqs, a.kv_tokens, a.rank, a.world,
+                           bytes.fromhex(os.environ.get("QWEN3_NCCL_ID", "")))
         print(f"engine ready: vocab {backend.vocab}, max_len {backend.max_len}, max_seqs {backend.max_seqs}, "
               f"KV pool {backend.num_blocks} blocks x {backend.block_size} tokens, YaRN {a.yarn or 'off'}, "
               f"eos {sorted(set(eos))}", flush=True)
     import uvicorn
-    uvicorn.run(create_app(backend, tok, a.served_model_name, eos), host="0.0.0.0", port=a.port, log_level="warning")
+    uvicorn.run(create_app(backend, tok, a.served_model_name, eos, link), host="0.0.0.0", port=a.port, log_level="warning")
 
 
 if __name__ == "__main__":

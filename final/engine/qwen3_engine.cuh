@@ -290,10 +290,17 @@ public:
             moe_ws_.hbuf = alloc<bf16>(A * cfg.moe_inter); moe_ws_.ysorted = alloc<bf16>(A * H);
             std::printf("MoE workspace: %zu tokens, %.2f GB\n", N, (A * (cfg.moe_inter + H) * sizeof(bf16) + A * 16) / 1e9);
             if (world > 1) {
+                // the receive side must hold every rank's tokens: size it with the largest N of all ranks (they may
+                // be configured differently, e.g. engine_test with different prompt lengths)
+                int nmax = (int)N;
+                CK(cudaMemcpy(d_tick_, &nmax, sizeof(int), cudaMemcpyHostToDevice));
+                NCK(ncclAllReduce(d_tick_, d_tick_, 1, ncclInt32, ncclMax, ep_.comm, 0));
+                CK(cudaMemcpy(&nmax, d_tick_, sizeof(int), cudaMemcpyDeviceToHost));
                 size_t eb = 0;
-                alloc_ep_workspace(ep_ws_, (int)N, cfg.top_k, cfg.experts, (int)H, cfg.moe_inter, world, &eb);
-                std::printf("EP workspace: up to %d received rows (%d ranks x %zu tokens x %d), %.2f GB\n", ep_ws_.max_recv,
-                            world, N, cfg.top_k, eb / 1e9);
+                alloc_ep_workspace(ep_ws_, nmax, cfg.top_k, cfg.experts, (int)H, cfg.moe_inter, world, &eb);
+                ep_ws_.max_tokens = (int)N;   // this rank's own tokens per pass
+                std::printf("EP workspace: up to %d received rows (%d ranks x %d tokens x %d), %.2f GB\n", ep_ws_.max_recv,
+                            world, nmax, cfg.top_k, eb / 1e9);
             }
             std::fflush(stdout);
         } else {

@@ -6,6 +6,7 @@ CPU reference does not keep a GPU waiting:
   modal run part1/moe_e2e.py --yes                  # 1x H100: engine vs the stored reference (+ dense 0.6B regression)
   modal run part1/moe_e2e.py --ref --yes --prompts heldout          # a prompt the MoE rule was NOT written from
   modal run part1/moe_e2e.py --yes --prompts tiling,heldout
+  modal run part1/moe_e2e.py --yes --ep --prompts tiling,heldout     # Part 3: 2 GPUs, one prompt per rank
 
 Same checks as e2e_test.py: teacher forcing (prefill the prompt in one chunk, then HF's own continuation one token at
 a time through the KV cache), logits of every position vs HF (top-1, cosine, max error), and greedy generation.
@@ -208,8 +209,12 @@ def verdict(ref, mine, n_prompt, first_keep, gen, exp, routing=None):
     return ok, lines
 
 
-def compare(model, prompt_id="tiling"):
-    """Engine (tests/engine_test.cu) on the stored reference tokens; saves the engine's logits and routing; 0 = pass."""
+def compare(model, prompt_id="tiling", rank=0, world=1, nccl_hex=""):
+    """Engine (tests/engine_test.cu) on the stored reference tokens; saves the engine's logits and routing.
+    Returns (0 = pass, printed lines). world > 1: this is rank `rank` of an expert-parallel group (Part 3), on GPU
+    `rank` only, running its own prompt while the other ranks run theirs (see engine())."""
+    lines_out = []
+    say = lines_out.append
     import shutil
     import subprocess
     import time
@@ -220,35 +225,38 @@ def compare(model, prompt_id="tiling"):
     if meta.get("snapshot") is None:
         # references made before the snapshot was recorded; the cache held only this one snapshot of each model then
         if (model, prompt_id) not in LEGACY_REFS:
-            print("reference has no snapshot recorded: regenerate it")
-            return 1
-        print(f"legacy reference (snapshot not recorded; the cache held only {os.path.basename(snap)[:8]} then)")
+            say("reference has no snapshot recorded: regenerate it")
+            return 1, lines_out
+        say(f"legacy reference (snapshot not recorded; the cache held only {os.path.basename(snap)[:8]} then)")
     elif meta["snapshot"] != os.path.basename(snap):
-        print(f"reference made with snapshot {meta['snapshot']}, engine would use {os.path.basename(snap)}: stop")
-        return 1
+        say(f"reference made with snapshot {meta['snapshot']}, engine would use {os.path.basename(snap)}: stop")
+        return 1, lines_out
     n_prompt, n_total, keep, V = meta["n_prompt"], meta["n_total"], meta["keep"], meta["vocab"]
     ref = np.fromfile(f"{d}/logits.f32", np.float32).reshape(keep, V)
     toks = np.fromfile(f"{d}/tokens.bin", np.int32)
     cfg = json.load(open(f"{snap}/config.json"))
     moe = cfg.get("num_experts", 0) > 0
     if moe and not os.path.exists(f"{d}/route_idx.i32"):
-        print("MoE model but the reference has no routing record: regenerate it")
-        return 1
+        say("MoE model but the reference has no routing record: regenerate it")
+        return 1, lines_out
     env = dict(os.environ)
+    tmp = f"/tmp/r{rank}_"
     if moe:
-        env["QWEN3_MOE_DUMP"] = "/tmp/route.bin"
+        env["QWEN3_MOE_DUMP"] = tmp + "route.bin"
+    if world > 1:
+        env.update(CUDA_VISIBLE_DEVICES=str(rank), QWEN3_RANK=str(rank), QWEN3_WORLD=str(world), QWEN3_NCCL_ID=nccl_hex)
     r = subprocess.run(["/root/final/build/engine_test", snap, f"{d}/tokens.bin", str(n_total), str(n_prompt),
-                        "/tmp/logits.bin", "/tmp/rope.bin", "/tmp/gen.bin", str(n_total - n_prompt)],
-                       capture_output=True, text=True, env=env)
-    print(r.stdout.strip())
+                        tmp + "logits.bin", tmp + "rope.bin", tmp + "gen.bin", str(n_total - n_prompt)],
+                       capture_output=True, text=True, env=env, timeout=900)   # a rank whose peer died waits in NCCL
+    say(r.stdout.strip())
     if r.returncode:
-        print("engine_test failed:", r.stderr[-2000:])
-        return 1
-    out = f"{RUN_DIR}/{os.path.basename(d)}_{int(time.time())}"      # keep the engine's side for later analysis
-    os.makedirs(out, exist_ok=True)
+        say("engine_test failed: " + r.stderr[-2000:])
+        return 1, lines_out
+    out = f"{RUN_DIR}/{os.path.basename(d)}{f'_ep{world}r{rank}' if world > 1 else ''}_{int(time.time())}"
+    os.makedirs(out, exist_ok=True)                                 # keep the engine's side for later analysis
     for f in ("logits.bin", "gen.bin") + (("route.bin",) if moe else ()):
-        shutil.copy(f"/tmp/{f}", out)
-    mine = (np.fromfile("/tmp/logits.bin", np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(keep, V)
+        shutil.copy(tmp + f, f"{out}/{f}")
+    mine = (np.fromfile(tmp + "logits.bin", np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(keep, V)
     routing = None
     if moe:
         # the expected shape comes from the model's config, not from the reference file's length: a reference that
@@ -257,15 +265,16 @@ def compare(model, prompt_id="tiling"):
         hidx = np.fromfile(f"{d}/route_idx.i32", np.int32)
         hlog = np.fromfile(f"{d}/route_logits.f32", np.float32)
         if hidx.size != L * T * K or hlog.size != L * T * E:
-            print(f"reference routing has {hidx.size} / {hlog.size} values, config wants [{L},{T},{K}] / [{L},{T},{E}]")
-            return 1
-        routing = routing_analysis(hidx.reshape(L, T, K), hlog.reshape(L, T, E), read_dump("/tmp/route.bin", K), E)
-    ok, lines = verdict(ref, mine, n_prompt, n_total - keep, np.fromfile("/tmp/gen.bin", np.int32), toks[n_prompt:], routing)
-    print(f"{model} [{prompt_id}, snapshot {os.path.basename(snap)[:8]}], engine side saved to final-results:{out}")
+            say(f"reference routing has {hidx.size} / {hlog.size} values, config wants [{L},{T},{K}] / [{L},{T},{E}]")
+            return 1, lines_out
+        routing = routing_analysis(hidx.reshape(L, T, K), hlog.reshape(L, T, E), read_dump(tmp + "route.bin", K), E)
+    ok, lines = verdict(ref, mine, n_prompt, n_total - keep, np.fromfile(tmp + "gen.bin", np.int32), toks[n_prompt:], routing)
+    say(f"{model} [{prompt_id}, snapshot {os.path.basename(snap)[:8]}{f', rank {rank} of {world}' if world > 1 else ''}], "
+        f"engine side saved to final-results:{out}")
     for line in lines:
-        print("  " + line)
+        say("  " + line)
     results.commit()
-    return 0 if ok else 1
+    return (0 if ok else 1), lines_out
 
 
 @app.function(image=image, gpu="H100", volumes={"/hf_cache": hf_cache.read_only(), "/results": results},
@@ -275,13 +284,61 @@ def engine(jobs: list) -> int:
     subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
     rc = 0
     for m, pid in jobs:
-        rc |= compare(m, pid)
+        r, lines = compare(m, pid)
+        print("\n".join(lines), flush=True)
+        rc |= r
+    return rc
+
+
+@app.function(image=image, gpu="H100:2", volumes={"/hf_cache": hf_cache.read_only(), "/results": results},
+              timeout=20 * 60)   # hard cap 20 min
+def engine_ep(jobs: list) -> int:
+    """Part 3: expert parallelism over 2 GPUs, one process per GPU (CUDA_VISIBLE_DEVICES), each rank with its own
+    prompt from `jobs` (data parallelism), all at the same time; every rank is judged by the same frozen rule."""
+    import ctypes
+    import subprocess
+    import threading
+    subprocess.run(["nvidia-smi", "--query-gpu=index,name,uuid", "--format=csv,noheader"])
+    nccl = ctypes.CDLL("libnccl.so.2")
+    uid = ctypes.create_string_buffer(128)                  # sizeof(ncclUniqueId) = NCCL_UNIQUE_ID_BYTES = 128
+    assert nccl.ncclGetUniqueId(uid) == 0
+    world = len(jobs)
+    res = [None] * world
+    th = [threading.Thread(target=lambda r=r: res.__setitem__(r, compare(*jobs[r], rank=r, world=world,
+                                                                          nccl_hex=uid.raw.hex())))
+          for r in range(world)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    rc = 0
+    for r, (code, lines) in enumerate(res):
+        print(f"===== rank {r} of {world}", flush=True)
+        print("\n".join(lines), flush=True)
+        rc |= code
+    # the EP layer is bit-exact vs one GPU (tests/ep_layer_test.cu), so the whole model on 2 GPUs must give the SAME
+    # logits and tokens as the single-GPU run of the same reference (the latest one saved on the volume)
+    import glob
+    import re
+    for r, (m, pid) in enumerate(jobs):
+        base = os.path.basename(ref_dir(m, pid))
+        single = sorted(d for d in glob.glob(f"{RUN_DIR}/{base}_*") if re.fullmatch(rf"{re.escape(base)}_\d+", os.path.basename(d)))
+        ep_runs = sorted(glob.glob(f"{RUN_DIR}/{base}_ep{world}r{r}_*"))
+        if not single or not ep_runs:
+            print(f"rank {r} [{pid}]: no single-GPU run to compare with")
+            rc |= 1
+            continue
+        same = all(open(f"{single[-1]}/{f}", "rb").read() == open(f"{ep_runs[-1]}/{f}", "rb").read()
+                   for f in ("logits.bin", "gen.bin"))
+        print(f"rank {r} [{pid}]: logits and generated tokens {'IDENTICAL to' if same else 'DIFFER from'} the single-GPU "
+              f"run {os.path.basename(single[-1])}")
+        rc |= 0 if same else 1
     return rc
 
 
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-30B-A3B", ref: bool = False, prompts: str = "tiling", dense_check: bool = True,
-         yes: bool = False):
+         ep: bool = False, yes: bool = False):
     pids = prompts.split(",")
     if ref:
         print(f"PLAN: CPU only (16 cores, 128 GiB, no GPU): HF reference for {model}, prompts {pids} "
@@ -292,6 +349,15 @@ def main(model: str = "Qwen/Qwen3-30B-A3B", ref: bool = False, prompts: str = "t
         else:
             print("Dry run only. Pass --yes to start.")
         return
+    if ep:
+        jobs = [(model, pid) for pid in pids]
+        assert len(jobs) == 2, "--ep runs one prompt per GPU: give two prompts"
+        print(f"PLAN: 2x H100, expert parallelism, rank 0 = {jobs[0]}, rank 1 = {jobs[1]} at the same time, hard cap "
+              f"20 min -> at most ~${2 * 20 / 60 * PRICE_H100:.2f} of shared credit")
+        if not yes:
+            print("Dry run only. Pass --yes to start.")
+            return
+        raise SystemExit(engine_ep.remote(jobs))
     models = [(model, pid) for pid in pids] + ([("Qwen/Qwen3-0.6B", "tiling")] if dense_check and model != "Qwen/Qwen3-0.6B" else [])
     print(f"PLAN: 1x H100, engine vs the stored references of {models}, hard cap 20 min -> at most "
           f"~${20 / 60 * PRICE_H100:.2f} of shared credit")

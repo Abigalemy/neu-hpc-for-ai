@@ -4,6 +4,9 @@
 //    (the KV-cache decode path). Writes the logits of every position, [n_total, vocab] bf16.
 // 2. Greedy generation of n_gen tokens from the prompt; prints TTFT and ITL.
 // 3. Dumps the engine's RoPE tables.
+// Expert parallelism (Part 3): QWEN3_WORLD=K QWEN3_RANK=r QWEN3_NCCL_ID=<hex> runs this process as rank r of K (one GPU
+// each, every rank with its own prompt); when its own work is done it keeps serving the other ranks' passes
+// (idle_tick) until no rank has work left.
 #include <algorithm>
 #include <chrono>
 #include "../engine/qwen3_engine.cuh"
@@ -23,7 +26,15 @@ int main(int argc, char** argv) {
     const int* tokens = (const int*)tok_bytes.data();
 
     auto t0 = std::chrono::steady_clock::now();
-    Qwen3Engine eng(dir, n_total + n_gen + 8, n_total + 8, n_total + 8);
+    const int world = std::getenv("QWEN3_WORLD") ? std::atoi(std::getenv("QWEN3_WORLD")) : 1;
+    const int rank = std::getenv("QWEN3_RANK") ? std::atoi(std::getenv("QWEN3_RANK")) : 0;
+    std::vector<unsigned char> nccl_id;
+    if (world > 1) {
+        const char* hex = std::getenv("QWEN3_NCCL_ID");
+        for (size_t i = 0; hex && hex[i] && hex[i + 1]; i += 2) nccl_id.push_back((unsigned char)std::strtol(std::string(hex + i, 2).c_str(), nullptr, 16));
+        if (nccl_id.size() != sizeof(ncclUniqueId)) { std::fprintf(stderr, "QWEN3_NCCL_ID: %zu bytes\n", nccl_id.size()); return 1; }
+    }
+    Qwen3Engine eng(dir, n_total + n_gen + 8, n_total + 8, n_total + 8, 0, 1, 0, rank, world, world > 1 ? nccl_id.data() : nullptr);
     double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("config: hidden=%d inter=%d layers=%d heads=%d/%d vocab=%d tied=%d\n", eng.cfg.hidden, eng.cfg.inter,
                 eng.cfg.layers, eng.cfg.hq, eng.cfg.hkv, eng.cfg.vocab, (int)eng.cfg.tie_embeddings);
@@ -75,5 +86,9 @@ int main(int argc, char** argv) {
     // 3) RoPE tables
     auto rt = eng.rope_tables_host();
     write_file(argv[6], rt.data(), rt.size() * sizeof(bf16));
+    // 4) expert parallelism: serve the other ranks until nobody has work
+    int idle = 0;
+    while (eng.idle_tick()) ++idle;
+    if (world > 1) std::printf("RANK %d of %d: own work done, then %d passes for the other ranks\n", rank, world, idle);
     return 0;
 }
