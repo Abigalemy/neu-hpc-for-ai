@@ -187,7 +187,7 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
 
 
 @app.function(image=image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=25 * 60)  # hard cap
-def run_suite(model: str, max_minutes: int, mode: str = "suite"):
+def run_suite(model: str, max_minutes: int, mode: str = "suite", world: int = 1):
     """The workloads of CONFIGS[mode] against ONE server instance, one after another (suite: 64 sequences; lecture:
     the Week 7 lecture workload with the lecture's limits, 2048 tokens x 128 sequences; paged / slots8: see CONFIGS)."""
     import urllib.request
@@ -196,10 +196,14 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
     print_versions()
     snap = local_snapshot(model)
     works, max_len, max_seqs, kv_tokens = CONFIGS[mode]
-    tag = mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}"
-    cmd = ["python", "server/server.py", "--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
-           "--max-len", str(max_len), "--max-chunk", str(max(i for _, i, _, _, _ in works) + CHAT_TEMPLATE_MARGIN),
-           "--max-seqs", str(max_seqs), "--kv-tokens", str(kv_tokens)]
+    tag = (mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}") + (f"_ep{world}" if world > 1 else "")
+    args = ["--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
+            "--max-len", str(max_len), "--max-chunk", str(max(i for _, i, _, _, _ in works) + CHAT_TEMPLATE_MARGIN),
+            "--max-seqs", str(max_seqs), "--kv-tokens", str(kv_tokens)]
+    # world > 1 (Part 3): part3/launch.py starts one rank per GPU behind a round-robin balancer on PORT; --max-seqs and
+    # --kv-tokens are per rank, like vLLM's --max-num-seqs per data-parallel engine
+    cmd = (["python", "part3/launch.py", "--world", str(world), "--lib", "build/libqwen3engine.so"] + args if world > 1
+           else ["python", "server/server.py"] + args)
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
     stamp, failed = int(time.time()), []
@@ -243,7 +247,7 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
 
 
 @app.function(image=image, volumes={HF_DIR: hf_cache}, timeout=15 * 60)   # CPU only
-def compat_check(model: str = "Qwen/Qwen3-4B"):
+def compat_check(model: str = "Qwen/Qwen3-4B", world: int = 1):
     """AIPerf, with the same settings shape, against server.py --fake on a CPU, in the SAME image and cache as the GPU
     runs: checks that AIPerf accepts our responses (streaming format, usage, fields) and that both consumers of the
     cache resolve `model` offline to the same revision: the engine's path (local_snapshot) and AIPerf's (the tokenizer
@@ -257,8 +261,10 @@ def compat_check(model: str = "Qwen/Qwen3-4B"):
     if os.path.realpath(aiperf_path) != os.path.realpath(engine_path):
         raise RuntimeError(f"engine uses {engine_path} but AIPerf resolves {aiperf_path}")
     os.chdir("/root/final")
-    server = subprocess.Popen(["python", "server/server.py", "--fake", "--port", str(PORT), "--max-len", "8192",
-                               "--max-seqs", "8", "--served-model-name", model])
+    fake = ["--fake", "--port", str(PORT), "--max-len", "8192", "--max-seqs", "8", "--served-model-name", model]
+    # world > 1: the same through part3/launch.py (fake ranks, coordinator, balancer) as the GPU run will use
+    server = subprocess.Popen(["python", "part3/launch.py", "--world", str(world)] + fake if world > 1
+                              else ["python", "server/server.py"] + fake)
     try:
         for _ in range(60):
             try:
@@ -284,7 +290,8 @@ def compat_check(model: str = "Qwen/Qwen3-4B"):
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False, requests: int = 5,
          max_minutes: int = 18, compat: bool = False, suite: bool = False, lecture: bool = False, mode: str = "",
-         gpu: str = "h100", yes: bool = False):
+         gpu: str = "h100", world: int = 1, yes: bool = False):
+    gpus = gpu.upper() + (f":{world}" if world > 1 else "")      # world > 1: expert parallelism over that many GPUs
     if lecture:
         mode = "lecture"
     if mode:
@@ -298,16 +305,18 @@ def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: b
             print("Dry run only. Pass --yes to start.")
         return
     if suite:
-        print(f"PLAN: our server, {model}, 1 {gpu.upper()}, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
-              f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
+        print(f"PLAN: our server, {model}, {world} {gpu.upper()} ({'1 rank' if world == 1 else f'{world} ranks, expert + data parallel'}), "
+              f"workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences per rank), "
+              f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu] * world:.2f} of shared credit")
         if yes:
-            run_suite.with_options(gpu=gpu.upper()).remote(model, max_minutes)
+            run_suite.with_options(gpu=gpus).remote(model, max_minutes, "suite", world)
         else:
             print("Dry run only. Pass --yes to start.")
         return
     if compat:
-        print(f"CPU-only: AIPerf ({model} tokenizer, offline) against the server with the fake engine (a few cents)")
-        raise SystemExit(compat_check.remote(model))
+        print(f"CPU-only: AIPerf ({model} tokenizer, offline) against the server with the fake engine"
+              f"{f' ({world} fake ranks via part3/launch.py)' if world > 1 else ''} (a few cents)")
+        raise SystemExit(compat_check.remote(model, world))
     lengths(isl, osl, yarn)   # fails here, locally, before any GPU is started
     print(f"PLAN: our server, {model}, 1 {gpu.upper()}, single sequence {isl} in / {osl} out, {requests} requests, YaRN={yarn}, "
           f"benchmark cap {max_minutes} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")

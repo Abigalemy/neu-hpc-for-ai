@@ -179,11 +179,11 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
 
 
 @app.function(image=vllm_image, gpu="H100", volumes={HF_DIR: hf_cache, RES_DIR: results_vol}, timeout=25 * 60)   # hard cap
-def run_suite(model: str, max_minutes: int, mode: str = "suite"):
+def run_suite(model: str, max_minutes: int, mode: str = "suite", world: int = 1):
     """All SUITE workloads against ONE vLLM server (max 64 sequences, prefix caching off), one after another, with the
     same AIPerf settings as modal_aipref.py; with lecture=True the Week 7 lecture workload with the lecture's limits."""
     works, max_len, max_seqs = CONFIGS[mode]
-    tag = mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}"
+    tag = (mode if model == "Qwen/Qwen3-4B" else f"{mode}_{model.split('/')[-1]}") + (f"_dp{world}ep" if world > 1 else "")
     # serve the cached snapshot by path (the same files as our server; nothing fetched), under the model's name; the
     # same pinned revision as our runner (PINNED in modal_aipref.py), checked here too, not only on our side
     import importlib.metadata as md
@@ -198,6 +198,8 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
            "--max-num-seqs", str(max_seqs), "--no-enable-prefix-caching", "--port", str(PORT)]
     if mode != "suite":
         cmd += ["--gpu-memory-utilization", "0.90"]
+    if world > 1:   # Part 3: data parallel = expert parallel = world, tensor parallel 1 (--max-num-seqs is per DP rank)
+        cmd += ["--data-parallel-size", str(world), "--tensor-parallel-size", "1", "--enable-expert-parallel"]
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
     stamp, failed = int(time.time()), []
@@ -241,7 +243,8 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite"):
 @app.local_entrypoint()
 def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: bool = False,
          requests: int = 5, max_minutes: int = 25, suite: bool = False, lecture: bool = False, mode: str = "",
-         gpu: str = "h100", yes: bool = False):
+         gpu: str = "h100", world: int = 1, yes: bool = False):
+    gpus = gpu.upper() + (f":{world}" if world > 1 else "")
     if lecture:
         mode = "lecture"
     if mode:
@@ -255,10 +258,11 @@ def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: b
             print("Dry run only. Pass --yes to start.")
         return
     if suite:
-        print(f"PLAN: vLLM {model}, 1 {gpu.upper()}, workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences), "
-              f"benchmark cap {min(max_minutes, 18)} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu]:.2f} of shared credit")
+        print(f"PLAN: vLLM {model}, {world} {gpu.upper()} ({'' if world == 1 else f'--data-parallel-size {world} --enable-expert-parallel, '}"
+              f"TP 1), workload suite {[w[0] for w in SUITE]} (max {SUITE_MAX_SEQS} sequences per engine), "
+              f"benchmark cap {min(max_minutes, 18)} min, container hard cap 25 min -> at most ~${25 / 60 * PRICES[gpu] * world:.2f} of shared credit")
         if yes:
-            run_suite.with_options(gpu=gpu.upper()).remote(model, min(max_minutes, 18))
+            run_suite.with_options(gpu=gpus).remote(model, min(max_minutes, 18), "suite", world)
         else:
             print("Dry run only. Pass --yes to start.")
         return

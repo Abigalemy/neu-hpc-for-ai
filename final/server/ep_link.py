@@ -15,7 +15,9 @@ fake_tick: the fake engine (server.py --fake) has no NCCL; its tick goes to the 
 ranks have sent theirs with the max, the same semantics as the engine's all-reduce, so the launcher, the load balancer
 and park / wake can be tested with real processes on a CPU.
 """
+import os
 import queue
+import sys
 import threading
 from multiprocessing.connection import Client, Listener
 
@@ -28,9 +30,24 @@ class EpLink:
         self.parks = 0
         self._send(("HELLO", rank))
 
+    def _gone(self, e):
+        # the coordinator (launcher) is gone: this rank cannot take part in the group any more; leaving at once is
+        # better than a scheduler loop that keeps failing (the other ranks are stopped by the launcher)
+        print(f"rank {self.rank}: coordinator connection lost ({e!r}); exiting", file=sys.stderr, flush=True)
+        os._exit(3)
+
     def _send(self, msg):
-        with self.lock:
-            self.conn.send(msg)
+        try:
+            with self.lock:
+                self.conn.send(msg)
+        except (EOFError, OSError) as e:
+            self._gone(e)
+
+    def _recv(self):
+        try:
+            return self.conn.recv()
+        except (EOFError, OSError) as e:
+            self._gone(e)
 
     def want(self):
         self._send(("WANT", self.rank))
@@ -39,13 +56,13 @@ class EpLink:
         """All ranks are idle: sleep until the coordinator wakes every rank."""
         self.parks += 1
         self._send(("PARKED", self.rank))
-        msg = self.conn.recv()
+        msg = self._recv()
         if msg != "WAKE":
             raise RuntimeError(f"rank {self.rank}: expected WAKE, got {msg!r}")
 
     def fake_tick(self, have: int) -> int:
         self._send(("TICK", self.rank, have))
-        msg = self.conn.recv()
+        msg = self._recv()
         if not (isinstance(msg, tuple) and msg[0] == "TICK"):
             raise RuntimeError(f"rank {self.rank}: expected a tick result, got {msg!r}")
         return msg[1]
