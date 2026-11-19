@@ -200,8 +200,9 @@ vs `modal_vllm_aipref.py`, same flags); both servers serve the same snapshot (re
 it, vLLM's log prints the path it served, and its runner now checks it too). `tools/check_suite.py` accepts the pair:
 all 6 workloads complete on both sides, planned request counts, no errors, every prompt and every server-reported
 completion (usage) exactly the target length, the same AIPerf version (0.13.0) and input configuration, and the same
-prompt tokens per request counted by both servers (AIPerf's own re-tokenised output length differs by a few tokens on
-both sides and is not used). The servers themselves are compared as they come: memory pool and scheduling are each
+prompt LENGTH per request counted by both servers (e.g. 128 synthetic tokens -> 136 with the chat template; lengths
+only, not a check that the token ids are identical). AIPerf's own re-tokenised output length differs by a few tokens on
+both sides and is not used. The servers themselves are compared as they come: memory pool and scheduling are each
 server's own (vLLM's chunked-prefill budget is its default, not pinned). Mean TTFT / ITL in ms, ratio = ours / vLLM:
 
 | Workload | ours TTFT | vLLM TTFT | TTFT x | ours ITL | vLLM ITL | ITL x |
@@ -220,14 +221,16 @@ think the numbers say (not yet measured stage by stage):
   layer took 0.135 ms for one token on an H100, engine only; 48 layers would be about 6.5 ms of an 11 ms step, an
   extrapolation, not a measurement on the H200). How much of the gap the empty blocks are is not measured; an A/B of
   one layer, including the cost of building the work list, comes first.
-- prefill_heavy ITL is the worst ratio: our scheduler runs every newly admitted prefill (2048 tokens) before the next
-  decode step, so running sequences stall; vLLM mixes prefill chunks into the decode batch under a token budget
-  (chunked prefill), which keeps its ITL flat.
+- prefill_heavy ITL is the worst ratio (45.87 vs 8.24 ms). A hypothesis, not yet measured: our scheduler runs every
+  newly admitted prefill (2048 tokens) before the next decode step (that much is in the code), so running sequences
+  may wait behind it; how vLLM interleaved them in this run and how much of the gap the blocking accounts for are not
+  broken down. A timeline of prefill start/end against token gaps, then a chunked-prefill A/B, would test it.
 - decode_heavy TTFT below 1 (concurrency 32): our scheduler admits new requests ahead of the next decode step, so
   first tokens come early and running sequences pay in ITL. baseline TTFT below 1 cannot be that (concurrency 1: no
   other request is running); its end-to-end TTFT is lower, and where the difference comes from (HTTP, tokenisation,
   prefill) is not broken down.
-- `long_out` TTFT (4.67x) is a single request: chunked prefill cannot help it, only a faster prefill can.
+- `long_out` TTFT (4.67x) is a single request at concurrency 1, so nothing waits on it: the prefill time of 3072
+  tokens is the first thing to look at (this is the HTTP first-token latency, so it also includes the server path).
 
 Over 3x, i.e. the Part 4 list for this model (ratio of means): `long_out` TTFT (target <= 242 ms), `balanced_c16` TTFT
 (<= 450 ms), `balanced_c64` TTFT (<= 1403 ms) and ITL (<= 38.2 ms), `prefill_heavy` TTFT (<= 735 ms) and ITL (<= 24.7
@@ -351,7 +354,8 @@ modal run hw_check.py --yes                        # 2x H200 available? peer acc
 modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container
 modal run modal_test_h100.py --yes --tests paged,paged_bench   # paged vs contiguous attention: bits and timing
 python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf
-python tools/check_suite.py OURS_DIR VLLM_DIR      # accept a paired suite run before reporting it (no GPU)
+python tools/check_suite.py OURS_DIR VLLM_DIR      # accept a paired suite run before reporting it (no GPU, no Modal)
+python tools/check_suite.py --sync                 # the runners' workload lists agree with workloads.py
 ```
 
 Weights come from the Modal volume `qwen3-hf-cache`; unit-test cases come from `modal run gen_cases.py`
