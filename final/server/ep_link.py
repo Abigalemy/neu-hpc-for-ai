@@ -22,13 +22,30 @@ import threading
 from multiprocessing.connection import Client, Listener
 
 
+def exit_with_parent(code: int = 5):
+    """Exit when this process's parent is gone (even after SIGKILL, or a uvicorn that re-raises SIGTERM before the
+    launcher's cleanup runs): a process left behind would hold its port, its GPU, or wait in a collective forever."""
+    import time
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            if os.getppid() != parent:
+                os._exit(code)
+            time.sleep(0.2)
+    threading.Thread(target=watch, daemon=True).start()
+
+
 class EpLink:
-    def __init__(self, address, authkey: bytes, rank: int):
+    """role: "rank" (Part 3: one process does everything), or in Part 5 "core" (engine core: want / park / report),
+    "worker" (fake GPU worker: fake_tick), "api" (API server: load queries)."""
+
+    def __init__(self, address, authkey: bytes, rank: int, role: str = "rank"):
         self.conn = Client(address, authkey=authkey)
-        self.rank = rank
-        self.lock = threading.Lock()          # want() comes from HTTP threads, the rest from the scheduler thread
+        self.rank, self.role = rank, role
+        self.lock = threading.Lock()          # want() comes from HTTP / IO threads, the rest from the scheduler thread
         self.parks = 0
-        self._send(("HELLO", rank))
+        self._send(("HELLO", rank, role))
 
     def _gone(self, e):
         # the coordinator (launcher) is gone: this rank cannot take part in the group any more; leaving at once is
@@ -60,6 +77,18 @@ class EpLink:
         if msg != "WAKE":
             raise RuntimeError(f"rank {self.rank}: expected WAKE, got {msg!r}")
 
+    def report(self, stats: dict):
+        """Engine core -> coordinator: its load (stats["load"] = running + waiting requests) and statistics."""
+        self._send(("REPORT", self.rank, stats))
+
+    def loads(self) -> list:
+        """API server -> coordinator: every engine core's last reported load (only this thread receives on an api link)."""
+        self._send(("LOADQ", self.rank))
+        msg = self._recv()
+        if not (isinstance(msg, tuple) and msg[0] == "LOAD"):
+            raise RuntimeError(f"api {self.rank}: expected loads, got {msg!r}")
+        return msg[1]
+
     def fake_tick(self, have: int) -> int:
         self._send(("TICK", self.rank, have))
         msg = self._recv()
@@ -69,57 +98,70 @@ class EpLink:
 
 
 class Coordinator:
-    """Accepts `world` ranks, then answers PARKED / WANT / TICK in one thread (the only sender)."""
+    """Accepts `world` connections of each role in `roles`, then answers in one thread (the only sender):
+      PARKED / WANT   from "rank" or "core": when every one of them is parked and someone wants to run, WAKE them all
+      TICK            fake all-reduce(max) over the `world` senders, answered to each sender
+      REPORT          an engine core's load and statistics (Part 5's DP coordinator: load balancing)
+      LOADQ           an API server asks for every engine core's load
+      GONE            any process ended: stop (the launcher's watchdog stops the group)"""
 
-    def __init__(self, world: int, authkey: bytes, host: str = "127.0.0.1"):
-        self.world = world
+    def __init__(self, world: int, authkey: bytes, host: str = "127.0.0.1", roles=("rank",)):
+        self.world, self.roles = world, tuple(roles)
         self.listener = Listener((host, 0), authkey=authkey)
         self.address = self.listener.address
-        self.conns = {}
+        self.conns = {}                       # (role, rank) -> connection
         self.inbox = queue.Queue()
         self.parked, self.want, self.ticks = set(), False, {}
-        self.stats = {"wakes": 0, "fake_ticks": 0, "parked_now": 0}
+        self.loads = [0] * world
+        self.stats = {"wakes": 0, "fake_ticks": 0, "parked_now": 0, "cores": [None] * world}
         self.error = None
 
     def accept_all(self):
-        while len(self.conns) < self.world:
+        while len(self.conns) < self.world * len(self.roles):
             c = self.listener.accept()
-            kind, r = c.recv()
-            if kind != "HELLO" or r in self.conns or not 0 <= r < self.world:
-                raise RuntimeError(f"bad hello {kind!r} {r!r}")
-            self.conns[r] = c
-            threading.Thread(target=self._reader, args=(r, c), daemon=True).start()
+            msg = c.recv()
+            key = (msg[2] if len(msg) > 2 else "rank", msg[1])
+            if msg[0] != "HELLO" or key in self.conns or key[0] not in self.roles or not 0 <= key[1] < self.world:
+                raise RuntimeError(f"bad hello {msg!r}")
+            self.conns[key] = c
+            threading.Thread(target=self._reader, args=(key, c), daemon=True).start()
 
-    def _reader(self, r, c):
+    def _reader(self, key, c):
         try:
             while True:
-                self.inbox.put(c.recv())
-        except (EOFError, OSError) as e:          # the rank's process ended: the launcher's watchdog acts on it
-            self.inbox.put(("GONE", r, repr(e)))
+                self.inbox.put((key, c.recv()))
+        except (EOFError, OSError) as e:          # the process ended: the launcher's watchdog acts on it
+            self.inbox.put((key, ("GONE", key[1], repr(e))))
 
     def serve(self):
+        parkers = [k for k in self.conns if k[0] in ("rank", "core")]
         while True:
-            msg = self.inbox.get()
+            key, msg = self.inbox.get()
             kind = msg[0]
             if kind == "PARKED":
-                self.parked.add(msg[1])
+                self.parked.add(key)
             elif kind == "WANT":
                 self.want = True
             elif kind == "TICK":
-                self.ticks[msg[1]] = msg[2]
+                self.ticks[key] = msg[2]
                 if len(self.ticks) == self.world:
                     m = max(self.ticks.values())
+                    for k in self.ticks:
+                        self.conns[k].send(("TICK", m))
                     self.ticks.clear()
                     self.stats["fake_ticks"] += 1
-                    for c in self.conns.values():
-                        c.send(("TICK", m))
+            elif kind == "REPORT":
+                self.loads[msg[1]] = msg[2].get("load", 0)
+                self.stats["cores"][msg[1]] = msg[2]
+            elif kind == "LOADQ":
+                self.conns[key].send(("LOAD", list(self.loads)))
             elif kind == "GONE":
-                self.error = f"rank {msg[1]} disconnected ({msg[2]})"
+                self.error = f"{key[0]} {key[1]} disconnected ({msg[2]})"
                 return
-            if len(self.parked) == self.world and self.want:
+            if len(self.parked) == len(parkers) and self.want:
                 self.want = False
                 self.parked.clear()
                 self.stats["wakes"] += 1
-                for c in self.conns.values():
-                    c.send("WAKE")
+                for k in parkers:
+                    self.conns[k].send("WAKE")
             self.stats["parked_now"] = len(self.parked)

@@ -339,6 +339,11 @@ class Scheduler:
                 r.pos += 1
                 self._accept(r, tok)            # releases r itself when it finishes
 
+    def stats(self) -> dict:
+        return {"world": self.world, "batch_steps": len(self.batch_sizes), "idle_passes": self.idle_passes,
+                "parks": self.link.parks if self.link else 0, "running": len(self.running),
+                "waiting": len(self.waiting), "preemptions": self.preemptions, "free_blocks": self.backend.free_blocks()}
+
     async def tokens(self, prompt_ids: List[int], max_new: int, min_new: int, ignore_eos: bool):
         """Async generator of (token_id, finish_reason or None) for one request."""
         req = GenRequest(prompt_ids, max_new, min_new, ignore_eos, asyncio.get_running_loop())
@@ -375,10 +380,27 @@ class Detokenizer:
         return delta
 
 
+def load_tokenizer(model_dir: str):
+    """The model's tokenizer (transformers, tokenizer only; PyTorch is not needed for it) and every EOS id: the
+    tokenizer's and those of generation_config.json."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    eos = [tok.eos_token_id]
+    gc = os.path.join(model_dir, "generation_config.json")
+    if os.path.exists(gc):
+        e = json.load(open(gc)).get("eos_token_id")
+        eos += e if isinstance(e, list) else ([e] if e is not None else [])
+    return tok, eos
+
+
 # ---------------------------------------------------------------- app
-def create_app(backend, tokenizer, model_name: str, eos_ids: List[int], link=None) -> FastAPI:
+def create_app(backend, tokenizer, model_name: str, eos_ids: List[int], link=None, sched=None) -> FastAPI:
+    """sched: anything with `async tokens(prompt_ids, max_new, min_new, ignore_eos)` -> (token, finish) and `stats()`;
+    default: a Scheduler that owns `backend` in this process. Part 5's API server passes a client of the engine cores
+    instead (server/api_server.py), and `backend` then only gives the limits (vocab, max_len, block_size, num_blocks)."""
     app = FastAPI()
-    sched = Scheduler(backend, eos_ids, link)
+    if sched is None:
+        sched = Scheduler(backend, eos_ids, link)
     app.state.scheduler = sched
 
     def _check(body: dict, n_prompt: int, max_new: int):
@@ -495,9 +517,7 @@ def create_app(backend, tokenizer, model_name: str, eos_ids: List[int], link=Non
 
     @app.get("/stats")
     async def stats():   # for the launcher and tests: what this rank did
-        return {"world": sched.world, "batch_steps": len(sched.batch_sizes), "idle_passes": sched.idle_passes,
-                "parks": sched.link.parks if sched.link else 0, "running": len(sched.running),
-                "waiting": len(sched.waiting)}
+        return sched.stats()
 
     return app
 
@@ -522,7 +542,8 @@ def main():
     a = ap.parse_args()
     link = None
     if a.world > 1:
-        from ep_link import EpLink
+        from ep_link import EpLink, exit_with_parent
+        exit_with_parent()                       # the launcher (part3/launch.py) is the parent
         host, port = a.coord.rsplit(":", 1)
         link = EpLink((host, int(port)), bytes.fromhex(os.environ["QWEN3_COORD_KEY"]), a.rank)
     if a.fake:
@@ -530,13 +551,7 @@ def main():
                               num_blocks=-(-a.kv_tokens // 128) if a.kv_tokens > 0 else None, link=link, world=a.world)
         tok, eos = FakeTokenizer(), [FakeTokenizer.eos_token_id]
     else:
-        from transformers import AutoTokenizer   # tokenizer only; PyTorch is not needed for it
-        tok = AutoTokenizer.from_pretrained(a.model_dir)
-        eos = [tok.eos_token_id]
-        gc = os.path.join(a.model_dir, "generation_config.json")
-        if os.path.exists(gc):
-            e = json.load(open(gc)).get("eos_token_id")
-            eos += e if isinstance(e, list) else ([e] if e is not None else [])
+        tok, eos = load_tokenizer(a.model_dir)
         backend = CBackend(a.lib, a.model_dir, a.max_len, a.max_chunk, a.yarn, a.max_seqs, a.kv_tokens, a.rank, a.world,
                            bytes.fromhex(os.environ.get("QWEN3_NCCL_ID", "")))
         print(f"engine ready: vocab {backend.vocab}, max_len {backend.max_len}, max_seqs {backend.max_seqs}, "

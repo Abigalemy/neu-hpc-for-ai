@@ -70,7 +70,7 @@ def print_versions(pkgs=("aiperf", "huggingface_hub", "transformers")):
 IMAGE = "nvidia/cuda:13.5.0-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE, add_python="3.12")
-    .pip_install("fastapi", "uvicorn", "httpx", "transformers", "aiperf", "huggingface_hub")   # no PyTorch
+    .pip_install("fastapi", "uvicorn", "httpx", "transformers", "aiperf", "huggingface_hub", "pyzmq")   # no PyTorch
     .env({"HF_HOME": HF_DIR, "HF_HUB_OFFLINE": "1"})   # use the cached files only, never the network
     .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases.db"], copy=True)
     .run_commands(
@@ -200,9 +200,9 @@ def run_suite(model: str, max_minutes: int, mode: str = "suite", world: int = 1)
     args = ["--model-dir", snap, "--served-model-name", model, "--port", str(PORT),
             "--max-len", str(max_len), "--max-chunk", str(max(i for _, i, _, _, _ in works) + CHAT_TEMPLATE_MARGIN),
             "--max-seqs", str(max_seqs), "--kv-tokens", str(kv_tokens)]
-    # world > 1 (Part 3): part3/launch.py starts one rank per GPU behind a round-robin balancer on PORT; --max-seqs and
-    # --kv-tokens are per rank, like vLLM's --max-num-seqs per data-parallel engine
-    cmd = (["python", "part3/launch.py", "--world", str(world), "--lib", "build/libqwen3engine.so"] + args if world > 1
+    # world > 1 (Parts 3 + 5): part5/launch.py starts vLLM's layout (balancer on PORT, K API servers, K engine cores, K GPU
+    # workers, DP coordinator); --max-seqs and --kv-tokens are per engine core, like vLLM's --max-num-seqs per DP engine
+    cmd = (["python", "part5/launch.py", "--world", str(world), "--lib", "build/libqwen3engine.so"] + args if world > 1
            else ["python", "server/server.py"] + args)
     print("starting:", " ".join(cmd), flush=True)
     server = subprocess.Popen(cmd)
@@ -262,8 +262,8 @@ def compat_check(model: str = "Qwen/Qwen3-4B", world: int = 1):
         raise RuntimeError(f"engine uses {engine_path} but AIPerf resolves {aiperf_path}")
     os.chdir("/root/final")
     fake = ["--fake", "--port", str(PORT), "--max-len", "8192", "--max-seqs", "8", "--served-model-name", model]
-    # world > 1: the same through part3/launch.py (fake ranks, coordinator, balancer) as the GPU run will use
-    server = subprocess.Popen(["python", "part3/launch.py", "--world", str(world)] + fake if world > 1
+    # world > 1: the same through part5/launch.py (fake workers, all the processes) as the GPU run will use
+    server = subprocess.Popen(["python", "part5/launch.py", "--world", str(world)] + fake if world > 1
                               else ["python", "server/server.py"] + fake)
     try:
         for _ in range(60):
@@ -315,7 +315,7 @@ def main(model: str = "Qwen/Qwen3-4B", isl: int = 3072, osl: int = 1024, yarn: b
         return
     if compat:
         print(f"CPU-only: AIPerf ({model} tokenizer, offline) against the server with the fake engine"
-              f"{f' ({world} fake ranks via part3/launch.py)' if world > 1 else ''} (a few cents)")
+              f"{f' ({world} fake ranks via part5/launch.py)' if world > 1 else ''} (a few cents)")
         raise SystemExit(compat_check.remote(model, world))
     lengths(isl, osl, yarn)   # fails here, locally, before any GPU is started
     print(f"PLAN: our server, {model}, 1 {gpu.upper()}, single sequence {isl} in / {osl} out, {requests} requests, YaRN={yarn}, "
