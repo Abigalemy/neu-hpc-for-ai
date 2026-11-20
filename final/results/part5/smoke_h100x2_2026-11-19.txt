@@ -1,0 +1,66 @@
+PLAN: Part 5 smoke test, Qwen/Qwen3-30B-A3B, H100:2, 1-GPU server then the 2-GPU group, 4 prompts x 32 tokens; container cap 20 min -> at most ~$2.63 of shared credit
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.5.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+weights: /hf_cache/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39 (revision ad44e777bcd18fa416d9da3bd8f70d33ebb85d39, 16 shard(s) checked)
+GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-8e385b77-3652-02d9-9460-3d278045c306)
+GPU 1: NVIDIA H100 80GB HBM3 (UUID: GPU-d8b200f4-853a-a86a-ca28-6fb622202e14)
+
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+weights: 61.06 GB on the GPU (MoE, experts packed per layer)
+KV cache: 128 blocks of 128 tokens = 16384 tokens, 1.61 GB (48 layers)
+MoE workspace: 1024 tokens, 0.05 GB
+engine ready: vocab 151936, max_len 2048, max_seqs 8, KV pool 128 blocks x 128 tokens, YaRN off, eos [151643, 151645]
+1-GPU server: healthy after 40 s
+1-GPU texts: [" Sarah. I am a 22-year-old woman who has been experiencing some issues with my menstrual cycle. I have been having irregular periods, and I have", " Paris. The capital of the United Kingdom is London. The capital of the United States is Washington, D.C. The capital of Brazil is Bras\u00edlia. The", " have a question about the use of the word \"sich\" in German. I know that \"sich\" is used as a 
+engine core 0: pid 41
+engine core 1: pid 42
+api server 0: pid 43
+api server 1: pid 44
+launcher: 2 API servers, 2 engine cores connected; load balancer on port 8000
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+api server 1: pid 44, waiting for 2 engine core(s)
+api server 0: pid 43, waiting for 2 engine core(s)
+engine core 1: pid 42, GPU worker pid 68
+engine core 0: pid 41, GPU worker pid 70
+expert parallelism: rank 0 of 2 holds experts 0..63 (64 of 128 per layer)
+weights: 32.07 GB on the GPU (MoE, experts packed per layer)
+KV cache: 128 blocks of 128 tokens = 16384 tokens, 1.61 GB (48 layers)
+expert parallelism: rank 1 of 2 holds experts 64..127 (64 of 128 per layer)
+weights: 32.07 GB on the GPU (MoE, experts packed per layer)
+KV cache: 128 blocks of 128 tokens = 16384 tokens, 1.61 GB (48 layers)
+MoE workspace: 1024 tokens, 0.05 GB
+EP workspace: up to 16384 received rows (2 ranks x 1024 tokens x 8), 0.26 GB
+MoE workspace: 1024 tokens, 0.05 GB
+EP workspace: up to 16384 received rows (2 ranks x 1024 tokens x 8), 0.26 GB
+engine core 1: worker ready (max_seqs 8, KV pool 128 blocks x 128 tokens)
+engine core 0: worker ready (max_seqs 8, KV pool 128 blocks x 128 tokens)
+api server 1: all engine cores ready; HTTP on port 8002
+api server 0: all engine cores ready; HTTP on port 8001
+Part 5 group (2 GPUs): healthy after 16 s
+rank 0: coordinator connection lost (EOFError()); exiting
+rank 1: coordinator connection lost (EOFError()); exiting
+rank 0: coordinator connection lost (EOFError()); exiting
+rank 1: coordinator connection lost (EOFError()); exiting
+one at a time, 2 GPUs vs 1 GPU: 4/4 texts identical [True, True, True, True]
+all at once (8 requests): 8/8 identical to 1 GPU
+stats after one at a time: sent per API server [[2, 0], [0, 2]]; cores [{'batch_steps': 62, 'idle_passes': 63, 'parks': 4, 'free_blocks': 128}, {'batch_steps': 62, 'idle_passes': 64, 'parks': 5, 'free_blocks': 128}]; wakes 4
+stats after all at once: sent per API server [[5, 1], [2, 4]]; cores [{'batch_steps': 94, 'idle_passes': 64, 'parks': 7, 'free_blocks': 128}, {'batch_steps': 93, 'idle_passes': 66, 'parks': 5, 'free_blocks': 128}]; wakes 6
+PART 5 GPU SMOKE: PASS
+Stopping app - uncaught exception raised locally: SystemExit(0).
+Runner terminated.
