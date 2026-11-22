@@ -285,13 +285,44 @@ cudaError_t launch_moe_router(const T* x, const T* wr, int* idx, T* w, int n, in
     return cudaGetLastError();
 }
 
+// Steps 2-3: count per expert and stable sort by expert of the router's ws.idx for n tokens (ws.count, ws.off,
+// ws.sorted, ws.inv).
+template <typename T, int E, int K>
+cudaError_t moe_sort(int n, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
+    moe_count_kernel<E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count);
+    moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count, ws.sorted, ws.inv, ws.off);
+    return cudaGetLastError();
+}
+
 // Steps 1-3: router, count, stable sort by expert (ws.idx, ws.w, ws.count, ws.off, ws.sorted, ws.inv for n tokens).
 template <typename T, int E, int K>
 cudaError_t moe_route(const T* x, const T* wr, int n, int hid, bool norm_topk, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
     cudaError_t e = launch_moe_router<T, E, K>(x, wr, ws.idx, ws.w, n, hid, norm_topk, s);
     if (e != cudaSuccess) return e;
-    moe_count_kernel<E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count);
-    moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count, ws.sorted, ws.inv, ws.off);
+    return moe_sort<T, E, K>(n, ws, s);
+}
+
+// One half of steps 4-5 (moe_experts below): gate_up = true launches the grouped gate/up + SiLU GEMM into hbuf, false
+// the grouped down GEMM from hbuf into ysorted. Separate so the engine's profile can time each (same kernels, same
+// tile choice, same order as moe_experts).
+template <typename T, int KDIV>
+cudaError_t moe_experts_part(bool gate_up, const T* x, int n_rows, const T* wg, const T* wu, const T* wd, const int* count,
+                             const int* off, const int* sorted, T* hbuf, T* ysorted, int e_base, int e_local, int max_rows,
+                             long long avg_rows, int hid, int inter, cudaStream_t s = 0) {
+    if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
+    if (e_local <= 0 || max_rows <= 0) return cudaSuccess;
+    auto grouped = [&](auto bm) {
+        constexpr int BM = decltype(bm)::value;
+        const int mt = (max_rows + BM - 1) / BM;
+        if (gate_up)
+            moe_gate_up_kernel<T, KDIV, BM, 64, 64><<<dim3(e_local, mt, inter / 64), 1, 0, s>>>(x, n_rows, wg, wu, count, off,
+                                                                                              sorted, hbuf, hid, inter, e_base);
+        else
+            moe_down_kernel<T, BM, 128, 64><<<dim3(e_local, mt, hid / 128), 1, 0, s>>>(hbuf, wd, count, off, ysorted, hid,
+                                                                                      inter, e_base);
+    };
+    if (avg_rows > 32) grouped(std::integral_constant<int, 64>{});      // small batches: small row tiles
+    else grouped(std::integral_constant<int, 16>{});
     return cudaGetLastError();
 }
 
@@ -304,17 +335,11 @@ cudaError_t moe_experts(const T* x, int n_rows, const T* wg, const T* wu, const 
                         int hid, int inter, cudaStream_t s = 0) {
     if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
     if (e_local <= 0 || max_rows <= 0) return cudaSuccess;
-    auto grouped = [&](auto bm) {
-        constexpr int BM = decltype(bm)::value;
-        const int mt = (max_rows + BM - 1) / BM;
-        moe_gate_up_kernel<T, KDIV, BM, 64, 64><<<dim3(e_local, mt, inter / 64), 1, 0, s>>>(x, n_rows, wg, wu, count, off,
-                                                                                          sorted, hbuf, hid, inter, e_base);
-        moe_down_kernel<T, BM, 128, 64><<<dim3(e_local, mt, hid / 128), 1, 0, s>>>(hbuf, wd, count, off, ysorted, hid,
-                                                                                  inter, e_base);
-    };
-    if (avg_rows > 32) grouped(std::integral_constant<int, 64>{});      // small batches: small row tiles
-    else grouped(std::integral_constant<int, 16>{});
-    return cudaGetLastError();
+    cudaError_t e = moe_experts_part<T, KDIV>(true, x, n_rows, wg, wu, wd, count, off, sorted, hbuf, ysorted, e_base, e_local,
+                                              max_rows, avg_rows, hid, inter, s);
+    if (e != cudaSuccess) return e;
+    return moe_experts_part<T, KDIV>(false, x, n_rows, wg, wu, wd, count, off, sorted, hbuf, ysorted, e_base, e_local,
+                                     max_rows, avg_rows, hid, inter, s);
 }
 
 // Step 6: y[t] = sum_j w[t,j] * ysorted[inv[t*K+j]] for n tokens (K = 1, w = 1: a pure permutation, exact).

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <numeric>
 #include <string>
@@ -412,7 +413,7 @@ public:
     }
 
     // ---- profiling -----------------------------------------------------------------------------------------------
-    void prof_reset() { prof_.clear(); }
+    void prof_reset() { prof_.clear(); wall_ms_ = 0; wall_n_ = 0; }
 
     // Table of the stages accumulated since prof_reset(): time per call group, share of the total, achieved memory
     // bandwidth (weights / cache bytes read, a lower bound of real traffic) and achieved TFLOP/s (useful flops).
@@ -434,7 +435,14 @@ public:
             out += buf;
         }
         std::snprintf(buf, sizeof buf, "  %-18s %6s %10.3f\n", "TOTAL (stages)", "", total / divisor);
-        return out + buf;
+        out += buf;
+        if (wall_n_) {   // host clock around each forward: the rest is time the GPU ran no stage (host work, waits)
+            std::snprintf(buf, sizeof buf, "  %-18s %6s %10.3f\n  %-18s %6s %10.3f %6.1f%% of wall\n", "WALL (host clock)", "",
+                          wall_ms_ / divisor, "not in any stage", "", (wall_ms_ - total) / divisor,
+                          wall_ms_ > 0 ? 100.0 * (wall_ms_ - total) / wall_ms_ : 0.0);
+            out += buf;
+        }
+        return out;
     }
 
 private:
@@ -450,6 +458,8 @@ private:
     struct ProfAcc { double ms = 0, bytes = 0, flops = 0; int calls = 0; };
     struct ProfEntry { cudaEvent_t a, b; const char* name; double bytes, flops; };
     std::map<std::string, ProfAcc> prof_;
+    double wall_ms_ = 0;                 // profile: host-clock time of the profiled forwards, and their number
+    int wall_n_ = 0;
     std::vector<ProfEntry> prof_log_;
     std::vector<cudaEvent_t> ev_pool_;
 
@@ -459,7 +469,9 @@ private:
         const bool decode = h_slots != nullptr;
         const int H = cfg.hidden, HQ = cfg.hq, HKV = cfg.hkv, QD = HQ * FA_D, KD = HKV * FA_D;
         const int start_pos = decode ? 0 : h_pos[0];
-        if (ep_.world > 1) tick(1);   // this rank has work: every rank runs this pass (idle ones via idle_tick)
+        const auto t_wall = std::chrono::steady_clock::now();
+        // this rank has work: every rank runs this pass (idle ones via idle_tick)
+        if (ep_.world > 1) stage("ep_tick", 0, 0, [&] { tick(1); });
         // blocks for the positions written now (a no-op when the caller reserved them), then the pool row of each token
         std::vector<int> kv_rows(n);
         for (int i = 0; i < n; ++i) {
@@ -511,14 +523,32 @@ private:
             std::swap(x, other);
             stage("rmsnorm", 2.0 * nn * H * 2, 0, [&] { CKL(rmsnorm_rows(x, L.ln2, h_, n, H)); });
             if (L.router) {   // MoE layer: K of E experts per token (bytes: the experts that can be touched, flops: K)
+                // the steps of launch_moe (same kernels, same order), each its own stage for the profile
                 const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
-                stage("moe", ex_bytes, 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H), [&] {
-                    if (ep_.world > 1)
-                        moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
-                                                   moe_ws_, ep_ws_, ep_, 0, ncclBfloat16);
-                    else
-                        CKL((launch_moe<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk, moe_ws_)));
-                });
+                const double ex_flops = 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H);
+                if (ep_.world > 1) {
+                    moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
+                                               moe_ws_, ep_ws_, ep_, 0, ncclBfloat16,
+                                               [&](const char* name, auto&& f) { stage(name, 0, 0, f); });
+                } else {
+                    if (n > moe_ws_.max_tokens) { std::fprintf(stderr, "moe: %d tokens (workspace %d)\n", n, moe_ws_.max_tokens); std::exit(2); }
+                    const int A = n * cfg.top_k;
+                    stage("moe_router", (double)cfg.experts * H * 2, 2.0 * nn * cfg.experts * H, [&] {
+                        CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk)));
+                    });
+                    stage("moe_sort", 0, 0, [&] { CKL((moe_sort<bf16, 128, 8>(n, moe_ws_))); });
+                    stage("moe_gate_up", ex_bytes * 2 / 3, ex_flops * 2 / 3, [&] {
+                        CKL((moe_experts_part<bf16, 8>(true, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
+                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter)));
+                    });
+                    stage("moe_down", ex_bytes / 3, ex_flops / 3, [&] {
+                        CKL((moe_experts_part<bf16, 8>(false, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
+                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter)));
+                    });
+                    stage("moe_combine", 0, 0, [&] {
+                        CKL((moe_combine<bf16, 8>(moe_ws_.ysorted, A, moe_ws_.inv, moe_ws_.w, o_, n, H)));
+                    });
+                }
                 if (moe_dump_) dump_routing(l, n, h_pos);
             } else {
                 stage("mlp_gate_up_silu", 2.0 * lin_bytes(cfg.inter, H), 2.0 * lin_flops(cfg.inter, H),
@@ -535,7 +565,11 @@ private:
         stage("lm_head", lin_bytes(cfg.vocab, H), 2.0 * rows * cfg.vocab * H,
               [&] { CKL(launch_linear<bf16>(h_, lm_head_, logits_, rows, H, cfg.vocab)); });
         CK(cudaDeviceSynchronize());
-        if (profile) prof_collect();
+        if (profile) {
+            wall_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_wall).count();
+            ++wall_n_;
+            prof_collect();
+        }
         return logits_;
     }
 

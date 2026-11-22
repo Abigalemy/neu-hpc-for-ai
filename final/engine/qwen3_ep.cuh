@@ -50,32 +50,43 @@ struct EpWorkspace {
     std::vector<int> h_counts;             // its host copy
 };
 
+// Default stage hook of moe_ep_layer: just run the step. The engine passes one that times each step (its profile).
+struct EpNoStage {
+    template <typename F> void operator()(const char*, F&& f) const { f(); }
+};
+
 // One MoE layer with expert parallelism. x [n, hid] -> y [n, hid]; n may be 0. ws = the single-GPU workspace (router
 // and sort of the local tokens, the returned rows in ws.ysorted); wg/wu/wd = THIS rank's experts only.
-template <typename T, int E, int K>
+// st(name, fn) runs each step (named ep_*): the engine's profile times them; the host wait for the counts is between
+// ep_pack and ep_dispatch, outside every step, so it shows up as time not in any stage.
+template <typename T, int E, int K, typename St = EpNoStage>
 void moe_ep_layer(const T* x, const T* wr, const T* wg, const T* wu, const T* wd, T* y, int n, int hid, int inter,
                   bool norm_topk, const MoeWorkspace<T>& ws, EpWorkspace<T>& ep, const EpGroup& g, cudaStream_t s,
-                  ncclDataType_t nccl_t) {
+                  ncclDataType_t nccl_t, St st = St{}) {
     auto CKE = [](cudaError_t e, const char* what) {
         if (e != cudaSuccess) { std::fprintf(stderr, "moe_ep %s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
     };
     if (n < 0 || n > ws.max_tokens || n > ep.max_tokens) { std::fprintf(stderr, "moe_ep: %d tokens\n", n); std::exit(2); }
     const int A = n * K, W = g.world;
     // 1. local routing and sort (nothing to route on an idle rank: its counts are zero)
-    if (n > 0) CKE((moe_route<T, E, K>(x, wr, n, hid, norm_topk, ws, s)), "route");
-    else CKE(cudaMemsetAsync(ws.count, 0, E * sizeof(int), s), "zero counts");
+    st("ep_route", [&] {
+        if (n > 0) CKE((moe_route<T, E, K>(x, wr, n, hid, norm_topk, ws, s)), "route");
+        else CKE(cudaMemsetAsync(ws.count, 0, E * sizeof(int), s), "zero counts");
+    });
     // 2. everyone's counts, one host copy
-    NCK(ncclAllGather(ws.count, ep.all_counts, E, ncclInt32, g.comm, s));
+    st("ep_allgather", [&] { NCK(ncclAllGather(ws.count, ep.all_counts, E, ncclInt32, g.comm, s)); });
     ep.h_counts.resize((size_t)W * E);
-    CKE(cudaMemcpyAsync(ep.h_counts.data(), ep.all_counts, (size_t)W * E * sizeof(int), cudaMemcpyDeviceToHost, s), "counts");
-    // 3. send buffer (overlaps the copy above on the same stream; the host waits once, below)
-    if (A > 0) {
-        constexpr int BR = 16, BN = 256, BA = 128;
-        moe_gather_rows_kernel<T, K, BR, BN><<<dim3((A + BR - 1) / BR, (hid + BN - 1) / BN, 1), 1, 0, s>>>(x, n, ws.sorted, A,
-                                                                                                  ep.send_rows, hid);
-        moe_gather_ids_kernel<BA><<<(A + BA - 1) / BA, 1, 0, s>>>(ws.idx, ws.sorted, A, ep.send_ids);
-        CKE(cudaGetLastError(), "gather");
-    }
+    st("ep_pack", [&] {
+        CKE(cudaMemcpyAsync(ep.h_counts.data(), ep.all_counts, (size_t)W * E * sizeof(int), cudaMemcpyDeviceToHost, s), "counts");
+        // 3. send buffer (overlaps the copy above on the same stream; the host waits once, below)
+        if (A > 0) {
+            constexpr int BR = 16, BN = 256, BA = 128;
+            moe_gather_rows_kernel<T, K, BR, BN><<<dim3((A + BR - 1) / BR, (hid + BN - 1) / BN, 1), 1, 0, s>>>(x, n, ws.sorted, A,
+                                                                                                      ep.send_rows, hid);
+            moe_gather_ids_kernel<BA><<<(A + BA - 1) / BA, 1, 0, s>>>(ws.idx, ws.sorted, A, ep.send_ids);
+            CKE(cudaGetLastError(), "gather");
+        }
+    });
     CKE(cudaStreamSynchronize(s), "sync");
     std::vector<int> scnt(W), soff(W), rcnt(W), roff(W);
     for (int q = 0; q < W; ++q) {
@@ -100,21 +111,32 @@ void moe_ep_layer(const T* x, const T* wr, const T* wg, const T* wu, const T* wd
         }
         NCK(ncclGroupEnd());
     };
-    a2a(ep.send_rows, ep.recv_rows, hid, nccl_t, sizeof(T), scnt, soff, rcnt, roff);
-    a2a(ep.send_ids, ep.recv_ids, 1, ncclInt32, sizeof(int), scnt, soff, rcnt, roff);
+    st("ep_dispatch", [&] {
+        a2a(ep.send_rows, ep.recv_rows, hid, nccl_t, sizeof(T), scnt, soff, rcnt, roff);
+        a2a(ep.send_ids, ep.recv_ids, 1, ncclInt32, sizeof(int), scnt, soff, rcnt, roff);
+    });
     // 5. computation on the received rows, with this rank's experts only
     if (R > 0) {
-        moe_count_kernel<E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count);
-        moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count, ep.r_sorted, ep.r_inv, ep.r_off);
-        CKE(cudaGetLastError(), "recv sort");
+        st("ep_recv_sort", [&] {
+            moe_count_kernel<E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count);
+            moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count, ep.r_sorted, ep.r_inv, ep.r_off);
+            CKE(cudaGetLastError(), "recv sort");
+        });
         // any one expert has at most W * n_max rows (a token picks an expert once): R bounds it
-        CKE((moe_experts<T, 1>(ep.recv_rows, R, wg, wu, wd, ep.r_count, ep.r_off, ep.r_sorted, ep.r_hbuf, ep.r_ysorted, g.e0(),
-                               g.e_local(), R, (long long)R / std::max(1, g.e_local()), hid, inter, s)), "experts");
-        CKE((moe_combine<T, 1>(ep.r_ysorted, R, ep.r_inv, ep.ones, ep.r_y, R, hid, s)), "unsort");
+        const long long avg = (long long)R / std::max(1, g.e_local());
+        st("ep_gate_up", [&] {
+            CKE((moe_experts_part<T, 1>(true, ep.recv_rows, R, wg, wu, wd, ep.r_count, ep.r_off, ep.r_sorted, ep.r_hbuf,
+                                        ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s)), "gate_up");
+        });
+        st("ep_down", [&] {
+            CKE((moe_experts_part<T, 1>(false, ep.recv_rows, R, wg, wu, wd, ep.r_count, ep.r_off, ep.r_sorted, ep.r_hbuf,
+                                        ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s)), "down");
+        });
+        st("ep_unsort", [&] { CKE((moe_combine<T, 1>(ep.r_ysorted, R, ep.r_inv, ep.ones, ep.r_y, R, hid, s)), "unsort"); });
     }
     // 6. back to the owners (counts swapped), then the weighted combine of Part 1
-    a2a(ep.r_y, ws.ysorted, hid, nccl_t, sizeof(T), rcnt, roff, scnt, soff);
-    if (n > 0) CKE((moe_combine<T, K>(ws.ysorted, A, ws.inv, ws.w, y, n, hid, s)), "combine");
+    st("ep_return", [&] { a2a(ep.r_y, ws.ysorted, hid, nccl_t, sizeof(T), rcnt, roff, scnt, soff); });
+    if (n > 0) st("ep_combine", [&] { CKE((moe_combine<T, K>(ws.ysorted, A, ws.inv, ws.w, y, n, hid, s)), "combine"); });
 }
 
 template <typename T>
