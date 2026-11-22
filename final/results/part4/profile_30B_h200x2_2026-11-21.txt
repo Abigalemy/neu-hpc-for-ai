@@ -1,0 +1,429 @@
+===== rank 0 (exit code 0)
+expert parallelism: rank 0 of 2 holds experts 0..63 (64 of 128 per layer)
+weights: 32.07 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1600 blocks of 128 tokens = 204800 tokens, 20.13 GB (48 layers)
+MoE workspace: 3072 tokens, 0.14 GB
+EP workspace: up to 49152 received rows (2 ranks x 3072 tokens x 8), 0.78 GB
+rank 0 of 2: loaded in 21.3 s; max_len 3080, max_chunk 3072, 64 slots
+PROFILE rank 0/2 prefill 256 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48     51.774   50.4%        0.0       0.00
+  ep_down                48     22.618   22.0%        0.0       0.00
+  ep_return              48      6.367    6.2%        0.0       0.00
+  ep_pack                48      2.968    2.9%        0.0       0.00
+  ep_dispatch            48      2.699    2.6%        0.0       0.00
+  ep_route               48      2.367    2.3%        0.0       0.00
+  ep_unsort              48      2.207    2.1%        0.0       0.00
+  ep_recv_sort           48      1.701    1.7%        0.0       0.00
+  o_proj                 48      1.281    1.2%      628.9     160.99
+  ep_combine             48      1.179    1.1%        0.0       0.00
+  qk_norm                48      1.108    1.1%      204.3       0.00
+  q_proj                 48      0.874    0.9%      921.9     236.00
+  rmsnorm                97      0.843    0.8%      238.7       0.00
+  residual_add           96      0.839    0.8%      359.8       0.00
+  v_proj                 48      0.793    0.8%      127.0      32.51
+  k_proj                 48      0.790    0.8%      127.4      32.61
+  attention              48      0.700    0.7%       36.0      36.97
+  ep_allgather           48      0.562    0.5%        0.0       0.00
+  rope                   48      0.464    0.5%      488.5       0.00
+  kv_write               48      0.311    0.3%      162.0       0.00
+  lm_head                 1      0.186    0.2%     3339.3       3.34
+  ep_tick                 1      0.062    0.1%        0.0       0.00
+  embedding               1      0.016    0.0%       64.4       0.00
+  TOTAL (stages)               102.708
+  WALL (host clock)            107.027
+  not in any stage               4.319    4.0% of wall
+
+PROFILE rank 0/2 prefill 2048 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48    322.570   54.7%        0.0       0.00
+  ep_down                48    124.515   21.1%        0.0       0.00
+  ep_return              48     54.224    9.2%        0.0       0.00
+  ep_unsort              48     13.610    2.3%        0.0       0.00
+  ep_pack                48     13.402    2.3%        0.0       0.00
+  ep_recv_sort           48     10.017    1.7%        0.0       0.00
+  ep_route               48      9.986    1.7%        0.0       0.00
+  attention              48      8.854    1.5%       22.7     186.37
+  ep_dispatch            48      8.547    1.4%        0.0       0.00
+  qk_norm                48      7.319    1.2%      247.6       0.00
+  ep_combine             48      4.238    0.7%        0.0       0.00
+  q_proj                 48      2.648    0.4%      304.2     622.92
+  o_proj                 48      2.439    0.4%      330.2     676.30
+  rmsnorm                97      1.709    0.3%      942.6       0.00
+  residual_add           96      1.487    0.3%     1625.1       0.00
+  k_proj                 48      0.906    0.2%      111.1     227.58
+  v_proj                 48      0.839    0.1%      119.9     245.63
+  rope                   48      0.761    0.1%     2380.8       0.00
+  ep_allgather           48      0.735    0.1%        0.0       0.00
+  kv_write               48      0.427    0.1%      942.0       0.00
+  lm_head                 1      0.184    0.0%     3381.1       3.38
+  ep_tick                 1      0.055    0.0%        0.0       0.00
+  embedding               1      0.016    0.0%      524.3       0.00
+  TOTAL (stages)               589.488
+  WALL (host clock)            593.601
+  not in any stage               4.113    0.7% of wall
+
+PROFILE rank 0/2 prefill 3072 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48    479.310   54.8%        0.0       0.00
+  ep_down                48    184.574   21.1%        0.0       0.00
+  ep_return              48     79.337    9.1%        0.0       0.00
+  ep_unsort              48     20.123    2.3%        0.0       0.00
+  ep_pack                48     19.361    2.2%        0.0       0.00
+  attention              48     17.253    2.0%       17.5     215.15
+  ep_route               48     15.017    1.7%        0.0       0.00
+  ep_recv_sort           48     14.748    1.7%        0.0       0.00
+  ep_dispatch            48     11.730    1.3%        0.0       0.00
+  qk_norm                48     11.098    1.3%      244.9       0.00
+  ep_combine             48      5.837    0.7%        0.0       0.00
+  q_proj                 48      3.972    0.5%      202.8     622.89
+  o_proj                 48      3.814    0.4%      211.1     648.61
+  rmsnorm                97      2.141    0.2%     1128.2       0.00
+  residual_add           96      1.895    0.2%     1912.7       0.00
+  rope                   48      1.003    0.1%     2709.6       0.00
+  k_proj                 48      0.898    0.1%      112.1     344.47
+  ep_allgather           48      0.861    0.1%        0.0       0.00
+  v_proj                 48      0.843    0.1%      119.4     366.78
+  kv_write               48      0.484    0.1%     1248.2       0.00
+  lm_head                 1      0.184    0.0%     3386.3       3.39
+  ep_tick                 1      0.072    0.0%        0.0       0.00
+  embedding               1      0.022    0.0%      578.3       0.00
+  TOTAL (stages)               874.576
+  WALL (host clock)            878.659
+  not in any stage               4.084    0.5% of wall
+
+PROFILE rank 0/2 decode batch 1, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48      2.969   17.5%        0.0       0.00
+  ep_down                48      1.369    8.1%        0.0       0.00
+  ep_route               48      1.288    7.6%        0.0       0.00
+  ep_dispatch            48      1.251    7.4%        0.0       0.00
+  ep_pack                48      1.197    7.1%        0.0       0.00
+  o_proj                 48      0.889    5.2%      906.1       0.91
+  attention              48      0.798    4.7%       32.9       0.26
+  rmsnorm                97      0.774    4.6%        1.0       0.00
+  residual_add           96      0.699    4.1%        1.7       0.00
+  ep_return              48      0.697    4.1%        0.0       0.00
+  q_proj                 48      0.686    4.0%     1173.1       1.17
+  ep_combine             48      0.626    3.7%        0.0       0.00
+  v_proj                 48      0.538    3.2%      187.0       0.19
+  k_proj                 48      0.533    3.1%      188.7       0.19
+  ep_recv_sort           48      0.463    2.7%        0.0       0.00
+  ep_allgather           48      0.436    2.6%        0.0       0.00
+  rope                   48      0.412    2.4%        2.1       0.00
+  qk_norm                48      0.409    2.4%        2.2       0.00
+  ep_unsort              48      0.398    2.3%        0.0       0.00
+  kv_write               48      0.279    1.6%        0.7       0.00
+  lm_head                 1      0.181    1.1%     3430.4       3.43
+  ep_tick                 1      0.049    0.3%        0.0       0.00
+  embedding               1      0.012    0.1%        0.3       0.00
+  TOTAL (stages)                16.954
+  WALL (host clock)             20.975
+  not in any stage               4.020   19.2% of wall
+
+PROFILE rank 0/2 decode batch 8, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48      4.200   19.7%        0.0       0.00
+  ep_down                48      2.120   10.0%        0.0       0.00
+  attention              48      1.836    8.6%      114.6       0.92
+  ep_dispatch            48      1.497    7.0%        0.0       0.00
+  ep_return              48      1.315    6.2%        0.0       0.00
+  ep_route               48      1.292    6.1%        0.0       0.00
+  ep_pack                48      1.261    5.9%        0.0       0.00
+  o_proj                 48      0.940    4.4%      856.4       6.85
+  rmsnorm                97      0.785    3.7%        8.0       0.00
+  ep_combine             48      0.783    3.7%        0.0       0.00
+  residual_add           96      0.760    3.6%       12.4       0.00
+  q_proj                 48      0.671    3.1%     1200.4       9.60
+  v_proj                 48      0.541    2.5%      186.0       1.49
+  k_proj                 48      0.535    2.5%      188.1       1.50
+  ep_unsort              48      0.486    2.3%        0.0       0.00
+  ep_recv_sort           48      0.478    2.2%        0.0       0.00
+  ep_allgather           48      0.446    2.1%        0.0       0.00
+  rope                   48      0.422    2.0%       16.8       0.00
+  qk_norm                48      0.417    2.0%       17.0       0.00
+  kv_write               48      0.282    1.3%        5.6       0.00
+  lm_head                 1      0.176    0.8%     3530.8      28.25
+  ep_tick                 1      0.047    0.2%        0.0       0.00
+  embedding               1      0.011    0.1%        2.9       0.00
+  TOTAL (stages)                21.302
+  WALL (host clock)             25.330
+  not in any stage               4.028   15.9% of wall
+
+PROFILE rank 0/2 decode batch 32, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48      9.232   27.2%        0.0       0.00
+  ep_down                48      4.518   13.3%        0.0       0.00
+  attention              48      4.417   13.0%      190.5       1.52
+  ep_return              48      2.934    8.7%        0.0       0.00
+  ep_dispatch            48      1.620    4.8%        0.0       0.00
+  ep_route               48      1.404    4.1%        0.0       0.00
+  ep_pack                48      1.388    4.1%        0.0       0.00
+  ep_combine             48      1.075    3.2%        0.0       0.00
+  o_proj                 48      0.875    2.6%      920.4      29.45
+  residual_add           96      0.789    2.3%       47.8       0.00
+  rmsnorm                97      0.786    2.3%       32.0       0.00
+  q_proj                 48      0.666    2.0%     1209.2      38.69
+  ep_recv_sort           48      0.630    1.9%        0.0       0.00
+  ep_unsort              48      0.623    1.8%        0.0       0.00
+  v_proj                 48      0.543    1.6%      185.3       5.93
+  k_proj                 48      0.540    1.6%      186.3       5.96
+  qk_norm                48      0.475    1.4%       59.6       0.00
+  ep_allgather           48      0.454    1.3%        0.0       0.00
+  rope                   48      0.421    1.2%       67.3       0.00
+  kv_write               48      0.292    0.9%       21.5       0.00
+  lm_head                 1      0.166    0.5%     3753.5     120.11
+  ep_tick                 1      0.049    0.1%        0.0       0.00
+  embedding               1      0.011    0.0%       12.4       0.00
+  TOTAL (stages)                33.909
+  WALL (host clock)             37.931
+  not in any stage               4.022   10.6% of wall
+
+PROFILE rank 0/2 decode batch 64, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48     16.306   31.9%        0.0       0.00
+  attention              48      8.270   16.2%      203.5       1.63
+  ep_down                48      7.823   15.3%        0.0       0.00
+  ep_return              48      5.067    9.9%        0.0       0.00
+  ep_dispatch            48      1.711    3.3%        0.0       0.00
+  ep_pack                48      1.588    3.1%        0.0       0.00
+  ep_route               48      1.552    3.0%        0.0       0.00
+  ep_combine             48      1.072    2.1%        0.0       0.00
+  o_proj                 48      0.847    1.7%      950.7      60.85
+  residual_add           96      0.831    1.6%       90.9       0.00
+  ep_unsort              48      0.821    1.6%        0.0       0.00
+  rmsnorm                97      0.795    1.6%       63.3       0.00
+  ep_recv_sort           48      0.763    1.5%        0.0       0.00
+  q_proj                 48      0.648    1.3%     1241.9      79.48
+  qk_norm                48      0.564    1.1%      100.4       0.00
+  v_proj                 48      0.554    1.1%      181.6      11.63
+  k_proj                 48      0.551    1.1%      182.7      11.69
+  ep_allgather           48      0.452    0.9%        0.0       0.00
+  rope                   48      0.426    0.8%      133.0       0.00
+  kv_write               48      0.300    0.6%       42.0       0.00
+  lm_head                 1      0.163    0.3%     3817.2     244.30
+  ep_tick                 1      0.048    0.1%        0.0       0.00
+  embedding               1      0.011    0.0%       23.6       0.00
+  TOTAL (stages)                51.165
+  WALL (host clock)             55.193
+  not in any stage               4.028    7.3% of wall
+
+rank 0: PROFILE DONE
+
+===== rank 1 (exit code 0)
+expert parallelism: rank 1 of 2 holds experts 64..127 (64 of 128 per layer)
+weights: 32.07 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1600 blocks of 128 tokens = 204800 tokens, 20.13 GB (48 layers)
+MoE workspace: 3072 tokens, 0.14 GB
+EP workspace: up to 49152 received rows (2 ranks x 3072 tokens x 8), 0.78 GB
+rank 1 of 2: loaded in 21.3 s; max_len 3080, max_chunk 3072, 64 slots
+PROFILE rank 1/2 prefill 256 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48     48.612   47.2%        0.0       0.00
+  ep_down                48     21.822   21.2%        0.0       0.00
+  ep_return              48     10.837   10.5%        0.0       0.00
+  ep_pack                48      2.951    2.9%        0.0       0.00
+  ep_dispatch            48      2.767    2.7%        0.0       0.00
+  ep_route               48      2.369    2.3%        0.0       0.00
+  ep_unsort              48      1.938    1.9%        0.0       0.00
+  ep_recv_sort           48      1.552    1.5%        0.0       0.00
+  o_proj                 48      1.276    1.2%      630.9     161.52
+  ep_combine             48      1.160    1.1%        0.0       0.00
+  qk_norm                48      1.124    1.1%      201.6       0.00
+  q_proj                 48      0.866    0.8%      929.5     237.95
+  rmsnorm                97      0.814    0.8%      247.3       0.00
+  residual_add           96      0.814    0.8%      371.0       0.00
+  v_proj                 48      0.790    0.8%      127.4      32.61
+  k_proj                 48      0.785    0.8%      128.2      32.81
+  ep_allgather           48      0.731    0.7%        0.0       0.00
+  attention              48      0.692    0.7%       36.4      37.38
+  rope                   48      0.462    0.4%      489.9       0.00
+  kv_write               48      0.306    0.3%      164.4       0.00
+  lm_head                 1      0.185    0.2%     3360.6       3.36
+  ep_tick                 1      0.065    0.1%        0.0       0.00
+  embedding               1      0.017    0.0%       60.3       0.00
+  TOTAL (stages)               102.939
+  WALL (host clock)            107.021
+  not in any stage               4.082    3.8% of wall
+
+PROFILE rank 1/2 prefill 2048 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48    272.550   46.2%        0.0       0.00
+  ep_return              48    127.533   21.6%        0.0       0.00
+  ep_down                48    105.064   17.8%        0.0       0.00
+  ep_pack                48     13.426    2.3%        0.0       0.00
+  ep_unsort              48     11.502    2.0%        0.0       0.00
+  ep_route               48      9.991    1.7%        0.0       0.00
+  attention              48      8.846    1.5%       22.8     186.54
+  ep_dispatch            48      8.507    1.4%        0.0       0.00
+  ep_recv_sort           48      8.465    1.4%        0.0       0.00
+  qk_norm                48      7.329    1.2%      247.2       0.00
+  ep_combine             48      4.242    0.7%        0.0       0.00
+  q_proj                 48      2.633    0.4%      305.9     626.48
+  o_proj                 48      2.427    0.4%      331.8     679.47
+  rmsnorm                97      1.705    0.3%      944.8       0.00
+  residual_add           96      1.489    0.3%     1622.8       0.00
+  k_proj                 48      0.890    0.2%      113.1     231.68
+  v_proj                 48      0.836    0.1%      120.5     246.70
+  ep_allgather           48      0.796    0.1%        0.0       0.00
+  rope                   48      0.750    0.1%     2414.8       0.00
+  kv_write               48      0.419    0.1%      960.3       0.00
+  lm_head                 1      0.184    0.0%     3383.4       3.38
+  ep_tick                 1      0.065    0.0%        0.0       0.00
+  embedding               1      0.014    0.0%      586.5       0.00
+  TOTAL (stages)               589.661
+  WALL (host clock)            593.597
+  not in any stage               3.936    0.7% of wall
+
+PROFILE rank 1/2 prefill 3072 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48    403.773   46.2%        0.0       0.00
+  ep_return              48    190.052   21.7%        0.0       0.00
+  ep_down                48    155.131   17.7%        0.0       0.00
+  ep_pack                48     19.426    2.2%        0.0       0.00
+  attention              48     17.267    2.0%       17.5     214.98
+  ep_unsort              48     16.934    1.9%        0.0       0.00
+  ep_route               48     15.030    1.7%        0.0       0.00
+  ep_recv_sort           48     12.408    1.4%        0.0       0.00
+  ep_dispatch            48     11.628    1.3%        0.0       0.00
+  qk_norm                48     11.110    1.3%      244.6       0.00
+  ep_combine             48      5.880    0.7%        0.0       0.00
+  q_proj                 48      3.939    0.5%      204.4     628.01
+  o_proj                 48      3.757    0.4%      214.4     658.48
+  rmsnorm                97      2.182    0.2%     1107.2       0.00
+  residual_add           96      1.876    0.2%     1931.4       0.00
+  rope                   48      1.001    0.1%     2715.9       0.00
+  k_proj                 48      0.891    0.1%      113.0     347.04
+  v_proj                 48      0.837    0.1%      120.2     369.29
+  ep_allgather           48      0.790    0.1%        0.0       0.00
+  kv_write               48      0.480    0.1%     1258.0       0.00
+  lm_head                 1      0.186    0.0%     3347.9       3.35
+  ep_tick                 1      0.084    0.0%        0.0       0.00
+  embedding               1      0.022    0.0%      572.4       0.00
+  TOTAL (stages)               874.683
+  WALL (host clock)            878.659
+  not in any stage               3.976    0.5% of wall
+
+PROFILE rank 1/2 decode batch 1, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48      2.959   17.2%        0.0       0.00
+  ep_down                48      1.367    8.0%        0.0       0.00
+  ep_route               48      1.280    7.5%        0.0       0.00
+  ep_dispatch            48      1.265    7.4%        0.0       0.00
+  ep_pack                48      1.184    6.9%        0.0       0.00
+  o_proj                 48      0.879    5.1%      916.4       0.92
+  attention              48      0.793    4.6%       33.2       0.27
+  ep_return              48      0.780    4.5%        0.0       0.00
+  rmsnorm                97      0.766    4.5%        1.0       0.00
+  residual_add           96      0.684    4.0%        1.7       0.00
+  q_proj                 48      0.682    4.0%     1181.3       1.18
+  ep_allgather           48      0.651    3.8%        0.0       0.00
+  ep_combine             48      0.617    3.6%        0.0       0.00
+  v_proj                 48      0.534    3.1%      188.4       0.19
+  k_proj                 48      0.530    3.1%      190.0       0.19
+  ep_recv_sort           48      0.458    2.7%        0.0       0.00
+  qk_norm                48      0.408    2.4%        2.2       0.00
+  rope                   48      0.404    2.4%        2.2       0.00
+  ep_unsort              48      0.391    2.3%        0.0       0.00
+  kv_write               48      0.271    1.6%        0.7       0.00
+  lm_head                 1      0.182    1.1%     3421.4       3.42
+  ep_tick                 1      0.074    0.4%        0.0       0.00
+  embedding               1      0.011    0.1%        0.4       0.00
+  TOTAL (stages)                17.169
+  WALL (host clock)             20.998
+  not in any stage               3.829   18.2% of wall
+
+PROFILE rank 1/2 decode batch 8, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48      4.119   19.2%        0.0       0.00
+  ep_down                48      2.082    9.7%        0.0       0.00
+  attention              48      1.840    8.6%      114.3       0.91
+  ep_return              48      1.527    7.1%        0.0       0.00
+  ep_dispatch            48      1.494    6.9%        0.0       0.00
+  ep_route               48      1.282    6.0%        0.0       0.00
+  ep_pack                48      1.265    5.9%        0.0       0.00
+  o_proj                 48      0.936    4.4%      860.7       6.89
+  rmsnorm                97      0.781    3.6%        8.1       0.00
+  ep_combine             48      0.776    3.6%        0.0       0.00
+  residual_add           96      0.741    3.4%       12.7       0.00
+  q_proj                 48      0.675    3.1%     1193.8       9.55
+  ep_allgather           48      0.620    2.9%        0.0       0.00
+  v_proj                 48      0.538    2.5%      186.9       1.50
+  k_proj                 48      0.534    2.5%      188.6       1.51
+  ep_unsort              48      0.481    2.2%        0.0       0.00
+  ep_recv_sort           48      0.466    2.2%        0.0       0.00
+  qk_norm                48      0.418    1.9%       16.9       0.00
+  rope                   48      0.411    1.9%       17.2       0.00
+  kv_write               48      0.274    1.3%        5.7       0.00
+  lm_head                 1      0.176    0.8%     3528.7      28.23
+  ep_tick                 1      0.060    0.3%        0.0       0.00
+  embedding               1      0.011    0.1%        2.9       0.00
+  TOTAL (stages)                21.506
+  WALL (host clock)             25.341
+  not in any stage               3.835   15.1% of wall
+
+PROFILE rank 1/2 decode batch 32, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48      8.752   25.7%        0.0       0.00
+  attention              48      4.421   13.0%      190.3       1.52
+  ep_down                48      4.299   12.6%        0.0       0.00
+  ep_return              48      3.734   11.0%        0.0       0.00
+  ep_dispatch            48      1.592    4.7%        0.0       0.00
+  ep_pack                48      1.413    4.1%        0.0       0.00
+  ep_route               48      1.397    4.1%        0.0       0.00
+  ep_combine             48      1.072    3.1%        0.0       0.00
+  o_proj                 48      0.866    2.5%      929.7      29.75
+  rmsnorm                97      0.776    2.3%       32.4       0.00
+  residual_add           96      0.775    2.3%       48.7       0.00
+  q_proj                 48      0.665    2.0%     1210.1      38.72
+  ep_allgather           48      0.635    1.9%        0.0       0.00
+  ep_recv_sort           48      0.612    1.8%        0.0       0.00
+  ep_unsort              48      0.599    1.8%        0.0       0.00
+  v_proj                 48      0.540    1.6%      186.4       5.96
+  k_proj                 48      0.537    1.6%      187.4       6.00
+  qk_norm                48      0.470    1.4%       60.2       0.00
+  rope                   48      0.414    1.2%       68.3       0.00
+  kv_write               48      0.284    0.8%       22.1       0.00
+  lm_head                 1      0.165    0.5%     3769.6     120.63
+  ep_tick                 1      0.050    0.1%        0.0       0.00
+  embedding               1      0.011    0.0%       12.0       0.00
+  TOTAL (stages)                34.083
+  WALL (host clock)             37.931
+  not in any stage               3.848   10.1% of wall
+
+PROFILE rank 1/2 decode batch 64, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  ep_gate_up             48     15.341   29.9%        0.0       0.00
+  attention              48      8.266   16.1%      203.6       1.63
+  ep_down                48      7.369   14.4%        0.0       0.00
+  ep_return              48      6.603   12.9%        0.0       0.00
+  ep_dispatch            48      1.692    3.3%        0.0       0.00
+  ep_pack                48      1.610    3.1%        0.0       0.00
+  ep_route               48      1.534    3.0%        0.0       0.00
+  ep_combine             48      1.074    2.1%        0.0       0.00
+  o_proj                 48      0.841    1.6%      957.3      61.26
+  residual_add           96      0.797    1.6%       94.7       0.00
+  ep_unsort              48      0.788    1.5%        0.0       0.00
+  rmsnorm                97      0.785    1.5%       64.1       0.00
+  ep_recv_sort           48      0.737    1.4%        0.0       0.00
+  ep_allgather           48      0.663    1.3%        0.0       0.00
+  q_proj                 48      0.649    1.3%     1240.8      79.41
+  qk_norm                48      0.560    1.1%      101.0       0.00
+  v_proj                 48      0.550    1.1%      183.1      11.72
+  k_proj                 48      0.547    1.1%      184.1      11.78
+  rope                   48      0.417    0.8%      135.9       0.00
+  kv_write               48      0.291    0.6%       43.2       0.00
+  lm_head                 1      0.163    0.3%     3829.3     245.08
+  ep_tick                 1      0.050    0.1%        0.0       0.00
+  embedding               1      0.011    0.0%       24.5       0.00
+  TOTAL (stages)                51.337
+  WALL (host clock)             55.190
+  not in any stage               3.853    7.0% of wall
+
+rank 1: PROFILE DONE
+
+saved to volume final-results:profile_30B_w2_1795309781.txt
+Stopping app - uncaught exception raised locally: SystemExit(0).
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+KeyboardInterrupt
