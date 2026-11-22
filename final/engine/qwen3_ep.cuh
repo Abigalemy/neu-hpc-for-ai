@@ -46,6 +46,7 @@ struct EpWorkspace {
     T* recv_rows = nullptr;  int* recv_ids = nullptr;      // [world*N*K]
     int *r_count = nullptr, *r_off = nullptr, *r_sorted = nullptr, *r_inv = nullptr;   // receiver's own sort (K = 1)
     T *r_hbuf = nullptr, *r_ysorted = nullptr, *r_y = nullptr, *ones = nullptr;
+    int* r_tiles = nullptr;                // work list of the expert GEMMs on the received rows (Part 4)
     int* all_counts = nullptr;             // [world, E] on the device
     std::vector<int> h_counts;             // its host copy
 };
@@ -124,13 +125,15 @@ void moe_ep_layer(const T* x, const T* wr, const T* wg, const T* wu, const T* wd
         });
         // any one expert has at most W * n_max rows (a token picks an expert once): R bounds it
         const long long avg = (long long)R / std::max(1, g.e_local());
+        // Part 4 (C3): a block per non-empty (expert, row tile) instead of e_local x R / BM (the 2x H200 profile)
+        st("ep_tiles", [&] { CKE((moe_tile_list<E>(ep.r_count, g.e0(), g.e_local(), R, avg, ep.r_tiles, s)), "tiles"); });
         st("ep_gate_up", [&] {
             CKE((moe_experts_part<T, 1>(true, ep.recv_rows, R, wg, wu, wd, ep.r_count, ep.r_off, ep.r_sorted, ep.r_hbuf,
-                                        ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s)), "gate_up");
+                                        ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s, ep.r_tiles, R)), "gate_up");
         });
         st("ep_down", [&] {
             CKE((moe_experts_part<T, 1>(false, ep.recv_rows, R, wg, wu, wd, ep.r_count, ep.r_off, ep.r_sorted, ep.r_hbuf,
-                                        ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s)), "down");
+                                        ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s, ep.r_tiles, R)), "down");
         });
         st("ep_unsort", [&] { CKE((moe_combine<T, 1>(ep.r_ysorted, R, ep.r_inv, ep.ones, ep.r_y, R, hid, s)), "unsort"); });
     }
@@ -155,6 +158,7 @@ void alloc_ep_workspace(EpWorkspace<T>& ep, int N, int K, int E, int hid, int in
     A(ep.r_count, E); A(ep.r_off, E); A(ep.r_sorted, R); A(ep.r_inv, R);
     A(ep.r_hbuf, R * inter); A(ep.r_ysorted, R * hid); A(ep.r_y, R * hid); A(ep.ones, R);
     A(ep.all_counts, (size_t)world * E);
+    A(ep.r_tiles, 2 * (size_t)moe_tile_cap((long long)R, 16, E));
     std::vector<T> one(R, T(1.0f));
     if (cudaMemcpy(ep.ones, one.data(), R * sizeof(T), cudaMemcpyHostToDevice) != cudaSuccess) std::exit(2);
 }

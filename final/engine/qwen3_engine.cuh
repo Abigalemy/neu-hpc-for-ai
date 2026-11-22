@@ -289,6 +289,7 @@ public:
             moe_ws_.count = alloc<int>(cfg.experts); moe_ws_.off = alloc<int>(cfg.experts);
             moe_ws_.sorted = alloc<int>(A); moe_ws_.inv = alloc<int>(A);
             moe_ws_.hbuf = alloc<bf16>(A * cfg.moe_inter); moe_ws_.ysorted = alloc<bf16>(A * H);
+            moe_ws_.tiles = alloc<int>(2 * moe_tile_cap(A, 16, cfg.experts));   // work list (the smallest row tile)
             std::printf("MoE workspace: %zu tokens, %.2f GB\n", N, (A * (cfg.moe_inter + H) * sizeof(bf16) + A * 16) / 1e9);
             if (world > 1) {
                 // the receive side must hold every rank's tokens: size it with the largest N of all ranks (they may
@@ -537,13 +538,17 @@ private:
                         CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk)));
                     });
                     stage("moe_sort", 0, 0, [&] { CKL((moe_sort<bf16, 128, 8>(n, moe_ws_))); });
+                    // Part 4 (C3): only the non-empty (expert, row tile) pairs get a block; same tiles, same results
+                    stage("moe_tiles", 0, 0, [&] { CKL((moe_tile_list<128>(moe_ws_.count, 0, 128, A, (long long)A / 128, moe_ws_.tiles))); });
                     stage("moe_gate_up", ex_bytes * 2 / 3, ex_flops * 2 / 3, [&] {
                         CKL((moe_experts_part<bf16, 8>(true, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
-                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter)));
+                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,
+                                                        0, moe_ws_.tiles, A)));
                     });
                     stage("moe_down", ex_bytes / 3, ex_flops / 3, [&] {
                         CKL((moe_experts_part<bf16, 8>(false, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
-                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter)));
+                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,
+                                                        0, moe_ws_.tiles, A)));
                     });
                     stage("moe_combine", 0, 0, [&] {
                         CKL((moe_combine<bf16, 8>(moe_ws_.ysorted, A, moe_ws_.inv, moe_ws_.w, o_, n, H)));

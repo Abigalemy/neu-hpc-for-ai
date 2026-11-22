@@ -1,0 +1,177 @@
+===== rank 0 (exit code 0)
+weights: 61.06 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1600 blocks of 128 tokens = 204800 tokens, 20.13 GB (48 layers)
+MoE workspace: 3072 tokens, 0.14 GB
+rank 0 of 1: loaded in 31.8 s; max_len 3080, max_chunk 3072, 64 slots
+PROFILE rank 0/1 prefill 256 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  moe_gate_up            48     19.911   43.5%     1941.4      31.06
+  moe_down               48     13.038   28.5%     1482.4      23.72
+  moe_sort               48      1.557    3.4%        0.0       0.00
+  moe_combine            48      1.495    3.3%        0.0       0.00
+  o_proj                 48      1.266    2.8%      635.9     162.79
+  qk_norm                48      1.119    2.4%      202.4       0.00
+  moe_router             48      0.941    2.1%       26.7       6.85
+  residual_add           96      0.850    1.9%      355.4       0.00
+  q_proj                 48      0.833    1.8%      967.0     247.55
+  rmsnorm                97      0.804    1.8%      250.5       0.00
+  k_proj                 48      0.799    1.7%      126.0      32.25
+  v_proj                 48      0.781    1.7%      128.9      32.99
+  moe_tiles              48      0.756    1.7%        0.0       0.00
+  attention              48      0.689    1.5%       36.5      37.54
+  rope                   48      0.443    1.0%      511.3       0.00
+  kv_write               48      0.290    0.6%      173.7       0.00
+  lm_head                 1      0.178    0.4%     3499.7       3.50
+  embedding               1      0.019    0.0%       55.5       0.00
+  TOTAL (stages)                45.769
+  WALL (host clock)             48.624
+  not in any stage               2.855    5.9% of wall
+
+PROFILE rank 0/1 prefill 2048 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  moe_down               48     79.779   44.2%      242.3      31.01
+  moe_gate_up            48     58.059   32.2%      665.8      85.22
+  moe_sort               48      9.146    5.1%        0.0       0.00
+  attention              48      8.824    4.9%       22.8     187.01
+  qk_norm                48      7.321    4.1%      247.5       0.00
+  moe_combine            48      4.194    2.3%        0.0       0.00
+  q_proj                 48      2.650    1.5%      303.8     622.26
+  o_proj                 48      2.477    1.4%      325.1     665.72
+  rmsnorm                97      1.612    0.9%      999.4       0.00
+  residual_add           96      1.457    0.8%     1658.1       0.00
+  moe_router             48      0.963    0.5%       26.1      53.52
+  k_proj                 48      0.875    0.5%      115.0     235.58
+  v_proj                 48      0.819    0.5%      122.8     251.58
+  moe_tiles              48      0.795    0.4%        0.0       0.00
+  rope                   48      0.743    0.4%     2439.0       0.00
+  kv_write               48      0.416    0.2%      967.3       0.00
+  lm_head                 1      0.183    0.1%     3401.2       3.40
+  embedding               1      0.017    0.0%      496.5       0.00
+  TOTAL (stages)               180.331
+  WALL (host clock)            183.167
+  not in any stage               2.836    1.5% of wall
+
+PROFILE rank 0/1 prefill 3072 tokens (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  moe_down               48    116.777   44.6%      165.5      31.78
+  moe_gate_up            48     79.787   30.5%      484.5      93.02
+  attention              48     17.264    6.6%       17.5     215.01
+  moe_sort               48     13.507    5.2%        0.0       0.00
+  qk_norm                48     11.105    4.2%      244.7       0.00
+  moe_combine            48      5.821    2.2%        0.0       0.00
+  q_proj                 48      3.925    1.5%      205.2     630.27
+  o_proj                 48      3.836    1.5%      209.9     644.97
+  rmsnorm                97      2.120    0.8%     1139.7       0.00
+  residual_add           96      1.844    0.7%     1965.6       0.00
+  moe_router             48      1.649    0.6%       15.3      46.87
+  rope                   48      0.980    0.4%     2772.7       0.00
+  k_proj                 48      0.887    0.3%      113.4     348.47
+  moe_tiles              48      0.835    0.3%        0.0       0.00
+  v_proj                 48      0.833    0.3%      120.8     371.19
+  kv_write               48      0.472    0.2%     1279.0       0.00
+  lm_head                 1      0.181    0.1%     3440.9       3.44
+  embedding               1      0.023    0.0%      537.9       0.00
+  TOTAL (stages)               261.847
+  WALL (host clock)            264.698
+  not in any stage               2.851    1.1% of wall
+
+PROFILE rank 0/1 decode batch 1, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  moe_gate_up            48      2.410   19.5%     1002.4       1.00
+  moe_down               48      1.272   10.3%      949.8       0.95
+  moe_router             48      0.933    7.5%       27.0       0.03
+  attention              48      0.791    6.4%       33.2       0.27
+  o_proj                 48      0.772    6.2%     1043.5       1.04
+  rmsnorm                97      0.749    6.1%        1.0       0.00
+  moe_tiles              48      0.715    5.8%        0.0       0.00
+  residual_add           96      0.675    5.5%        1.7       0.00
+  moe_combine            48      0.645    5.2%        0.0       0.00
+  q_proj                 48      0.629    5.1%     1279.4       1.28
+  k_proj                 48      0.528    4.3%      190.7       0.19
+  v_proj                 48      0.518    4.2%      194.2       0.19
+  moe_sort               48      0.488    3.9%        0.0       0.00
+  qk_norm                48      0.396    3.2%        2.2       0.00
+  rope                   48      0.385    3.1%        2.3       0.00
+  kv_write               48      0.275    2.2%        0.7       0.00
+  lm_head                 1      0.178    1.4%     3499.1       3.50
+  embedding               1      0.011    0.1%        0.4       0.00
+  TOTAL (stages)                12.370
+  WALL (host clock)             15.182
+  not in any stage               2.812   18.5% of wall
+
+PROFILE rank 0/1 decode batch 8, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  moe_gate_up            48      3.100   21.1%     6234.0       6.23
+  attention              48      1.843   12.5%      114.2       0.91
+  moe_down               48      1.535   10.4%     6293.6       6.29
+  moe_router             48      0.938    6.4%       26.8       0.21
+  moe_combine            48      0.866    5.9%        0.0       0.00
+  o_proj                 48      0.778    5.3%     1034.7       8.28
+  residual_add           96      0.772    5.2%       12.2       0.00
+  rmsnorm                97      0.767    5.2%        8.2       0.00
+  moe_tiles              48      0.715    4.9%        0.0       0.00
+  q_proj                 48      0.606    4.1%     1328.0      10.62
+  k_proj                 48      0.530    3.6%      190.1       1.52
+  v_proj                 48      0.520    3.5%      193.5       1.55
+  moe_sort               48      0.484    3.3%        0.0       0.00
+  qk_norm                48      0.402    2.7%       17.6       0.00
+  rope                   48      0.396    2.7%       17.9       0.00
+  kv_write               48      0.277    1.9%        5.7       0.00
+  lm_head                 1      0.175    1.2%     3558.0      28.46
+  embedding               1      0.013    0.1%        2.6       0.00
+  TOTAL (stages)                14.717
+  WALL (host clock)             17.530
+  not in any stage               2.813   16.0% of wall
+
+PROFILE rank 0/1 decode batch 32, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              48      4.403   22.4%      191.1       1.53
+  moe_gate_up            48      4.020   20.5%     9616.3      19.23
+  moe_down               48      2.445   12.5%     7904.7      15.81
+  moe_combine            48      1.097    5.6%        0.0       0.00
+  moe_router             48      0.940    4.8%       26.8       0.86
+  residual_add           96      0.813    4.1%       46.4       0.00
+  o_proj                 48      0.804    4.1%     1001.4      32.05
+  rmsnorm                97      0.770    3.9%       32.7       0.00
+  moe_tiles              48      0.756    3.9%        0.0       0.00
+  moe_sort               48      0.594    3.0%        0.0       0.00
+  q_proj                 48      0.591    3.0%     1361.7      43.57
+  k_proj                 48      0.534    2.7%      188.7       6.04
+  v_proj                 48      0.524    2.7%      192.2       6.15
+  qk_norm                48      0.459    2.3%       61.7       0.00
+  rope                   48      0.408    2.1%       69.3       0.00
+  kv_write               48      0.278    1.4%       22.6       0.00
+  lm_head                 1      0.166    0.8%     3738.9     119.65
+  embedding               1      0.012    0.1%       11.0       0.00
+  TOTAL (stages)                19.614
+  WALL (host clock)             22.438
+  not in any stage               2.824   12.6% of wall
+
+PROFILE rank 0/1 decode batch 64, context ~256 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              48      8.221   31.5%      204.7       1.64
+  moe_gate_up            48      5.491   21.0%     7039.9      28.16
+  moe_down               48      3.237   12.4%     5971.1      23.88
+  moe_combine            48      1.110    4.3%        0.0       0.00
+  moe_router             48      0.941    3.6%       26.7       1.71
+  residual_add           96      0.836    3.2%       90.3       0.00
+  o_proj                 48      0.812    3.1%      991.5      63.45
+  rmsnorm                97      0.775    3.0%       65.0       0.00
+  moe_tiles              48      0.753    2.9%        0.0       0.00
+  moe_sort               48      0.731    2.8%        0.0       0.00
+  v_proj                 48      0.616    2.4%      163.3      10.45
+  q_proj                 48      0.605    2.3%     1331.3      85.20
+  qk_norm                48      0.549    2.1%      103.1       0.00
+  k_proj                 48      0.542    2.1%      185.7      11.89
+  rope                   48      0.415    1.6%      136.4       0.00
+  kv_write               48      0.282    1.1%       44.7       0.00
+  lm_head                 1      0.161    0.6%     3862.4     247.19
+  embedding               1      0.012    0.0%       22.4       0.00
+  TOTAL (stages)                26.089
+  WALL (host clock)             28.947
+  not in any stage               2.858    9.9% of wall
+
+rank 0: PROFILE DONE
+
+saved to volume final-results:profile_30B_w1_1795311626.txt
+Stopping app - uncaught exception raised locally: SystemExit(0).
