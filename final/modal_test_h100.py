@@ -19,7 +19,7 @@ TESTS = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention"]
 
 # self-checking binaries without SQLite cases (exit code 0 = pass): `--tests paged` runs the PagedAttention test
 MOE = ["moe"]   # Part 1: cases in test_cases_moe.db (modal run part1/gen_moe_cases.py), `--tests moe`
-SELF_CHECKING = ["paged_attention", "paged_bench", "moe_tiles"]   # paged_bench: timings only; moe_tiles: Part 4 work list
+SELF_CHECKING = ["paged_attention", "paged_bench", "moe_tiles", "moe_sweep"]   # paged_bench: timings only; moe_tiles: Part 4 work list
 
 
 def build_cmd(arch):
@@ -58,7 +58,9 @@ def run_all(tests: list):
         rc |= subprocess.run(["build/paged_bench_test"], cwd="/root/final").returncode
     if "moe_tiles" in tests:
         rc |= subprocess.run(["build/moe_tiles_test"], cwd="/root/final").returncode
-    unknown = [t for t in tests if t not in TESTS + ["moe", "moe_debug", "paged", "paged_bench", "moe_tiles"]]
+    if "moe_sweep" in tests:
+        rc |= subprocess.run(["build/moe_sweep_test"], cwd="/root/final").returncode
+    unknown = [t for t in tests if t not in TESTS + ["moe", "moe_debug", "paged", "paged_bench", "moe_tiles", "moe_sweep"]]
     if unknown:                      # a name with no branch above would otherwise "pass" without running anything
         print(f"unknown tests: {unknown}")
         rc |= 1

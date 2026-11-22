@@ -1,0 +1,26 @@
+  ok   moe_router E=128 t1: experts: 1/1 tokens same set
+  ok   moe_router E=128 t2: experts: 2/2 tokens same set
+  ok   moe_router E=128 t7: experts: 6/7 tokens same set, 1 near-tie
+  ok   moe_router E=128 t64: experts: 61/64 tokens same set, 3 near-tie
+  ok   moe_block E=16 t1: experts: 1/1 tokens same set; y (1 tokens, 0 with recomputed terms): max err 2.24e-03 of max|e| = 0.15 of the bound (ok); for information: vs fp32 path 5.26e-03, vs HF's bf16 sum 4.53e-03
+  ok   moe_block E=16 t2: experts: 2/2 tokens same set; y (2 tokens, 0 with recomputed terms): max err 2.94e-03 of max|e| = 0.18 of the bound (ok); for information: vs fp32 path 6.71e-03, vs HF's bf16 sum 1.29e-02
+  ok   moe_block E=16 t5: experts: 5/5 tokens same set; y (5 tokens, 0 with recomputed terms): max err 4.22e-03 of max|e| = 0.32 of the bound (ok); for information: vs fp32 path 4.30e-03, vs HF's bf16 sum 7.15e-03
+  ok   moe_block E=16 t33: experts: 33/33 tokens same set; y (33 tokens, 0 with recomputed terms): max err 2.91e-03 of max|e| = 0.22 of the bound (ok); for information: vs fp32 path 4.52e-03, vs HF's bf16 sum 5.60e-03
+  ok   moe_block E=16 t128: experts: 127/128 tokens same set, 1 near-tie; y (128 tokens, 1 with recomputed terms): max err 5.26e-03 of max|e| = 0.31 of the bound (ok); for information: vs fp32 path 1.12e-01, vs HF's bf16 sum 1.12e-01
+  ok   moe_block_designed E=16 two_tokens_overlap: experts: 2/2 tokens same set; y (2 tokens, 0 with recomputed terms): max err 3.21e-03 of max|e| = 0.24 of the bound (ok); for information: vs fp32 path 4.81e-03, vs HF's bf16 sum 1.10e-02
+  moe_router E=128 top-8       cases=4   tol=4   strict=4   worst=0.000e+00
+  moe_block E=16 top-8         cases=5   tol=5   strict=5   worst=5.259e-03
+  moe_block_designed E=16 top-8 cases=1   tol=1   strict=1   worst=3.212e-03
+ALL PASS (tolerance)
+MOE TILES: all 40 cases bit-exact (work list = full grid)
+Qwen/Qwen3-30B-A3B [tiling, snapshot ad44e777], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_1795314318
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+Qwen/Qwen3-30B-A3B [heldout, snapshot ad44e777], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_heldout_1795314333
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+Qwen/Qwen3-0.6B [tiling, snapshot c1899de2], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-0.6B_1795314335
+  PASS (dense rule)
+byte compare with the 11/18 runs: gen.bin logits.bin route.bin all same (tiling, heldout)
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+rank 0 [tiling]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_1795314318
+rank 1 [heldout]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_heldout_1795314333

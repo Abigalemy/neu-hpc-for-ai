@@ -154,7 +154,9 @@ __tile_global__ void moe_sort_kernel(const int* __restrict__ IDX, int n_assign, 
 }
 
 // ---- 4. grouped gate/up + SiLU, 5. grouped down --------------------------------------------------------------------
-template <typename T, int K, int BM, int BN, int BK>
+// HINTS (Part 4): which bases the compiler may assume 16-byte aligned (always true here; it lets it use bulk / TMA
+// copies): 1 = the input rows, 2 = the expert weights, 4 = the output rows. Same arithmetic for every value.
+template <typename T, int K, int BM, int BN, int BK, int HINTS = 7>
 __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, const T* __restrict__ WG,
                                         const T* __restrict__ WU, const int* __restrict__ COUNT,
                                         const int* __restrict__ OFF, const int* __restrict__ SORTED,
@@ -175,16 +177,30 @@ __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, 
     int e = e_base + el;
     int off = OFF[e], cnt = COUNT[e];
     if (unused) mb = cnt / BM + 1;                               // a tile past the rows: no work, nothing stored
+    // views get at least one row: with the alignment hints below the compiler uses bulk (TMA) copies, which reject a
+    // tensor of 0 rows (an expert without tokens: "illegal instruction parameter" on the H100); such a block is
+    // moved past that one row, so it still loads and stores nothing
+    const int ext = cnt > 0 ? cnt : 1;
+    if (cnt == 0) mb = 1;
     int k_all = (hid + BK - 1) / BK;
     int k_blocks = cnt - mb * BM > 0 ? k_all : 0;               // a tile past the expert's rows does no work
 
-    auto pSort = ct::partition_view{ct::tensor_span{SORTED + off, ct::extents{cnt}}, ct::shape<BM>{}};
+    auto pSort = ct::partition_view{ct::tensor_span{SORTED + off, ct::extents{ext}}, ct::shape<BM>{}};
     auto r = mb * BM + ct::iota<i32_m>();
     auto tok = ct::select(r < cnt, pSort.load_masked(mb) / K, ct::full<i32_m>(n_tokens));   // token of each row
-    auto gX = ct::gather_scatter_view{ct::tensor_span{_X, ct::extents{n_tokens, hid}}, ct::shape<BM, BK>{}, ct::integral_constant<0>{}};
+    // every base below is 16-byte aligned (cudaMalloc'd buffers; offsets are multiples of hid, inter, which are
+    // multiples of 64): telling the compiler lets it use wide / bulk loads (Part 4; same arithmetic, same results)
     const size_t wofs = (size_t)el * _inter * _hid;
-    auto pWG = ct::partition_view{ct::tensor_span{WG + wofs, ct::extents{inter, hid}}, ct::shape<BN, BK>{}};
-    auto pWU = ct::partition_view{ct::tensor_span{WU + wofs, ct::extents{inter, hid}}, ct::shape<BN, BK>{}};
+    const T* xp = _X;
+    const T* wgp = WG + wofs;
+    const T* wup = WU + wofs;
+    T* hp = HBUF + (size_t)off * _inter;
+    if constexpr (HINTS & 1) xp = ct::assume_aligned(_X, 16_ic);
+    if constexpr (HINTS & 2) { wgp = ct::assume_aligned(WG + wofs, 16_ic); wup = ct::assume_aligned(WU + wofs, 16_ic); }
+    if constexpr (HINTS & 4) hp = ct::assume_aligned(HBUF + (size_t)off * _inter, 16_ic);
+    auto gX = ct::gather_scatter_view{ct::tensor_span{xp, ct::extents{n_tokens, hid}}, ct::shape<BM, BK>{}, ct::integral_constant<0>{}};
+    auto pWG = ct::partition_view{ct::tensor_span{wgp, ct::extents{inter, hid}}, ct::shape<BN, BK>{}};
+    auto pWU = ct::partition_view{ct::tensor_span{wup, ct::extents{inter, hid}}, ct::shape<BN, BK>{}};
 
     auto acc_g = ct::zeros<acc_t>();
     auto acc_u = ct::zeros<acc_t>();
@@ -198,11 +214,11 @@ __tile_global__ void moe_gate_up_kernel(const T* __restrict__ _X, int n_tokens, 
     auto g = ct::element_cast<float>(ct::element_cast<T>(acc_g));    // same roundings as gate_up_silu_kernel
     auto u = ct::element_cast<float>(ct::element_cast<T>(acc_u));
     auto s = ct::element_cast<float>(ct::element_cast<T>(g / (ct::full<acc_t>(1.0f) + ct::exp(-g))));
-    auto pH = ct::partition_view{ct::tensor_span{HBUF + (size_t)off * _inter, ct::extents{cnt, inter}}, ct::shape<BM, BN>{}};
+    auto pH = ct::partition_view{ct::tensor_span{hp, ct::extents{ext, inter}}, ct::shape<BM, BN>{}};
     pH.store_masked(ct::element_cast<T>(s * u), mb, nb);
 }
 
-template <typename T, int BM, int BN, int BK>
+template <typename T, int BM, int BN, int BK, int HINTS = 7>   // HINTS as moe_gate_up_kernel (1 = hbuf rows)
 __tile_global__ void moe_down_kernel(const T* __restrict__ HBUF, const T* __restrict__ WD, const int* __restrict__ COUNT,
                                      const int* __restrict__ OFF, T* __restrict__ YS, int _hid, int _inter, int e_base,
                                      const int* __restrict__ TILES, int cap) {
@@ -218,17 +234,25 @@ __tile_global__ void moe_down_kernel(const T* __restrict__ HBUF, const T* __rest
     int e = e_base + el;
     int off = OFF[e], cnt = COUNT[e];
     if (unused) mb = cnt / BM + 1;
+    const int ext = cnt > 0 ? cnt : 1;                           // at least one row (see moe_gate_up_kernel)
+    if (cnt == 0) mb = 1;
     int k_all = (inter + BK - 1) / BK;
     int k_blocks = cnt - mb * BM > 0 ? k_all : 0;
-    auto pH = ct::partition_view{ct::tensor_span{HBUF + (size_t)off * _inter, ct::extents{cnt, inter}}, ct::shape<BM, BK>{}};
-    auto pW = ct::partition_view{ct::tensor_span{WD + (size_t)el * _hid * _inter, ct::extents{hid, inter}}, ct::shape<BN, BK>{}};
+    const T* hp = HBUF + (size_t)off * _inter;
+    const T* wp = WD + (size_t)el * _hid * _inter;
+    T* yp = YS + (size_t)off * _hid;
+    if constexpr (HINTS & 1) hp = ct::assume_aligned(HBUF + (size_t)off * _inter, 16_ic);
+    if constexpr (HINTS & 2) wp = ct::assume_aligned(WD + (size_t)el * _hid * _inter, 16_ic);
+    if constexpr (HINTS & 4) yp = ct::assume_aligned(YS + (size_t)off * _hid, 16_ic);
+    auto pH = ct::partition_view{ct::tensor_span{hp, ct::extents{ext, inter}}, ct::shape<BM, BK>{}};
+    auto pW = ct::partition_view{ct::tensor_span{wp, ct::extents{hid, inter}}, ct::shape<BN, BK>{}};
     auto acc = ct::zeros<acc_t>();
     for (auto kb : ct::irange(0, k_blocks)) {
         ct::tile<T, ct::shape<BM, BK>> h = pH.load_masked(mb, kb);
         ct::tile<T, ct::shape<BN, BK>> w = pW.load(nb, kb);
         acc = ct::mma(h, ct::transpose(w), acc);
     }
-    auto pY = ct::partition_view{ct::tensor_span{YS + (size_t)off * _hid, ct::extents{cnt, hid}}, ct::shape<BM, BN>{}};
+    auto pY = ct::partition_view{ct::tensor_span{yp, ct::extents{ext, hid}}, ct::shape<BM, BN>{}};
     pY.store_masked(ct::element_cast<T>(acc), mb, nb);
 }
 
@@ -385,24 +409,33 @@ cudaError_t moe_experts_part(bool gate_up, const T* x, int n_rows, const T* wg, 
                              const int* off, const int* sorted, T* hbuf, T* ysorted, int e_base, int e_local, int max_rows,
                              long long avg_rows, int hid, int inter, cudaStream_t s = 0, const int* tiles = nullptr,
                              long long A = 0) {
-    if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
+    if (inter % 128 || hid % 256) { std::fprintf(stderr, "moe: inter %% 128 and hid %% 256 required\n"); return cudaErrorInvalidValue; }
     if (e_local <= 0 || max_rows <= 0) return cudaSuccess;
     // tiles (moe_tile_list of the same A and avg_rows): one block per non-empty (expert, row tile); otherwise the full
-    // grid, every row tile up to max_rows of every expert (the blocks past an expert's rows do nothing)
-    auto grouped = [&](auto bm) {
-        constexpr int BM = decltype(bm)::value;
+    // grid, every row tile up to max_rows of every expert (the blocks past an expert's rows do nothing).
+    // Tiles and alignment hints from the H100 sweep (tests/moe_sweep_test.cu, results/part4/moe_sweep_h100_2026-11-21.txt;
+    // every choice bit-exact with every other, BK = 64 throughout): with 64-row tiles gate/up is fastest at 64 x 128
+    // with only the weights marked aligned (marking the gathered input rows too made it 3-5x slower), down at 64 x 256
+    // with every base marked; with 16-row tiles (decode) all hints and 16 x 64 / 16 x 256. At 2048 tokens: gate/up
+    // 1.23 -> 0.73 ms, down 1.63 -> 0.26 ms per layer.
+    auto grouped = [&](auto bm, auto bng, auto hg, auto bnd) {
+        constexpr int BM = decltype(bm)::value, BNG = decltype(bng)::value, HG = decltype(hg)::value, BND = decltype(bnd)::value;
         const int cap = tiles ? (int)moe_tile_cap(A, BM, e_local) : 0;
         const dim3 rows = tiles ? dim3(cap, 1) : dim3(e_local, (max_rows + BM - 1) / BM);
         if (tiles && cap == 0) return;
         if (gate_up)
-            moe_gate_up_kernel<T, KDIV, BM, 64, 64><<<dim3(rows.x, rows.y, inter / 64), 1, 0, s>>>(
+            moe_gate_up_kernel<T, KDIV, BM, BNG, 64, HG><<<dim3(rows.x, rows.y, inter / BNG), 1, 0, s>>>(
                 x, n_rows, wg, wu, count, off, sorted, hbuf, hid, inter, e_base, tiles, cap);
         else
-            moe_down_kernel<T, BM, 128, 64><<<dim3(rows.x, rows.y, hid / 128), 1, 0, s>>>(
+            moe_down_kernel<T, BM, BND, 64, 7><<<dim3(rows.x, rows.y, hid / BND), 1, 0, s>>>(
                 hbuf, wd, count, off, ysorted, hid, inter, e_base, tiles, cap);
     };
-    if (moe_bm(avg_rows) == 64) grouped(std::integral_constant<int, 64>{});      // small batches: small row tiles
-    else grouped(std::integral_constant<int, 16>{});
+    if (moe_bm(avg_rows) == 64)      // small batches: small row tiles
+        grouped(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{}, std::integral_constant<int, 2>{},
+                std::integral_constant<int, 256>{});
+    else
+        grouped(std::integral_constant<int, 16>{}, std::integral_constant<int, 64>{}, std::integral_constant<int, 7>{},
+                std::integral_constant<int, 256>{});
     return cudaGetLastError();
 }
 
@@ -413,7 +446,6 @@ template <typename T, int KDIV>
 cudaError_t moe_experts(const T* x, int n_rows, const T* wg, const T* wu, const T* wd, const int* count, const int* off,
                         const int* sorted, T* hbuf, T* ysorted, int e_base, int e_local, int max_rows, long long avg_rows,
                         int hid, int inter, cudaStream_t s = 0) {
-    if (inter % 64 || hid % 128) { std::fprintf(stderr, "moe: inter %% 64 and hid %% 128 required\n"); return cudaErrorInvalidValue; }
     if (e_local <= 0 || max_rows <= 0) return cudaSuccess;
     cudaError_t e = moe_experts_part<T, KDIV>(true, x, n_rows, wg, wu, wd, count, off, sorted, hbuf, ysorted, e_base, e_local,
                                               max_rows, avg_rows, hid, inter, s);
