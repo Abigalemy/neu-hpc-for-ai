@@ -53,6 +53,35 @@ def tile_list(count, e_base, e_local, A, BM):
     return out, int(total), cap
 
 
+def tile_list_from_sort(count, e_base, e_local, A, BM):
+    """The same list written by the sort kernel (Part 4: one launch fewer per MoE layer). Block e of the sort (one per
+    global expert) scatters its own entries: position excl[e] + j gets (e - e_base, j) for j < tiles[e], in chunks of
+    BP; the last local expert's block also writes (-1, 0) to positions total .. cap - 1 (at most min(e_local, A) <= BP
+    of them, since total >= ceil(A / BM)); every other position is written by exactly one block."""
+    cap = capacity(A, BM, e_local)
+    lst = [None] * cap
+    lane = np.arange(E)
+    local = (lane >= e_base) & (lane < e_base + e_local)
+    tl = np.where(local, (count + BM - 1) // BM, 0)
+    total = int(tl.sum())
+    assert cap - total <= BP, (cap, total)
+    for e in range(e_base, e_base + e_local):
+        excl = int(np.where(lane < e, tl, 0).sum())
+        te = int(tl[e])
+        for jc in range((te + BP - 1) // BP):
+            for j in jc * BP + np.arange(BP):
+                if j < te:
+                    assert lst[excl + j] is None, "written twice"
+                    lst[excl + j] = (e - e_base, int(j))
+        if e == e_base + e_local - 1:
+            for p in total + np.arange(BP):
+                if p < cap:
+                    assert lst[p] is None, "tail overlaps"
+                    lst[p] = (-1, 0)
+    assert all(t is not None for t in lst), "position never written"
+    return lst
+
+
 def check(count, e_base, e_local, A, BM, what):
     lst, total, cap = tile_list(count, e_base, e_local, A, BM)
     want = [(e, m) for e in range(e_local) for m in range((count[e_base + e] + BM - 1) // BM)]
@@ -61,6 +90,7 @@ def check(count, e_base, e_local, A, BM, what):
     assert total <= cap, (what, total, cap)
     assert got == want, (what, got[:5], want[:5])               # same tiles, same (expert-major) order
     assert all(t == (-1, 0) for t in lst[len(want):]), what
+    assert tile_list_from_sort(count, e_base, e_local, A, BM) == lst, (what, "sort-built list differs")
     return total, cap
 
 
@@ -93,7 +123,8 @@ def main():
                     n_cases += 1
     # empty layer (an idle expert-parallel rank receives nothing): no list positions
     assert tile_list(np.zeros(E, dtype=np.int64), 0, 128, 0, 16)[2] == 0
-    print(f"{n_cases} count vectors: every non-empty tile exactly once, in expert order, total <= capacity")
+    print(f"{n_cases} count vectors: every non-empty tile exactly once, in expert order, total <= capacity; the list "
+          f"written by the sort kernel's blocks is identical, each position written once")
     print("row-tile blocks launched (per column tile), uniform routing on one GPU: old grid -> work list")
     for BM, n, old, new in waste_old:
         if n in (1, 64, 2048, 3072):

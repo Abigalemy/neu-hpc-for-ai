@@ -118,15 +118,17 @@ void moe_ep_layer(const T* x, const T* wr, const T* wg, const T* wu, const T* wd
     });
     // 5. computation on the received rows, with this rank's experts only
     if (R > 0) {
-        st("ep_recv_sort", [&] {
-            moe_count_kernel<E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count);
-            moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count, ep.r_sorted, ep.r_inv, ep.r_off);
-            CKE(cudaGetLastError(), "recv sort");
-        });
         // any one expert has at most W * n_max rows (a token picks an expert once): R bounds it
         const long long avg = (long long)R / std::max(1, g.e_local());
-        // Part 4 (C3): a block per non-empty (expert, row tile) instead of e_local x R / BM (the 2x H200 profile)
-        st("ep_tiles", [&] { CKE((moe_tile_list<E>(ep.r_count, g.e0(), g.e_local(), R, avg, ep.r_tiles, s)), "tiles"); });
+        // Part 4: the sort also writes the work list, a block per non-empty (expert, row tile) instead of
+        // e_local x R / BM (the 2x H200 profile)
+        st("ep_recv_sort", [&] {
+            const int bm = moe_bm(avg), cap = (int)moe_tile_cap(R, bm, g.e_local());
+            moe_count_kernel<E><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count);
+            moe_sort_kernel<T, E, true><<<E, 1, 0, s>>>(ep.recv_ids, R, ep.r_count, ep.r_sorted, ep.r_inv, ep.r_off, bm,
+                                                        g.e0(), g.e_local(), cap, ep.r_tiles);
+            CKE(cudaGetLastError(), "recv sort");
+        });
         st("ep_gate_up", [&] {
             CKE((moe_experts_part<T, 1>(true, ep.recv_rows, R, wg, wu, wd, ep.r_count, ep.r_off, ep.r_sorted, ep.r_hbuf,
                                         ep.r_ysorted, g.e0(), g.e_local(), R, avg, hid, inter, s, ep.r_tiles, R)), "gate_up");

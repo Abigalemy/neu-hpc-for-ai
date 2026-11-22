@@ -66,11 +66,25 @@ int main() {
         CK(cudaMemcpy(ws.idx, ids.data(), A * 4, cudaMemcpyHostToDevice));
         if (c.kdiv == 8) CK((moe_sort<bf16, E, 8>(n, ws))); else CK((moe_sort<bf16, E, 1>(n, ws)));
         const long long avg = (long long)A / c.e_local;
+        // the list as the sort kernel writes it (what the engine uses) must equal moe_tile_list's, entry for entry
+        const int bm = moe_bm(avg), cap = (int)moe_tile_cap(A, bm, c.e_local);
+        std::vector<int> l1(2 * (size_t)cap), l2(2 * (size_t)cap);
+        if (cap > 0) {
+            CK(cudaMemset(ws.tiles, 0x7F, 2 * (size_t)cap * 4));
+            CK((moe_tile_list<E>(ws.count, c.e_base, c.e_local, A, avg, ws.tiles)));
+            CK(cudaMemcpy(l1.data(), ws.tiles, l1.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemset(ws.tiles, 0x7F, 2 * (size_t)cap * 4));
+            moe_sort_kernel<bf16, E, true><<<E, 1>>>(ws.idx, A, ws.count, ws.sorted, ws.inv, ws.off, bm, c.e_base, c.e_local,
+                                                     cap, ws.tiles);
+            CK(cudaGetLastError());
+            CK(cudaMemcpy(l2.data(), ws.tiles, l2.size() * 4, cudaMemcpyDeviceToHost));
+        }
+        const bool same_list = l1 == l2;
         const int max_rows = c.kdiv == 8 ? n : A;           // what the engine passes today (n, or every received row)
         auto run = [&](bool list, std::vector<bf16>& h, std::vector<bf16>& y) {
             CK(cudaMemset(ws.hbuf, 0xFF, (size_t)A * INTER * 2));   // sentinel: NaN pattern, an unwritten row would differ
             CK(cudaMemset(ws.ysorted, 0xFF, (size_t)A * HID * 2));
-            if (list) CK((moe_tile_list<E>(ws.count, c.e_base, c.e_local, A, avg, ws.tiles)));
+            // list: the sort-built list from above is still in ws.tiles (the sort itself is deterministic)
             for (bool gu : {true, false}) {
                 cudaError_t e = c.kdiv == 8
                     ? moe_experts_part<bf16, 8>(gu, x, n, wg, wu, wd, ws.count, ws.off, ws.sorted, ws.hbuf, ws.ysorted, c.e_base,
@@ -93,13 +107,13 @@ int main() {
         uint16_t sentinel = 0xFFFF;
         for (auto& v : y1) unwritten += std::memcmp(&v, &sentinel, 2) == 0;
         const int BM = moe_bm(avg);
-        std::printf("%-14s kdiv %d rows %5d experts %3d..%3d  BM %2d  blocks per column tile: grid %6lld, list %5lld | %s",
+        std::printf("%-14s kdiv %d rows %5d experts %3d..%3d  BM %2d  blocks per column tile: grid %6lld, list %5lld | %s | list %s",
                     c.name, c.kdiv, n, c.e_base, c.e_base + c.e_local - 1, BM,
                     (long long)c.e_local * ((max_rows + BM - 1) / BM), moe_tile_cap(A, BM, c.e_local),
-                    bad || unwritten ? "DIFFERS" : "bit-exact");
+                    bad || unwritten ? "DIFFERS" : "bit-exact", same_list ? "from the sort = moe_tile_list" : "FROM THE SORT DIFFERS");
         if (bad || unwritten) std::printf(" (%lld values differ, %lld output values unwritten)", bad, unwritten);
         std::printf("\n");
-        failed += bad || unwritten;
+        failed += bad || unwritten || !same_list;
     }
     std::printf(failed ? "MOE TILES: %d case(s) FAILED\n" : "MOE TILES: all %zu cases bit-exact (work list = full grid)\n",
                 failed ? failed : cases.size());

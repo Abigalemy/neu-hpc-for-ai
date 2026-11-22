@@ -537,9 +537,9 @@ private:
                     stage("moe_router", (double)cfg.experts * H * 2, 2.0 * nn * cfg.experts * H, [&] {
                         CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk)));
                     });
-                    stage("moe_sort", 0, 0, [&] { CKL((moe_sort<bf16, 128, 8>(n, moe_ws_))); });
-                    // Part 4 (C3): only the non-empty (expert, row tile) pairs get a block; same tiles, same results
-                    stage("moe_tiles", 0, 0, [&] { CKL((moe_tile_list<128>(moe_ws_.count, 0, 128, A, (long long)A / 128, moe_ws_.tiles))); });
+                    // Part 4: the sort also writes the work list (only the non-empty (expert, row tile) pairs get a
+                    // block in the GEMMs; same tiles, same results)
+                    stage("moe_sort", 0, 0, [&] { CKL((moe_sort_list<bf16, 128, 8>(n, moe_ws_))); });
                     stage("moe_gate_up", ex_bytes * 2 / 3, ex_flops * 2 / 3, [&] {
                         CKL((moe_experts_part<bf16, 8>(true, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
                                                         moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,

@@ -112,9 +112,13 @@ __tile_global__ void moe_count_kernel(const int* __restrict__ IDX, int n_assign,
     pC.store(total, e);
 }
 
-template <typename T, int E>
+// LIST (Part 4): also write the work list of the expert GEMMs (as moe_tile_list_kernel, one launch fewer per layer;
+// part4/tile_list_sim.py checks this form against it): block e scatters its own (e - e_base, row tile) entries to
+// positions excl[e] .., and the last local expert's block writes (-1, 0) to positions total .. cap - 1.
+template <typename T, int E, bool LIST = false>
 __tile_global__ void moe_sort_kernel(const int* __restrict__ IDX, int n_assign, const int* __restrict__ COUNT,
-                                     int* __restrict__ SORTED, int* __restrict__ INV, int* __restrict__ OFF) {
+                                     int* __restrict__ SORTED, int* __restrict__ INV, int* __restrict__ OFF,
+                                     int bm = 16, int e_base = 0, int e_local = E, int cap = 0, int* __restrict__ TILES = nullptr) {
     using namespace ct::literals;
     using i32_a = ct::tile<int, ct::shape<MOE_BA>>;
     using i32_aa = ct::tile<int, ct::shape<MOE_BA, MOE_BA>>;
@@ -126,6 +130,33 @@ __tile_global__ void moe_sort_kernel(const int* __restrict__ IDX, int n_assign, 
     auto off = ct::sum(ct::select(eid < e, cnt, ct::zeros<ct::tile<int, ct::shape<E>>>()), 0_ic);   // [1]
     auto pOff = ct::partition_view{ct::tensor_span{OFF, ct::extents{ct::integral_constant<E>{}}}, ct::shape<1>{}};
     pOff.store(off, e);
+
+    if constexpr (LIST) {
+        using i32_e = ct::tile<int, ct::shape<E>>;
+        using i32_b = ct::tile<int, ct::shape<MOE_BA>>;
+        auto local = (eid >= e_base) & (eid < e_base + e_local);
+        auto tl = ct::select(local, (cnt + (bm - 1)) / bm, ct::zeros<i32_e>());
+        auto excl = ct::broadcast<ct::shape<MOE_BA>>(ct::sum(ct::select(eid < e, tl, ct::zeros<i32_e>()), 0_ic));
+        auto total = ct::broadcast<ct::shape<MOE_BA>>(ct::sum(tl, 0_ic));
+        const bool mine = e >= e_base && e < e_base + e_local;
+        const int te = mine ? (COUNT[e] + bm - 1) / bm : 0;           // this expert's row tiles (0: not local)
+        auto gE = ct::gather_scatter_view{ct::tensor_span{TILES, ct::extents{cap}}, ct::shape<MOE_BA>{}, ct::integral_constant<0>{}};
+        auto gM = ct::gather_scatter_view{ct::tensor_span{TILES + cap, ct::extents{cap}}, ct::shape<MOE_BA>{}, ct::integral_constant<0>{}};
+        for (auto jc : ct::irange(0, (te + MOE_BA - 1) / MOE_BA)) {
+            auto j = jc * MOE_BA + ct::iota<i32_b>();
+            auto dst = ct::select(j < te, excl + j, ct::full<i32_b>(cap));            // cap = masked out
+            gE.store_masked(ct::full<i32_b>(e - e_base), dst);
+            gM.store_masked(j, dst);
+        }
+        const int tail = mine && e == e_base + e_local - 1 ? 1 : 0;   // unused positions: at most MOE_BA of them
+        for (auto t : ct::irange(0, tail)) {
+            (void)t;
+            auto p = total + ct::iota<i32_b>();
+            auto dst = ct::select(p < cap, p, ct::full<i32_b>(cap));
+            gE.store_masked(ct::full<i32_b>(-1), dst);
+            gM.store_masked(ct::zeros<i32_b>(), dst);
+        }
+    }
 
     // pre[r] = number of matches at positions < r inside the tile: a masked row sum over a [BA, BA] tile (integer,
     // exact). The first version computed it as a mma with a lower-triangular bf16 matrix of ones; on the H100 SORTED
@@ -364,12 +395,29 @@ cudaError_t launch_moe_router(const T* x, const T* wr, int* idx, T* w, int n, in
     return cudaGetLastError();
 }
 
+// Row tile of the expert GEMMs for an average of avg_rows rows per expert, and the work list's size for A rows in
+// all (part4/tile_list_sim.py: sum ceil(c / BM) <= A / BM + the number of non-empty experts).
+inline int moe_bm(long long avg_rows) { return avg_rows > 32 ? 64 : 16; }
+inline long long moe_tile_cap(long long A, int BM, int e_local) { return (A + BM - 1) / BM + std::min<long long>(e_local, A); }
+
 // Steps 2-3: count per expert and stable sort by expert of the router's ws.idx for n tokens (ws.count, ws.off,
 // ws.sorted, ws.inv).
 template <typename T, int E, int K>
 cudaError_t moe_sort(int n, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
     moe_count_kernel<E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count);
     moe_sort_kernel<T, E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count, ws.sorted, ws.inv, ws.off);
+    return cudaGetLastError();
+}
+
+// moe_sort that also writes the work list (ws.tiles) for the expert GEMMs, as moe_tile_list<E>(ws.count, 0, E, n * K,
+// n * K / E, ws.tiles) would: the GEMMs then take ws.tiles with A = n * K and avg_rows = n * K / E.
+template <typename T, int E, int K>
+cudaError_t moe_sort_list(int n, const MoeWorkspace<T>& ws, cudaStream_t s = 0) {
+    const long long A = (long long)n * K;
+    const int bm = moe_bm(A / E);
+    const int cap = (int)moe_tile_cap(A, bm, E);
+    moe_count_kernel<E><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count);
+    moe_sort_kernel<T, E, true><<<E, 1, 0, s>>>(ws.idx, n * K, ws.count, ws.sorted, ws.inv, ws.off, bm, 0, E, cap, ws.tiles);
     return cudaGetLastError();
 }
 
@@ -381,10 +429,6 @@ cudaError_t moe_route(const T* x, const T* wr, int n, int hid, bool norm_topk, c
     return moe_sort<T, E, K>(n, ws, s);
 }
 
-// Row tile of the expert GEMMs for an average of avg_rows rows per expert, and the work list's size for A rows in
-// all (part4/tile_list_sim.py: sum ceil(c / BM) <= A / BM + the number of non-empty experts).
-inline int moe_bm(long long avg_rows) { return avg_rows > 32 ? 64 : 16; }
-inline long long moe_tile_cap(long long A, int BM, int e_local) { return (A + BM - 1) / BM + std::min<long long>(e_local, A); }
 
 // The work list for the local experts e_base .. e_base + e_local - 1 (COUNT has global ids), A = their rows in all;
 // tiles holds 2 * moe_tile_cap(A, BM, e_local) ints. The GEMMs must get the same A and avg_rows (same BM, same cap).
