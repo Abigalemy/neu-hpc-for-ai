@@ -17,3 +17,9 @@ slots8/long_c8,16000,256,8,1444.62,3178.04,2.2,12.79,34.14,2.67,433,172,0.0,slot
 30B/balanced_c64,256,256,64,467.52,1930.17,4.13,12.74,43.21,3.39,4396,1264,0.0,suite_Qwen3-30B-A3B_ours_1795057331/balanced_c64,suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c64
 30B/prefill_heavy,2048,32,8,245.02,1141.38,4.66,8.24,45.87,5.56,507,100,0.0,suite_Qwen3-30B-A3B_ours_1795057331/prefill_heavy,suite_Qwen3-30B-A3B_vllm_1795049169/prefill_heavy
 30B/decode_heavy,64,1024,32,1064.34,491.96,0.46,10.26,27.73,2.7,2830,1135,0.0,suite_Qwen3-30B-A3B_ours_1795057331/decode_heavy,suite_Qwen3-30B-A3B_vllm_1795049169/decode_heavy
+30B_2gpu/baseline,128,128,1,102.9,58.5,0.57,4.97,14.44,2.91,174,67,0.0,suite_Qwen3-30B-A3B_ep2_ours_1795147115/baseline,suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/baseline
+30B_2gpu/long_out,3072,1024,1,112.13,496.9,4.43,5.1,15.86,3.11,192,61,0.0,suite_Qwen3-30B-A3B_ep2_ours_1795147115/long_out,suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/long_out
+30B_2gpu/balanced_c16,256,256,16,384.85,509.81,1.32,8.11,23.97,2.95,1663,618,0.0,suite_Qwen3-30B-A3B_ep2_ours_1795147115/balanced_c16,suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/balanced_c16
+30B_2gpu/balanced_c64,256,256,64,320.04,1750.75,5.47,9.21,43.85,4.76,6116,1259,0.0,suite_Qwen3-30B-A3B_ep2_ours_1795147115/balanced_c64,suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/balanced_c64
+30B_2gpu/prefill_heavy,2048,32,8,259.37,1471.41,5.67,8.75,50.66,5.79,476,84,0.0,suite_Qwen3-30B-A3B_ep2_ours_1795147115/prefill_heavy,suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/prefill_heavy
+30B_2gpu/decode_heavy,64,1024,32,218.8,451.71,2.06,8.68,28.61,3.3,3593,1101,0.0,suite_Qwen3-30B-A3B_ep2_ours_1795147115/decode_heavy,suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/decode_heavy

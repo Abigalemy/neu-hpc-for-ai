@@ -9,7 +9,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 | Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x (below), with a paged KV cache (Week 7); without paging the lecture workload is 46x |
 | Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done** (2026-11-18): whole model matches HF under the frozen MoE rule on a held-out prompt; on 1x H200 every suite workload within 5.56x of vLLM (below) |
-| Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | **in progress**: expert-parallel MoE layer bit-exact vs one GPU, and the whole model on 2x H100 gives logits and tokens identical to 1 GPU; multi-rank server (launcher, coordinator, load balancer) tested on CPU; AIPerf benchmark on 2x H200 pending |
+| Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | **done** (2026-11-19, K = 2 as agreed with the instructor): EP layer bit-exact and whole model identical to 1 GPU; vLLM's process layout (API servers, engine cores, GPU workers, DP coordinator, ZMQ); 2x H200 AIPerf suite vs vLLM DP2 EP: every workload within 5.79x (below) |
 | Part 4 | Within 3x of vLLM; write-up | not started |
 
 Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100, measured 2026-11-18 with the paged KV cache):
@@ -279,6 +279,51 @@ run while the image is built (CPU); on 2x H100 (2026-11-18, NCCL 2.32.3) the per
 (hot, Today, is / feel, I, happy) and all 6 outputs are exact (`results/part2/a2a_mock_2xH100_2026-11-18.txt`).
 Rows past the end of a tile get an out-of-range index, which the masked gather / scatter skips (verified by this run:
 5 padding rows per tile, results exact, no memory error).
+
+## Part 3 + Part 5: data + expert parallelism on 2 GPUs, vLLM's process layout
+
+**Design.** Rank r keeps every non-expert weight and its own requests (data parallelism) and only experts
+[64r, 64r + 64) of each layer (expert parallelism, `engine/qwen3_ep.cuh`). One MoE layer: local route and stable sort
+(Part 1; sorted by expert = grouped by owner rank) -> all-gather of the per-expert counts (one host copy gives send and
+receive counts) -> grouped NCCL send / recv of rows and expert ids -> the owner's grouped GEMMs on its experts ->
+all-to-all back with the counts swapped, which yields exactly Part 1's sorted buffer -> Part 1's weighted combine.
+Receive buffers are sized for the worst case (all tokens of all ranks on one rank's experts); startup fails if they
+do not fit. Every MoE layer is a collective, so every rank runs every forward pass: each pass starts with an
+all-reduce "does anyone have work", an idle rank joins with 0 tokens, and when nobody has work the ranks park until
+the coordinator wakes them all (checked with real processes, `part3/protocol_sim.py`).
+
+**Process layout** (Week 9; `part5/DESIGN.md`, `part5/launch.py`): HTTP load balancer -> K API servers (HTTP, tokenizer,
+streaming) -> ZMQ, any API server to any engine core -> K engine cores (scheduler, KV admission and preemption) ->
+Pipe -> K GPU workers (one per GPU, NCCL between them), plus one DP coordinator (park / wake, load table for routing).
+
+**Correctness.** One real layer on 2x H100: bit-exact vs the single-GPU layer in 6 cases incl. a hotspot where every
+token goes to rank 0's experts (`results/part3/ep_layer_h100x2_2026-11-18.txt`). Whole model on 2x H100: logits and
+tokens identical to 1 GPU (`results/part3/moe_e2e_ep2_h100x2_2026-11-18.txt`). Through all the Part 5 processes on
+2x H100: 4/4 texts identical to the 1-GPU server one at a time, 8/8 all at once
+(`results/part5/smoke_h100x2_2026-11-19.txt`). CPU tests: `part5/test_part5.py` (K = 1, 3; abort frees KV blocks;
+killing any process stops the group).
+
+**Performance, Qwen3-30B-A3B, AIPerf suite** (2026-11-19; ours `suite_Qwen3-30B-A3B_ep2_ours_1795147115`, vLLM
+`--data-parallel-size 2 --tensor-parallel-size 1 --enable-expert-parallel`, `suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843`;
+1-GPU rows from Part 1; `tools/check_suite.py`: all workloads complete and comparable). Averages:
+
+| Workload | TTFT ms: ours 1 / ours 2 / vLLM 1 / vLLM 2 | ratio 2 GPUs | ITL ms: ours 1 / ours 2 / vLLM 1 / vLLM 2 | ratio 2 GPUs | tok/s: ours 2 / vLLM 2 |
+|---|---|---|---|---|---|
+| baseline (128/128, c1) | 42 / 59 / 68 / 103 | 0.57 | 11.02 / 14.44 / 4.00 / 4.97 | 2.91 | 67 / 174 |
+| long_out (3072/1024, c1) | 377 / 497 / 81 / 112 | 4.43 | 12.28 / 15.86 / 4.15 / 5.10 | 3.11 | 61 / 192 |
+| balanced_c16 (256/256) | 514 / 510 / 150 / 385 | 1.32 | 21.66 / 23.97 / 8.46 / 8.11 | 2.95 | 618 / 1663 |
+| balanced_c64 (256/256) | 1930 / 1751 / 468 / 320 | 5.47 | 43.21 / 43.85 / 12.74 / 9.21 | 4.76 | 1259 / 6116 |
+| prefill_heavy (2048/32, c8) | 1141 / 1471 / 245 / 259 | 5.67 | 45.87 / 50.66 / 8.24 / 8.75 | **5.79** | 84 / 476 |
+| decode_heavy (64/1024, c32) | 492 / 452 / 1064 / 219 | 2.06 | 27.73 / 28.61 / 10.26 / 8.68 | 3.30 | 1101 / 3593 |
+
+What the numbers show:
+- One request at a time, 2 GPUs are slower than 1 for both servers (ITL +31% ours, +24% vLLM): every MoE layer adds
+  the count exchange and two all-to-alls.
+- At high concurrency vLLM gains from the second GPU (balanced_c64 ITL 12.74 -> 9.21 ms, throughput +39%;
+  decode_heavy +27%) and ours does not (43.2 -> 43.9 ms). With half the batch per GPU, vLLM's step gets shorter; ours
+  stays the same, so our step time is not dominated by work that scales with the batch. A hypothesis, not yet
+  profiled: the per-layer host synchronisation for the counts (48 per step) and fixed per-layer costs. This is the
+  first item for Part 4 on 2 GPUs.
 
 ## Correctness checks
 

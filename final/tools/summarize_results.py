@@ -39,7 +39,10 @@ PAIRS = [
     ("30B/balanced_c64", "suite_Qwen3-30B-A3B_ours_1795057331/balanced_c64", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c64"),
     ("30B/prefill_heavy", "suite_Qwen3-30B-A3B_ours_1795057331/prefill_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/prefill_heavy"),
     ("30B/decode_heavy", "suite_Qwen3-30B-A3B_ours_1795057331/decode_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/decode_heavy"),
-]
+    # Parts 3 + 5 (2026-11-19): Qwen3-30B-A3B on 2x H200, DP = EP = 2, TP = 1; ours through part5/launch.py, vLLM with
+    # --data-parallel-size 2 --enable-expert-parallel
+] + [(f"30B_2gpu/{w}", f"suite_Qwen3-30B-A3B_ep2_ours_1795147115/{w}", f"suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/{w}")
+     for w in ("baseline", "long_out", "balanced_c16", "balanced_c64", "prefill_heavy", "decode_heavy")]
 
 
 def flag(cli, name):
