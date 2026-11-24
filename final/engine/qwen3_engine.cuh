@@ -44,22 +44,22 @@ using bf16 = __nv_bfloat16;
 #define CKL(call) CK((call))
 
 // ---- compile-time dispatch of the kernels that are specialised on model dimensions -----------------------------------
-static cudaError_t rmsnorm_rows(const bf16* x, const bf16* w, bf16* y, int rows, int D) {
+static cudaError_t rmsnorm_rows(const bf16* x, const bf16* w, bf16* y, int rows, int D, cudaStream_t st = 0) {
     switch (D) {
-        case 128:  return launch_rmsnorm<bf16, 128, 128>(x, y, w, rows);
-        case 1024: return launch_rmsnorm<bf16, 512, 1024>(x, y, w, rows);
-        case 2048: return launch_rmsnorm<bf16, 512, 2048>(x, y, w, rows);
-        case 2560: return launch_rmsnorm<bf16, 512, 2560>(x, y, w, rows);
+        case 128:  return launch_rmsnorm<bf16, 128, 128>(x, y, w, rows, st);
+        case 1024: return launch_rmsnorm<bf16, 512, 1024>(x, y, w, rows, st);
+        case 2048: return launch_rmsnorm<bf16, 512, 2048>(x, y, w, rows, st);
+        case 2560: return launch_rmsnorm<bf16, 512, 2560>(x, y, w, rows, st);
     }
     std::fprintf(stderr, "rmsnorm: unsupported D=%d\n", D);
     return cudaErrorInvalidValue;
 }
 
 static cudaError_t rope_dispatch(bf16* q, bf16* k, const bf16* c, const bf16* s, const int* pos, int n, int max_pos,
-                                 int hq, int hkv) {
-    if (hq == 16 && hkv == 8) return launch_rope<bf16, 16, 8>(q, k, c, s, pos, n, max_pos);
-    if (hq == 32 && hkv == 8) return launch_rope<bf16, 32, 8>(q, k, c, s, pos, n, max_pos);
-    if (hq == 32 && hkv == 4) return launch_rope<bf16, 32, 4>(q, k, c, s, pos, n, max_pos);
+                                 int hq, int hkv, cudaStream_t st = 0) {
+    if (hq == 16 && hkv == 8) return launch_rope<bf16, 16, 8>(q, k, c, s, pos, n, max_pos, st);
+    if (hq == 32 && hkv == 8) return launch_rope<bf16, 32, 8>(q, k, c, s, pos, n, max_pos, st);
+    if (hq == 32 && hkv == 4) return launch_rope<bf16, 32, 4>(q, k, c, s, pos, n, max_pos, st);
     std::fprintf(stderr, "rope: unsupported heads %d/%d\n", hq, hkv);
     return cudaErrorInvalidValue;
 }
@@ -67,42 +67,46 @@ static cudaError_t rope_dispatch(bf16* q, bf16* k, const bf16* c, const bf16* s,
 // Prefill / chunk of ONE sequence: q [n_q, HQ, 128] against the block pool kc, vc (pool_rows rows) through that
 // sequence's block table d_bt (device).
 static cudaError_t attention_prefill(const bf16* q, const bf16* kc, const bf16* vc, bf16* o, int n_q, int n_kv,
-                                     const int* d_bt, int pool_rows, int hq, int hkv) {
-    if (hq == 16 && hkv == 8) return launch_flash_attention<bf16, 16, 8>(q, kc, vc, o, n_q, n_kv, 0, d_bt, pool_rows);
-    if (hq == 32 && hkv == 8) return launch_flash_attention<bf16, 32, 8>(q, kc, vc, o, n_q, n_kv, 0, d_bt, pool_rows);
-    if (hq == 32 && hkv == 4) return launch_flash_attention<bf16, 32, 4>(q, kc, vc, o, n_q, n_kv, 0, d_bt, pool_rows);
+                                     const int* d_bt, int pool_rows, int hq, int hkv, cudaStream_t st = 0) {
+    if (hq == 16 && hkv == 8) return launch_flash_attention<bf16, 16, 8>(q, kc, vc, o, n_q, n_kv, st, d_bt, pool_rows);
+    if (hq == 32 && hkv == 8) return launch_flash_attention<bf16, 32, 8>(q, kc, vc, o, n_q, n_kv, st, d_bt, pool_rows);
+    if (hq == 32 && hkv == 4) return launch_flash_attention<bf16, 32, 4>(q, kc, vc, o, n_q, n_kv, st, d_bt, pool_rows);
     std::fprintf(stderr, "attention: unsupported heads %d/%d\n", hq, hkv);
     return cudaErrorInvalidValue;
 }
 
 // One decode step of B sequences (split-KV kernel over the block pool; d_bt = all block tables [slots, max_blocks]).
 // QWEN3_ATTN=small or a device without big tiles: one launch per sequence with the verified 16x16 / fp32-P kernel.
+// max_kv_floor (CUDA graph capture): size the split grid for this length at least, so the grid no longer depends on
+// the positions of this step. Each sequence still splits its own tiles by split_target only (the kernel), and the
+// extra splits write empty states that the combine weights by 0: the same results, bit for bit.
 static cudaError_t attention_decode(const bf16* q, const bf16* kc, const bf16* vc, bf16* o, int B, const int* d_slots,
                                     const int* d_pos, const int* h_slots, const int* h_pos, const int* d_bt, int max_blocks,
-                                    int pool_rows, int hq, int hkv, const BatchDecodeWorkspace& ws) {
+                                    int pool_rows, int hq, int hkv, const BatchDecodeWorkspace& ws, cudaStream_t st = 0,
+                                    int max_kv_floor = 0) {
     static const bool force_small = [] { const char* e = std::getenv("QWEN3_ATTN"); return e && std::string(e) == "small"; }();
     if (tile_profile() != TileProfile::BIG || force_small) {
         const size_t QD = (size_t)hq * FA_D;
         for (int b = 0; b < B; ++b) {
             cudaError_t e = attention_prefill(q + b * QD, kc, vc, o + b * QD, 1, h_pos[b] + 1,
-                                              d_bt + (size_t)h_slots[b] * max_blocks, pool_rows, hq, hkv);
+                                              d_bt + (size_t)h_slots[b] * max_blocks, pool_rows, hq, hkv, st);
             if (e != cudaSuccess) return e;
         }
         return cudaSuccess;
     }
-    int max_kv = 0;
+    int max_kv = max_kv_floor;
     for (int b = 0; b < B; ++b) max_kv = std::max(max_kv, h_pos[b] + 1);
-    if (hq == 16 && hkv == 8) return launch_flash_decode_batch<bf16, 16, 8>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws);
-    if (hq == 32 && hkv == 8) return launch_flash_decode_batch<bf16, 32, 8>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws);
-    if (hq == 32 && hkv == 4) return launch_flash_decode_batch<bf16, 32, 4>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws);
+    if (hq == 16 && hkv == 8) return launch_flash_decode_batch<bf16, 16, 8>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws, st);
+    if (hq == 32 && hkv == 8) return launch_flash_decode_batch<bf16, 32, 8>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws, st);
+    if (hq == 32 && hkv == 4) return launch_flash_decode_batch<bf16, 32, 4>(q, kc, vc, o, B, d_slots, d_pos, d_bt, max_blocks, pool_rows, max_kv, ws, st);
     std::fprintf(stderr, "attention: unsupported heads %d/%d\n", hq, hkv);
     return cudaErrorInvalidValue;
 }
 
 static cudaError_t kv_scatter_dispatch(const bf16* k, const bf16* v, bf16* kc, bf16* vc, const int* d_rows, int n, int n_rows,
-                                       int hkv) {
-    if (hkv == 8) return launch_kv_scatter<bf16, 8>(k, v, kc, vc, d_rows, n, n_rows);
-    if (hkv == 4) return launch_kv_scatter<bf16, 4>(k, v, kc, vc, d_rows, n, n_rows);
+                                       int hkv, cudaStream_t st = 0) {
+    if (hkv == 8) return launch_kv_scatter<bf16, 8>(k, v, kc, vc, d_rows, n, n_rows, st);
+    if (hkv == 4) return launch_kv_scatter<bf16, 4>(k, v, kc, vc, d_rows, n, n_rows, st);
     std::fprintf(stderr, "kv scatter: unsupported kv heads %d\n", hkv);
     return cudaErrorInvalidValue;
 }
@@ -168,6 +172,9 @@ public:
     int max_blocks;          // block-table width: blocks of one sequence of max_len tokens
     int n_blocks;            // KV-cache blocks in the pool (KV_BLOCK tokens each), shared by all sequences
     bool profile = false;    // when true, forward() times every stage with CUDA events (see prof_report)
+    int graphs_captured = 0; // decode CUDA graphs captured so far (one per batch size seen)
+    // decode steps on one GPU as CUDA graphs (see graphable()); QWEN3_GRAPH=0 turns them off
+    bool use_graphs = [] { const char* e = std::getenv("QWEN3_GRAPH"); return !(e && std::string(e) == "0"); }();
 
     // yarn_factor > 0 turns YaRN on (original context 32768) even if the checkpoint's config has no rope_scaling, as
     // needed for Qwen3-4B at 128K (factor 4). If it is <= 0 the environment variable QWEN3_YARN is used the same way.
@@ -496,79 +503,90 @@ private:
         double pairs = 0, kv_read = 0;                                                    // for the profile only
         for (int i = 0; i < n; ++i) { pairs += decode ? h_pos[i] + 1 : start_pos + i + 1; kv_read += decode ? h_pos[i] + 1 : 0; }
         if (!decode) kv_read = start_pos + nn;
-        bf16 *x = xa_, *other = xb_;
-        stage("embedding", nn * H * 2.0, 0, [&] { CKL(launch_embedding<bf16>(d_tokens_, embed_, x, cfg.vocab, n, H)); });
-        for (int l = 0; l < cfg.layers; ++l) {
-            const LayerWeights& L = layers_[l];
-            stage("rmsnorm", 2.0 * nn * H * 2, 0, [&] { CKL(rmsnorm_rows(x, L.ln1, h_, n, H)); });
-            stage("q_proj", lin_bytes(QD, H), lin_flops(QD, H), [&] { CKL(launch_linear<bf16>(h_, L.wq, qraw_, n, H, QD)); });
-            stage("k_proj", lin_bytes(KD, H), lin_flops(KD, H), [&] { CKL(launch_linear<bf16>(h_, L.wk, kraw_, n, H, KD)); });
-            stage("v_proj", lin_bytes(KD, H), lin_flops(KD, H), [&] { CKL(launch_linear<bf16>(h_, L.wv, v_, n, H, KD)); });
-            stage("qk_norm", 2.0 * nn * (QD + KD) * 2, 0, [&] {
-                CKL(rmsnorm_rows(qraw_, L.qn, qn_, n * HQ, FA_D));    // per-head RMSNorm: rows = n*heads, D = 128
-                CKL(rmsnorm_rows(kraw_, L.kn, kn_, n * HKV, FA_D));
-            });
-            stage("rope", 2.0 * nn * (QD + KD) * 2, 0, [&] { CKL(rope_dispatch(qn_, kn_, d_cos_, d_sin_, d_pos_, n, max_len, HQ, HKV)); });
-            stage("kv_write", 2.0 * nn * KD * 2 * 2, 0, [&] {   // every token to its pool row (blocks are not contiguous)
-                CKL(kv_scatter_dispatch(kn_, v_, kcache_[l], vcache_[l], d_rows_, n, pool_rows, HKV));
-            });
-            stage("attention", 2.0 * kv_read * KD * 2, 4.0 * HQ * FA_D * pairs, [&] {
-                if (decode)
-                    CKL(attention_decode(qn_, kcache_[l], vcache_[l], attn_, n, d_slots_, d_pos_, h_slots, h_pos, d_bt_,
-                                         max_blocks, pool_rows, HQ, HKV, dec_ws_));
-                else
-                    CKL(attention_prefill(qn_, kcache_[l], vcache_[l], attn_, n, start_pos + n, seq_bt, pool_rows, HQ, HKV));
-            });
-            stage("o_proj", lin_bytes(H, QD), lin_flops(H, QD), [&] { CKL(launch_linear<bf16>(attn_, L.wo, o_, n, QD, H)); });
-            stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H)); });
-            std::swap(x, other);
-            stage("rmsnorm", 2.0 * nn * H * 2, 0, [&] { CKL(rmsnorm_rows(x, L.ln2, h_, n, H)); });
-            if (L.router) {   // MoE layer: K of E experts per token (bytes: the experts that can be touched, flops: K)
-                // the steps of launch_moe (same kernels, same order), each its own stage for the profile
-                const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
-                const double ex_flops = 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H);
-                if (ep_.world > 1) {
-                    moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
-                                               moe_ws_, ep_ws_, ep_, 0, ncclBfloat16,
-                                               [&](const char* name, auto&& f) { stage(name, 0, 0, f); });
+        // the GPU part of the pass (every launch on s_): run directly, or, for a decode step on one GPU, captured once
+        // per batch size as a CUDA graph and replayed (one launch instead of ~1000; see decode_graph)
+        auto pass = [&] {
+            bf16 *x = xa_, *other = xb_;
+            stage("embedding", nn * H * 2.0, 0, [&] { CKL(launch_embedding<bf16>(d_tokens_, embed_, x, cfg.vocab, n, H, s_)); });
+            for (int l = 0; l < cfg.layers; ++l) {
+                const LayerWeights& L = layers_[l];
+                stage("rmsnorm", 2.0 * nn * H * 2, 0, [&] { CKL(rmsnorm_rows(x, L.ln1, h_, n, H, s_)); });
+                stage("q_proj", lin_bytes(QD, H), lin_flops(QD, H), [&] { CKL(launch_linear<bf16>(h_, L.wq, qraw_, n, H, QD, s_)); });
+                stage("k_proj", lin_bytes(KD, H), lin_flops(KD, H), [&] { CKL(launch_linear<bf16>(h_, L.wk, kraw_, n, H, KD, s_)); });
+                stage("v_proj", lin_bytes(KD, H), lin_flops(KD, H), [&] { CKL(launch_linear<bf16>(h_, L.wv, v_, n, H, KD, s_)); });
+                stage("qk_norm", 2.0 * nn * (QD + KD) * 2, 0, [&] {
+                    CKL(rmsnorm_rows(qraw_, L.qn, qn_, n * HQ, FA_D, s_));    // per-head RMSNorm: rows = n*heads, D = 128
+                    CKL(rmsnorm_rows(kraw_, L.kn, kn_, n * HKV, FA_D, s_));
+                });
+                stage("rope", 2.0 * nn * (QD + KD) * 2, 0, [&] { CKL(rope_dispatch(qn_, kn_, d_cos_, d_sin_, d_pos_, n, max_len, HQ, HKV, s_)); });
+                stage("kv_write", 2.0 * nn * KD * 2 * 2, 0, [&] {   // every token to its pool row (blocks are not contiguous)
+                    CKL(kv_scatter_dispatch(kn_, v_, kcache_[l], vcache_[l], d_rows_, n, pool_rows, HKV, s_));
+                });
+                stage("attention", 2.0 * kv_read * KD * 2, 4.0 * HQ * FA_D * pairs, [&] {
+                    if (decode)
+                        CKL(attention_decode(qn_, kcache_[l], vcache_[l], attn_, n, d_slots_, d_pos_, h_slots, h_pos, d_bt_,
+                                             max_blocks, pool_rows, HQ, HKV, dec_ws_, s_, kv_floor_));
+                    else
+                        CKL(attention_prefill(qn_, kcache_[l], vcache_[l], attn_, n, start_pos + n, seq_bt, pool_rows, HQ, HKV, s_));
+                });
+                stage("o_proj", lin_bytes(H, QD), lin_flops(H, QD), [&] { CKL(launch_linear<bf16>(attn_, L.wo, o_, n, QD, H, s_)); });
+                stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H, s_)); });
+                std::swap(x, other);
+                stage("rmsnorm", 2.0 * nn * H * 2, 0, [&] { CKL(rmsnorm_rows(x, L.ln2, h_, n, H, s_)); });
+                if (L.router) {   // MoE layer: K of E experts per token (bytes: the experts that can be touched, flops: K)
+                    // the steps of launch_moe (same kernels, same order), each its own stage for the profile
+                    const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
+                    const double ex_flops = 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H);
+                    if (ep_.world > 1) {
+                        moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
+                                                   moe_ws_, ep_ws_, ep_, 0, ncclBfloat16,
+                                                   [&](const char* name, auto&& f) { stage(name, 0, 0, f); });
+                    } else {
+                        if (n > moe_ws_.max_tokens) { std::fprintf(stderr, "moe: %d tokens (workspace %d)\n", n, moe_ws_.max_tokens); std::exit(2); }
+                        const int A = n * cfg.top_k;
+                        stage("moe_router", (double)cfg.experts * H * 2, 2.0 * nn * cfg.experts * H, [&] {
+                            CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk, s_)));
+                        });
+                        // Part 4: the sort also writes the work list (only the non-empty (expert, row tile) pairs get a
+                        // block in the GEMMs; same tiles, same results)
+                        stage("moe_sort", 0, 0, [&] { CKL((moe_sort_list<bf16, 128, 8>(n, moe_ws_, s_))); });
+                        stage("moe_gate_up", ex_bytes * 2 / 3, ex_flops * 2 / 3, [&] {
+                            CKL((moe_experts_part<bf16, 8>(true, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
+                                                            moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,
+                                                            s_, moe_ws_.tiles, A)));
+                        });
+                        stage("moe_down", ex_bytes / 3, ex_flops / 3, [&] {
+                            CKL((moe_experts_part<bf16, 8>(false, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
+                                                            moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,
+                                                            s_, moe_ws_.tiles, A)));
+                        });
+                        stage("moe_combine", 0, 0, [&] {
+                            CKL((moe_combine<bf16, 8>(moe_ws_.ysorted, A, moe_ws_.inv, moe_ws_.w, o_, n, H, s_)));
+                        });
+                    }
+                    if (moe_dump_) dump_routing(l, n, h_pos);
                 } else {
-                    if (n > moe_ws_.max_tokens) { std::fprintf(stderr, "moe: %d tokens (workspace %d)\n", n, moe_ws_.max_tokens); std::exit(2); }
-                    const int A = n * cfg.top_k;
-                    stage("moe_router", (double)cfg.experts * H * 2, 2.0 * nn * cfg.experts * H, [&] {
-                        CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk)));
-                    });
-                    // Part 4: the sort also writes the work list (only the non-empty (expert, row tile) pairs get a
-                    // block in the GEMMs; same tiles, same results)
-                    stage("moe_sort", 0, 0, [&] { CKL((moe_sort_list<bf16, 128, 8>(n, moe_ws_))); });
-                    stage("moe_gate_up", ex_bytes * 2 / 3, ex_flops * 2 / 3, [&] {
-                        CKL((moe_experts_part<bf16, 8>(true, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
-                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,
-                                                        0, moe_ws_.tiles, A)));
-                    });
-                    stage("moe_down", ex_bytes / 3, ex_flops / 3, [&] {
-                        CKL((moe_experts_part<bf16, 8>(false, h_, n, L.ewg, L.ewu, L.ewd, moe_ws_.count, moe_ws_.off, moe_ws_.sorted,
-                                                        moe_ws_.hbuf, moe_ws_.ysorted, 0, 128, n, (long long)A / 128, H, cfg.moe_inter,
-                                                        0, moe_ws_.tiles, A)));
-                    });
-                    stage("moe_combine", 0, 0, [&] {
-                        CKL((moe_combine<bf16, 8>(moe_ws_.ysorted, A, moe_ws_.inv, moe_ws_.w, o_, n, H)));
-                    });
+                    stage("mlp_gate_up_silu", 2.0 * lin_bytes(cfg.inter, H), 2.0 * lin_flops(cfg.inter, H),
+                          [&] { CKL(launch_mlp_gate_up<bf16>(h_, L.wg, L.wu, mlp_h_, n, H, cfg.inter, s_)); });
+                    stage("mlp_down", lin_bytes(H, cfg.inter), lin_flops(H, cfg.inter),
+                          [&] { CKL(launch_mlp_down<bf16>(mlp_h_, L.wd, o_, n, H, cfg.inter, s_)); });
                 }
-                if (moe_dump_) dump_routing(l, n, h_pos);
-            } else {
-                stage("mlp_gate_up_silu", 2.0 * lin_bytes(cfg.inter, H), 2.0 * lin_flops(cfg.inter, H),
-                      [&] { CKL(launch_mlp_gate_up<bf16>(h_, L.wg, L.wu, mlp_h_, n, H, cfg.inter)); });
-                stage("mlp_down", lin_bytes(H, cfg.inter), lin_flops(H, cfg.inter),
-                      [&] { CKL(launch_mlp_down<bf16>(mlp_h_, L.wd, o_, n, H, cfg.inter)); });
+                stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H, s_)); });
+                std::swap(x, other);
             }
-            stage("residual_add", 3.0 * nn * H * 2, 0, [&] { CKL(launch_add<bf16>(x, o_, other, n * H)); });
-            std::swap(x, other);
+            int rows = all_logits ? n : 1;
+            const bf16* xin = all_logits ? x : x + (size_t)(n - 1) * H;
+            stage("rmsnorm", 0, 0, [&] { CKL(rmsnorm_rows(xin, final_norm_, h_, rows, H, s_)); });
+            stage("lm_head", lin_bytes(cfg.vocab, H), 2.0 * rows * cfg.vocab * H,
+                  [&] { CKL(launch_linear<bf16>(h_, lm_head_, logits_, rows, H, cfg.vocab, s_)); });
+        };
+        if (decode && graphable()) {
+            cudaGraphExec_t& ge = graphs_[n];
+            if (!ge) ge = capture(pass);
+            CK(cudaGraphLaunch(ge, 0));
+        } else {
+            pass();
         }
-        int rows = all_logits ? n : 1;
-        const bf16* xin = all_logits ? x : x + (size_t)(n - 1) * H;
-        stage("rmsnorm", 0, 0, [&] { CKL(rmsnorm_rows(xin, final_norm_, h_, rows, H)); });
-        stage("lm_head", lin_bytes(cfg.vocab, H), 2.0 * rows * cfg.vocab * H,
-              [&] { CKL(launch_linear<bf16>(h_, lm_head_, logits_, rows, H, cfg.vocab)); });
         CK(cudaDeviceSynchronize());
         if (profile) {
             wall_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_wall).count();
@@ -577,6 +595,42 @@ private:
         }
         return logits_;
     }
+
+    // ---- CUDA graphs for decode (Part 4) -----------------------------------------------------------------------
+    // A decode step is ~1000 small launches (about 20 per layer); at small batches the GPU work per launch is a few
+    // microseconds, so the host's launch rate sets the step time. Everything a decode pass launches depends only on
+    // the batch size B once the attention split grid is sized for max_len (kv_floor_), and all its inputs (tokens,
+    // positions, slots, KV rows, block tables) are read from fixed device buffers that run() fills before the
+    // launch. So the pass is captured once per B and replayed; same kernels, same arguments, same results.
+    // Not used with expert parallelism (NCCL and a host sync inside the layer), while profiling (stage events), with
+    // QWEN3_MOE_DUMP (a copy per layer), with the small-tile attention (a launch per sequence with host lengths), or
+    // with use_graphs off (QWEN3_GRAPH=0).
+    bool graphable() const {
+        static const bool small = [] { const char* e = std::getenv("QWEN3_ATTN"); return e && std::string(e) == "small"; }();
+        return use_graphs && !small && ep_.world == 1 && !profile && !moe_dump_ && tile_profile() == TileProfile::BIG;
+    }
+    template <typename F>
+    cudaGraphExec_t capture(F&& pass) {
+        if (!cap_stream_) CK(cudaStreamCreateWithFlags(&cap_stream_, cudaStreamNonBlocking));
+        CK(cudaDeviceSynchronize());
+        s_ = cap_stream_;
+        kv_floor_ = max_len;
+        CK(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
+        pass();
+        cudaGraph_t g;
+        CK(cudaStreamEndCapture(s_, &g));
+        s_ = 0;
+        kv_floor_ = 0;
+        cudaGraphExec_t ge;
+        CK(cudaGraphInstantiate(&ge, g, 0));
+        CK(cudaGraphDestroy(g));
+        ++graphs_captured;
+        return ge;
+    }
+    cudaStream_t s_ = 0;                     // stream of the pass's launches (the capture stream while capturing)
+    cudaStream_t cap_stream_ = nullptr;
+    int kv_floor_ = 0;                       // attention split grid sized for at least this length (graphs: max_len)
+    std::map<int, cudaGraphExec_t> graphs_;  // decode graph per batch size
 
     // QWEN3_MOE_DUMP=<file>: append every MoE layer's chosen experts, record = int32 layer, n, positions[n],
     // experts[n * K] (debugging only: a device-to-host copy per layer)
