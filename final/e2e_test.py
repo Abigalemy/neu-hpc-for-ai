@@ -35,6 +35,54 @@ PRICE_L4 = 0.80
 PROMPT = ("Explain in two sentences why tiling a matrix multiplication in GPU shared memory makes it faster. "
           "Then name one limit of the technique.")
 
+NEAR_TIE = 0.5      # logits: a top-1 or greedy difference passes only if HF scores the engine's token < 0.5 below its best
+MIN_COS = 0.999
+
+
+def dense_verdict(ref, mine, gen, exp, gen_row0, rope_bad):
+    """The dense pass decision as a pure function of the data (numpy; tested locally by tools/test_verdicts.py).
+    ref, mine: [rows, vocab] logits of HF and the engine on the same teacher-forced positions; gen, exp: the engine's
+    and HF's greedy tokens; gen_row0: the row of ref whose logits predict exp[0]; rope_bad: differing RoPE table entries.
+    Pass needs all of:
+      * every top-1 mismatch a near tie FOR THE ENGINE'S TOKEN: HF's best minus HF's score of the engine's choice < 0.5
+        (HF's own top-2 gap is not enough: HF tied on A and B, engine choosing a far lower C must fail)
+      * min cosine over all rows > 0.999
+      * greedy tokens identical, or the first difference at a near tie for the engine's token (same 0.5, on HF's
+        logits at that position); after a difference the two continuations have different prefixes, so later tokens
+        are not compared
+      * RoPE tables bit-identical
+    Returns (ok, lines)."""
+    import numpy as np
+    rows = np.arange(len(ref))
+    choice = mine.argmax(1)
+    best = ref.max(1)
+    gap = best - ref[rows, choice]
+    mism = np.nonzero(ref.argmax(1) != choice)[0]
+    top1_ok = bool(np.all(gap[mism] < NEAR_TIE))
+    cos = (ref * mine).sum(1) / (np.linalg.norm(ref, axis=1) * np.linalg.norm(mine, axis=1))
+    cos_ok = bool(cos.min() > MIN_COS)
+    n = min(len(gen), len(exp))
+    first = next((i for i in range(n) if gen[i] != exp[i]), None)
+    if len(gen) < len(exp) and first is None:
+        greedy_ok, why = False, f"engine produced {len(gen)} of {len(exp)} tokens"
+    elif first is None:
+        greedy_ok, why = True, f"{len(exp)}/{len(exp)} identical"
+    else:
+        r = gen_row0 + first
+        if 0 <= r < len(ref):
+            g = float(best[r] - ref[r, gen[first]])
+            greedy_ok, why = g < NEAR_TIE, (f"first difference at token {first}: the engine's token is {g:.3f} below "
+                                            f"HF's best there")
+        else:
+            greedy_ok, why = False, f"first difference at token {first}, outside the compared rows"
+    rope_ok = rope_bad == 0
+    lines = [f"  top-1 {len(ref) - len(mism)}/{len(ref)}, every mismatch's engine token < {NEAR_TIE} below HF's best: "
+             f"{'yes' if top1_ok else 'NO'}" + "".join(f"; row {int(i)}: {gap[i]:.3f}" for i in mism),
+             f"  min cosine {cos.min():.6f} (> {MIN_COS}: {'yes' if cos_ok else 'NO'})",
+             f"  greedy: {why} ({'ok' if greedy_ok else 'FAIL'})",
+             f"  RoPE tables: {rope_bad} differing entries ({'ok' if rope_ok else 'FAIL'})"]
+    return top1_ok and cos_ok and greedy_ok and rope_ok, lines
+
 
 def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int = 0, yarn: float = 0.0):
     import glob
@@ -143,12 +191,10 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
               + ("" if first_bad is None else f" (first difference at token {first_bad})"))
         if vi == 0:
             print("  engine text:", repr(tok.decode(gen.tolist())))
-            first = (mism, pre_cos, dec_cos)
-        summary.append((tag, keep - len(mism), pre_cos, dec_cos))
-    mism, pre_cos, dec_cos = first
+        summary.append((tag, keep - len(mism), pre_cos, dec_cos, mine.numpy(), gen.copy()))
     if ab:
         print("\nA/B summary (same HF reference): configuration | top-1 | min cosine prefill | min cosine decode")
-        for tag, ok_n, pc, dc in summary:
+        for tag, ok_n, pc, dc, _, _ in summary:
             print(f"  {tag[:62]:<62} {ok_n}/{keep}  {pc:.6f}  {dc:.6f}")
 
     # RoPE tables vs HF
@@ -161,10 +207,15 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
     bad_c, bad_s = int((rt[0] != hf_c).sum()), int((rt[1] != hf_s).sum())
     print(f"RoPE tables (positions 0..{P - 1}): differing bf16 entries cos {bad_c}/{hf_c.size}, sin {bad_s}/{hf_s.size}")
 
-    # verdict: any top-1 mismatch must be a near tie in HF's own logits
-    bad_mism = [i for i in mism if margin[i] >= 0.5]
-    ok = (not bad_mism) and min(pre_cos, dec_cos) > 0.999
-    print("\nPASS" if ok else "\nFAIL (top-1 mismatch with a clear margin, or cosine below 0.999)")
+    # verdict: every engine configuration must pass every check (see dense_verdict)
+    ok = True
+    ref_np = ref.numpy()
+    for tag, _, _, _, mine_np, gen_np in summary:
+        v_ok, lines = dense_verdict(ref_np, mine_np, gen_np, exp, n_prompt - 1 - first_keep, bad_c + bad_s)
+        print(f"\nverdict, {tag}: {'PASS' if v_ok else 'FAIL'}")
+        print("\n".join(lines))
+        ok &= v_ok
+    print("\nPASS (all configurations)" if ok else "\nFAIL")
     return 0 if ok else 1
 
 

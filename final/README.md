@@ -11,8 +11,8 @@ the dense Qwen3-4B and the MoE Qwen3-30B-A3B, on one GPU or with data + expert p
 
 | Part | What | Status |
 |---|---|---|
-| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x, with a paged KV cache (Week 7); without paging the lecture workload is 46x |
-| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done**: whole model matches HF under the frozen MoE rule on a held-out prompt. With HF's experts forced, mean cosine is 0.99987 / 0.99988, so the remaining difference is mostly router ties |
+| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x, with a paged KV cache (Week 7); in an 8-slot equal-memory capacity simulation (fixed per-sequence reservations) the lecture workload's TTFT is 46.1x |
+| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done**: whole model matches HF under the frozen MoE rule on a held-out prompt. Forcing HF's expert choices removes 89% / 75% of the mean cosine distance on the two tested prompts (mean cosine 0.99987 / 0.99988) |
 | Part 2 | Two-GPU all-to-all mock | **done**: `part2/`, exact on 2x H100 |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | **done** (K = 2, as agreed with the instructor): EP layer bit-exact and whole model identical to 1 GPU; vLLM's process layout (API servers, engine cores, GPU workers, DP coordinator, ZMQ) |
 | Part 4 | Within 3x of vLLM; write-up | **done**: all 6 suite workloads within 3x of vLLM for TTFT and ITL on 4B 1x H100, 30B 1x H200 and 30B 2x H200 |
@@ -110,7 +110,9 @@ The numbers as measured at the end of Part 0 (2026-11-18). The suite was rerun a
 [Part 4](#part-4-every-suite-workload-within-3x-of-vllm) for the current numbers.
 
 Qwen3-4B bf16, 1x H100, both measured with AIPerf through their HTTP servers, same AIPerf settings and seed, greedy,
-EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source: `results/comparison.csv`.
+EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source: `results/aiperf/suite_ours_1795031469`
+vs `results/aiperf/suite_vllm_1794881615` (suite rows), `ours_isl130816_osl128_1795026977` vs
+`vllm_isl130816_osl128_1794875810` (128K); `results/comparison.csv` now holds the Part 4 rerun of the suite.
 
 | Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio | ITL vLLM / ours (ms) | ratio | output tok/s vLLM / ours |
 |---|---|---|---|---|---|---|
@@ -292,9 +294,12 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
   Same routing removes 89% (tiling) and 75% (heldout) of the mean 1 - cosine. With it, heldout meets the dense
   criterion (min cosine > 0.999) on all 46 positions, and tiling meets it on 42 of 43. The one exception, tiling
   position 37 (cosine 0.99815), is a position where HF is certain: top-1 probability 1.000, margin 13.6. The largest
-  error there is 0.625 on logits up to 34, 2.5 bf16 steps. That is rounding accumulated over 48 layers, not a wrong
-  token. So the gap between the MoE and the dense results comes mostly from the routing ties, as the earlier runs
-  suggested but could not show. The frozen MoE rule reports FAIL for the forced tiling run only because of its
+  error there is 0.625 on logits up to 34, 2.5 bf16 steps, not a wrong token; this is consistent with numerical
+  differences, but its source was not isolated (no per-layer ablation). So on these two prompts the expert choice
+  accounts for most of the gap between the MoE and the dense results. The experiment replaces the choice at every
+  layer and position at once: it does not separate exact ties from rounding differences near the top-8 boundary or
+  from their propagation to later layers. And not every difference is a tie the tie rule resolves: with the
+  engine's tie rule in the reference, tiling's free-routing mean cosine went down (0.99921 -> 0.99878), not up. The frozen MoE rule reports FAIL for the forced tiling run only because of its
   "low cosine within reach of a routing difference" clause: with forced routing there is no difference for a low
   position to be within reach of.
 
@@ -402,6 +407,21 @@ do not fit. Every MoE layer is a collective, so every rank runs every forward pa
 all-reduce "does anyone have work", an idle rank joins with 0 tokens, and when nobody has work the ranks park until
 the coordinator wakes them all (checked with real processes, `part3/protocol_sim.py`).
 
+**Memory per GPU** (Qwen3-30B-A3B, bf16, 2 GPUs):
+
+| item | size |
+|---|---|
+| one expert of one layer: gate, up, down, each 2048 x 768 | 3 x 2048 x 768 x 2 B = 9 MiB |
+| one expert id across the 48 layers | 48 x 9 MiB = 432 MiB |
+| experts per GPU: 64 of 128 | 64 x 432 MiB = **27 GiB** (all 128 on one GPU: 54 GiB) |
+| non-expert weights, copied on every rank: attention 48 x 2048 x (4096 + 512 + 512) + 48 x 4096 x 2048, routers 48 x 2048 x 128, embedding and lm_head (untied) 2 x 151936 x 2048 | about 1.55 G parameters = 2.9 GiB |
+| KV cache: 48 layers x (K + V) x 4 KV heads x 128 x 2 B | 96 KiB per token (the suite's pool, per rank: 64 sequences x 4224 tokens = 270336 tokens = 24.8 GiB) |
+| EP receive buffers and the MoE workspace | sized at startup for the worst case (all tokens of all ranks on one rank) |
+
+So about 55 GiB per GPU (27 + 2.9 + 24.8) of the 141 GB of an H200 with the suite's settings, before the workspaces. The engine allocates the weights first and the
+buffers after them, and stops with an error if an allocation fails; there is no separate budget check before the
+first allocation.
+
 **Process layout** (Week 9; `part5/DESIGN.md`, `part5/launch.py`): HTTP load balancer -> K API servers (HTTP, tokenizer,
 streaming) -> ZMQ, any API server to any engine core -> K engine cores (scheduler, KV admission and preemption) ->
 Pipe -> K GPU workers (one per GPU, NCCL between them), plus one DP coordinator (park / wake, load table for routing).
@@ -411,7 +431,9 @@ token goes to rank 0's experts (`results/part3/ep_layer_h100x2_2026-11-18.txt`).
 tokens identical to 1 GPU (`results/part3/moe_e2e_ep2_h100x2_2026-11-18.txt`). Through all the Part 5 processes on
 2x H100: 4/4 texts identical to the 1-GPU server one at a time, 8/8 all at once
 (`results/part5/smoke_h100x2_2026-11-19.txt`). CPU tests: `part5/test_part5.py` (K = 1, 3; abort frees KV blocks;
-killing any process stops the group).
+killing any process stops the group); `tools/test_verdicts.py`: a GPU worker that stays alive but stops replying
+makes its engine core exit after `QWEN3_WORKER_TIMEOUT` (600 s per call; 3600 s for loading the weights), so the
+launcher stops the group, and a request whose first send fails leaves nothing pending.
 
 **Performance, Qwen3-30B-A3B, AIPerf suite, before Part 4** (2026-11-19; the rerun after Part 4 is in
 [Part 4](#part-4-every-suite-workload-within-3x-of-vllm); ours `suite_Qwen3-30B-A3B_ep2_ours_1795147115`, vLLM
@@ -481,7 +503,9 @@ runs are the same ones as before. Every run had 0 request errors. The ratios are
 What changed (each step checked bit-exact or byte-identical before it was timed; profiles in `results/part4/`):
 1. Per-stage profile of the MoE and EP layers with the host clock (`tests/moe_profile_test.cu`). On 1x H200 the
    expert GEMMs took most of a long prefill, at 30-40 TFLOP/s: most of the blocks of their grid had no rows.
-2. Work list for the expert GEMMs: blocks are launched only for the (expert, row tile) pairs that have rows
+2. Work list for the expert GEMMs: a compact list of the (expert, row tile) pairs that have rows replaces the
+   worst-case grid per expert. The grid is sized for the list's upper bound, so a few sentinel entries (-1) remain:
+   their blocks start and return at once
    (`part4/tile_list_sim.py` checked the indexing on the CPU first; `tests/moe_tiles_test.cu`: same output as the full
    grid, bit for bit). 2048-token prefill 251 -> 183 ms on 1 GPU, 594 -> 259 ms on 2 GPUs.
 3. Expert GEMM tiles and alignment hints chosen by a sweep (`tests/moe_sweep_test.cu`, bit-exact): 2048-token
@@ -491,9 +515,13 @@ What changed (each step checked bit-exact or byte-identical before it was timed;
    19 steps at batch 1 / 8 / 32 / 64. Decode step 8.14 -> 7.33 ms at batch 1 and 20.32 -> 19.03 ms at batch 64
    (30B, 1x H200). Graphs are off with expert parallelism, so the 2-GPU gains come from steps 2-4.
 
-Rejected: chunked prefill. A simulation of the scheduler (it matched the measured prefill_heavy run) showed that
-it raises the mean ITL here. Every forward reads all the expert weights, so splitting a prefill into chunks adds
-whole forwards.
+Not done: chunked prefill. A scheduler simulation (`part4/sched_sim.py`, CPU; output
+`results/part4/sched_sim_2026-11-25.txt`) with the step times of the 1x H200 profile reproduces the measured
+prefill_heavy run (389 / 25.6 ms modelled vs 391 / 24.4 ms measured, TTFT / ITL) and predicts a higher mean ITL
+for every chunked policy it models: 27.9-43.5 ms for chunks of 2048, 1024 and 512 tokens, interleaved or mixed with
+the decode rows. Each chunk is a forward of its own with the fixed cost of a forward (34 ms at 256 tokens), and a
+chunk of a few hundred tokens x top-8 already touches most of the 128 experts of each layer. This is a model's
+prediction for this one workload, not a measurement of a chunked scheduler.
 
 Caveat: runs of our server in different containers have differed by up to 7-28% (Known limitations). The 4B gains
 of 5-17% in ITL are within that range; only the 30B changes (up to 3.5x in TTFT) are clearly larger than that noise.
@@ -515,7 +543,7 @@ The lecture and paged rows of Part 0 were not rerun.
   RoPE tables bit-identical. Qwen3-4B, 43 positions: criterion met (see the development log).
 - Batched decode vs decoding alone (`batch_check.py`, Qwen3-4B, 4 sequences of 27-3000 tokens, 16 steps): with a fixed
   split count, 64/64 logits rows bit-identical (rerun with the paged KV cache on 2026-11-18, same result).
-- Server (`server/test_server.py`, 14 tests, fake engine with the engine's block accounting): stream format, exact
+- Server (`server/test_server.py`, 18 tests, fake engine with the engine's block accounting): stream format, exact
   lengths and usage, EOS handling, rejections, batching equals running alone, more requests than slots, disconnects,
   engine errors, UTF-8 split over tokens; paging: four short requests run together in a pool of one max_len sequence,
   preemption + recompute gives exactly the output of running alone with no block leaked, a request larger than the
@@ -546,8 +574,19 @@ The lecture and paged rows of Part 0 were not rerun.
   a confident position with an error of 2.5 bf16 steps (Part 1).
 - CUDA graphs are used on 1 GPU only. With expert parallelism every MoE layer has a host-side count exchange, so
   the 2-GPU decode step is not captured.
-- A prefill stalls the decode of the other running sequences: there is no chunked-prefill interleaving. It was
-  simulated and rejected for the MoE model (Part 4), not tried for the dense one.
+- A prefill stalls the decode of the other running sequences: there is no chunked-prefill interleaving. A
+  scheduler simulation predicts a higher mean ITL with it for the MoE prefill_heavy run (Part 4); it was neither
+  implemented nor simulated for the dense model.
+- Each ratio to vLLM is one measured run per server, not an interval: 2.81x means that run met 3x, not that every run
+  will. The vLLM image installs `vllm` without a pinned version, and the runs' resolved vLLM version and
+  chunked-prefill token budget are not recorded in `results/` (vLLM's own defaults were used, with the flags shown).
+- The acceptance scripts were tightened on 2026-11-25, after the runs above (`tools/test_verdicts.py` has a
+  counterexample for each): `e2e_test.py` judged a top-1 mismatch by HF's own top-2 gap instead of HF's score of the
+  engine's token, and did not include the greedy and RoPE checks or the A/B variants in its exit code; `run_tests.py`
+  passed a module with no cases and an unknown test name, and its MoE "strict" column repeated the tolerance count
+  (now N/A: MoE is judged against a bound). The dense end-to-end runs were not repeated under the corrected rule.
+- Some dense checks are recorded only in this README and the development log, not as log files under `results/`:
+  the 36 attention cases and the 28/28 paged vs contiguous attention cases.
 - Stale rows of a reused block are not zeroed: masked keys get P = 0 exactly, which needs finite stale values (the pool
   is zeroed at start). Zeroing them in the attention loop cost 1.9x (decode) / 2.5x (prefill) and was removed
   (`tests/paged_bench_test.cu`).
@@ -557,7 +596,13 @@ The lecture and paged rows of Part 0 were not rerun.
 
 ## How to reproduce
 
+Run from `final/`. Prerequisites: the Modal volume `qwen3-hf-cache` with the weights (`part1/download_moe.py` for
+30B), and the unit-test database `test_cases.db` (not committed), made on the CPU by `modal run gen_cases.py`
+before `modal_test_h100.py`. `part1/moe_e2e.py` also runs the dense Qwen3-0.6B check, which needs that model in the
+volume. Every `--yes` command uses a GPU and prints its cost cap first.
+
 ```bash
+python tools/test_verdicts.py                      # local, no GPU: every pass/fail decision fails on a counterexample
 python server/test_server.py                       # local, no GPU
 modal run modal_aipref.py --compat                 # CPU only: AIPerf vs the fake-engine server
 modal run modal_test_h100.py --yes                 # unit tests, 1x H100
@@ -565,7 +610,7 @@ modal run e2e_test.py --yes --model Qwen/Qwen3-0.6B --gpu h100 --long 8192 --yar
 modal run batch_check.py --yes --splits ,4
 modal run modal_vllm_aipref.py --yes --suite       # vLLM, workload suite
 modal run modal_aipref.py --yes --suite            # ours, workload suite
-modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn
+modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2
 modal run modal_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2
 modal run modal_vllm_aipref.py --yes --lecture     # vLLM, Week 7 lecture workload
 modal run modal_aipref.py --yes --lecture          # ours, Week 7 lecture workload
@@ -592,13 +637,16 @@ python part5/test_part5.py                         # Part 5: process layout, CPU
 modal run part5/modal_smoke.py --yes               # Part 5: all processes on 2x H100 vs the 1-GPU server
 modal run modal_vllm_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200 --world 2   # vLLM DP2 EP suite
 modal run modal_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200 --world 2        # ours, 2x H200 suite
-modal run part4/modal_profile.py --yes [--world 2] # Part 4: per-stage profile, 1 or 2x H200 (+ CUDA graph A/B on 1)
+modal run part4/modal_profile.py --yes            # Part 4: per-stage profile, 1x H200 (+ CUDA graph A/B)
+modal run part4/modal_profile.py --yes --world 2  # Part 4: per-stage profile, 2x H200
 python part4/tile_list_sim.py                      # Part 4: work-list indexing, CPU only
+python part4/sched_sim.py                          # Part 4: chunked-prefill scheduler simulation, CPU only
 modal run modal_test_h100.py --yes --tests moe_tiles,moe_sweep,moe_force   # Part 4 / Part 1: work list, tiles, forced router
 modal run part1/moe_e2e.py --tie-check-only        # Part 1: tie-rule patch self-check on the image's transformers (CPU)
 modal run part1/moe_e2e.py --ref --tie low --yes --prompts tiling,heldout   # references with the engine's tie rule (CPU)
 modal run part1/moe_e2e.py --rejudge-runs --tie low --prompts tiling,heldout    # saved engine runs vs them (CPU)
 modal run part1/moe_e2e.py --yes --force-routing --tie low --prompts tiling,heldout   # forced-routing A/B, 1x H100
+# (exits non-zero: forced tiling FAILs the frozen MoE rule's "within reach" clause, as reported in Part 1)
 modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container
 modal run modal_test_h100.py --yes --tests paged,paged_bench   # paged vs contiguous attention: bits and timing
 python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf

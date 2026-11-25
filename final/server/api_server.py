@@ -95,13 +95,14 @@ class EngineClient:
         rid = f"{self.api}-{next(self.ids)}"
         q = asyncio.Queue()
         self.pending[rid] = (asyncio.get_running_loop(), q)
-        e = self._pick()
-        self.sent[e] += 1
-        self.since[e] += 1
-        self._send(e, {"type": "ADD", "id": rid, "prompt_ids": list(prompt_ids), "max_new": max_new,
-                       "min_new": min_new, "ignore_eos": ignore_eos})
-        finished = False
-        try:
+        finished = added = False
+        try:                                             # from here on, pending[rid] is removed whatever happens
+            e = self._pick()
+            self.sent[e] += 1
+            self.since[e] += 1
+            self._send(e, {"type": "ADD", "id": rid, "prompt_ids": list(prompt_ids), "max_new": max_new,
+                           "min_new": min_new, "ignore_eos": ignore_eos})
+            added = True
             while True:
                 tok, fin = await q.get()
                 yield tok, fin
@@ -110,7 +111,7 @@ class EngineClient:
                     return
         finally:
             self.pending.pop(rid, None)
-            if not finished:                             # the client left early: the engine core frees its blocks
+            if added and not finished:                   # the client left early: the engine core frees its blocks
                 self._send(e, {"type": "ABORT", "id": rid})
 
     def stats(self) -> dict:

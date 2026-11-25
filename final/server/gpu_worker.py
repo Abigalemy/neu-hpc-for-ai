@@ -13,6 +13,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# seconds a call may take before the worker counts as hung (alive but making no progress, e.g. stuck in a collective):
+# the engine core then exits, which the launcher's watchdog sees, and the group stops. Loading the weights (the first
+# message) has its own, longer limit. Neither applies while the core is parked: then no call is in flight.
+CALL_TIMEOUT = float(os.environ.get("QWEN3_WORKER_TIMEOUT", "600"))
+LOAD_TIMEOUT = float(os.environ.get("QWEN3_WORKER_LOAD_TIMEOUT", "3600"))
+
 INFO = ("vocab", "max_len", "max_seqs", "block_size", "num_blocks", "world")
 CALLS = ("idle_tick", "reserve", "release", "prefill", "decode_batch")
 
@@ -53,7 +59,7 @@ class WorkerProxy:
 
     def __init__(self, pipe, proc):
         self.pipe, self.proc = pipe, proc
-        info = self._recv()
+        info = self._recv(LOAD_TIMEOUT, "loading")
         for k in INFO:
             setattr(self, k, info[k])
         self.calls = 0
@@ -63,8 +69,13 @@ class WorkerProxy:
         """Any thread may read this (statistics): it is the value sent with the last reply, no Pipe traffic."""
         return self.free
 
-    def _recv(self):
+    def _recv(self, timeout=None, what="a call"):
+        timeout = CALL_TIMEOUT if timeout is None else timeout
         try:
+            if not self.pipe.poll(timeout):
+                print(f"GPU worker (pid {self.proc.pid}): no reply to {what} in {timeout:.0f} s (alive but hung?); "
+                      f"engine core exiting", file=sys.stderr, flush=True)
+                os._exit(5)
             return self.pipe.recv()
         except EOFError:          # the worker died: so does this engine core (the launcher then stops the group)
             print(f"GPU worker (pid {self.proc.pid}) is gone; engine core exiting", file=sys.stderr, flush=True)
@@ -73,7 +84,7 @@ class WorkerProxy:
     def _call(self, method, *args):
         self.pipe.send((method, args))
         self.calls += 1
-        reply = self._recv()
+        reply = self._recv(what=method)
         if reply[0] != "ok":
             raise RuntimeError(f"GPU worker: {reply[1]}")
         self.free = reply[2]
