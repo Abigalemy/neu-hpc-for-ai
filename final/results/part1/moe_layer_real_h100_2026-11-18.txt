@@ -1,0 +1,23 @@
+layer 0: router + 384 expert tensors loaded in 2.6 s
+MOE_LAYER layer=0 tokens=1: 0.135 ms per call (x48 layers = 6.47 ms)
+MOE_LAYER_CHECK layer=0 tokens=1: experts 1/1 same, 0 tie (<= 2 bf16 ulps of the logit), 0 wrong; weights ok; y max err 9.18e-04 of max|y| = 0.10 of the bound (ok)
+layer 0: router + 384 expert tensors loaded in 0.4 s
+MOE_LAYER layer=0 tokens=33: 0.548 ms per call (x48 layers = 26.32 ms)
+MOE_LAYER_CHECK layer=0 tokens=33: experts 33/33 same, 0 tie (<= 2 bf16 ulps of the logit), 0 wrong; weights ok; y max err 2.92e-03 of max|y| = 0.22 of the bound (ok)
+layer 0: router + 384 expert tensors loaded in 0.4 s
+MOE_LAYER layer=0 tokens=1024: 2.411 ms per call (x48 layers = 115.73 ms)
+AssertionError: grouped reference != per-token one
+layer 47: router + 384 expert tensors loaded in 0.6 s
+MOE_LAYER layer=47 tokens=1: 0.135 ms per call (x48 layers = 6.46 ms)
+MOE_LAYER_CHECK layer=47 tokens=1: experts 1/1 same, 0 tie (<= 2 bf16 ulps of the logit), 0 wrong; weights ok; y max err 2.22e-03 of max|y| = 0.12 of the bound (ok)
+layer 47: router + 384 expert tensors loaded in 0.3 s
+MOE_LAYER layer=47 tokens=33: 0.521 ms per call (x48 layers = 24.99 ms)
+MOE_LAYER_CHECK layer=47 tokens=33: experts 33/33 same, 0 tie (<= 2 bf16 ulps of the logit), 0 wrong; weights ok; y max err 3.24e-03 of max|y| = 0.12 of the bound (ok)
+layer 47: router + 384 expert tensors loaded in 0.3 s
+MOE_LAYER layer=47 tokens=1024: 2.417 ms per call (x48 layers = 115.99 ms)
+MOE_LAYER_CHECK layer=47 tokens=1024: experts 1024/1024 same, 0 tie (<= 2 bf16 ulps of the logit), 0 wrong; weights ok; y max err 2.40e-03 of max|y| = 0.13 of the bound (ok)
+SOME MOE LAYER CHECKS FAILED
+rerun after the checker fix: layer 0: router + 384 expert tensors loaded in 1.9 s
+rerun after the checker fix: MOE_LAYER layer=0 tokens=1024: 2.411 ms per call (x48 layers = 115.73 ms)
+rerun after the checker fix: MOE_LAYER_CHECK layer=0 tokens=1024: experts 1024/1024 same, 0 tie (<= 2 bf16 ulps of the logit), 0 wrong; weights ok; y max err 2.14e-03 of max|y| = 0.18 of the bound (ok)
+rerun after the checker fix: ALL MOE LAYER CHECKS PASS

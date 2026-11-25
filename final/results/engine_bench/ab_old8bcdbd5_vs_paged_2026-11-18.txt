@@ -1,0 +1,88 @@
+AB old    B=1   L=256  prefill    37.81 ms per sequence | decode step   6.965 ms
+AB old    B=1   L=3072 prefill    63.52 ms per sequence | decode step   7.849 ms
+AB old    B=32  L=64   prefill     6.92 ms per sequence | decode step   9.299 ms
+AB old    B=64  L=256  prefill     9.87 ms per sequence | decode step  13.052 ms
+PROFILE old decode B=64 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36      7.695   50.7%      486.3       1.95
+  mlp_gate_up_silu       36      1.702   11.2%     2107.4     134.88
+  mlp_down               36      1.234    8.1%     1453.2      93.00
+  o_proj                 36      0.654    4.3%     1154.6      73.90
+  rmsnorm                73      0.615    4.1%       76.7       0.00
+  residual_add           72      0.609    4.0%      116.1       0.00
+  q_proj                 36      0.535    3.5%     1411.3      90.32
+  v_proj                 36      0.448    2.9%      421.5      26.97
+  k_proj                 36      0.446    2.9%      423.4      27.10
+  qk_norm                36      0.414    2.7%      113.9       0.00
+  rope                   36      0.321    2.1%      147.1       0.00
+  lm_head                 1      0.270    1.8%     2880.0     184.32
+  kv_write               36      0.227    1.5%       83.1       0.00
+  embedding               1      0.013    0.1%       24.3       0.00
+  TOTAL (stages)                15.184
+AB old    B=100 L=1000 prefill    22.98 ms per sequence | decode step  28.183 ms
+AB new    B=1   L=256  prefill    18.18 ms per sequence | decode step   6.803 ms
+AB new    B=1   L=3072 prefill    63.95 ms per sequence | decode step   7.648 ms
+AB new    B=32  L=64   prefill     6.79 ms per sequence | decode step   8.987 ms
+AB new    B=64  L=256  prefill     9.78 ms per sequence | decode step  12.476 ms
+PROFILE new decode B=64 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36      7.189   49.4%      520.5       2.08
+  mlp_gate_up_silu       36      1.687   11.6%     2126.2     136.08
+  mlp_down               36      1.228    8.4%     1460.2      93.45
+  o_proj                 36      0.646    4.4%     1168.7      74.79
+  residual_add           72      0.601    4.1%      117.8       0.00
+  rmsnorm                73      0.576    4.0%       81.9       0.00
+  q_proj                 36      0.529    3.6%     1427.4      91.35
+  v_proj                 36      0.441    3.0%      428.1      27.40
+  k_proj                 36      0.439    3.0%      429.6      27.49
+  qk_norm                36      0.400    2.7%      118.0       0.00
+  rope                   36      0.310    2.1%      152.1       0.00
+  lm_head                 1      0.270    1.9%     2880.2     184.33
+  kv_write               36      0.222    1.5%       85.2       0.00
+  embedding               1      0.013    0.1%       25.4       0.00
+  TOTAL (stages)                14.550
+AB new    B=100 L=1000 prefill    22.86 ms per sequence | decode step  27.372 ms
+AB old    B=1   L=256  prefill    18.90 ms per sequence | decode step   6.876 ms
+AB old    B=1   L=3072 prefill    63.65 ms per sequence | decode step   7.792 ms
+AB old    B=32  L=64   prefill     6.86 ms per sequence | decode step   9.241 ms
+AB old    B=64  L=256  prefill     9.82 ms per sequence | decode step  12.925 ms
+PROFILE old decode B=64 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36      7.663   50.9%      488.3       1.95
+  mlp_gate_up_silu       36      1.696   11.3%     2115.0     135.36
+  mlp_down               36      1.231    8.2%     1457.0      93.25
+  o_proj                 36      0.650    4.3%     1162.2      74.38
+  residual_add           72      0.605    4.0%      117.0       0.00
+  rmsnorm                73      0.581    3.9%       81.2       0.00
+  q_proj                 36      0.532    3.5%     1419.5      90.85
+  v_proj                 36      0.444    2.9%      425.5      27.23
+  k_proj                 36      0.441    2.9%      427.8      27.38
+  qk_norm                36      0.405    2.7%      116.5       0.00
+  rope                   36      0.312    2.1%      151.5       0.00
+  lm_head                 1      0.270    1.8%     2884.7     184.62
+  kv_write               36      0.224    1.5%       84.2       0.00
+  embedding               1      0.013    0.1%       25.4       0.00
+  TOTAL (stages)                15.064
+AB old    B=100 L=1000 prefill    22.89 ms per sequence | decode step  28.028 ms
+AB new    B=1   L=256  prefill    18.13 ms per sequence | decode step   6.947 ms
+AB new    B=1   L=3072 prefill    64.11 ms per sequence | decode step   7.765 ms
+AB new    B=32  L=64   prefill     6.90 ms per sequence | decode step   9.096 ms
+AB new    B=64  L=256  prefill     9.90 ms per sequence | decode step  12.582 ms
+PROFILE new decode B=64 (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36      7.224   49.2%      518.0       2.07
+  mlp_gate_up_silu       36      1.695   11.5%     2116.2     135.44
+  mlp_down               36      1.234    8.4%     1452.9      92.99
+  o_proj                 36      0.652    4.4%     1158.7      74.16
+  residual_add           72      0.612    4.2%      115.6       0.00
+  rmsnorm                73      0.589    4.0%       80.1       0.00
+  q_proj                 36      0.535    3.6%     1410.1      90.25
+  v_proj                 36      0.447    3.0%      422.4      27.04
+  k_proj                 36      0.445    3.0%      424.0      27.13
+  qk_norm                36      0.418    2.8%      113.0       0.00
+  rope                   36      0.322    2.2%      146.4       0.00
+  lm_head                 1      0.270    1.8%     2880.8     184.37
+  kv_write               36      0.227    1.5%       83.2       0.00
+  embedding               1      0.012    0.1%       26.6       0.00
+  TOTAL (stages)                14.682
+AB new    B=100 L=1000 prefill    22.96 ms per sequence | decode step  27.471 ms

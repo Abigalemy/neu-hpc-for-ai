@@ -1,0 +1,7 @@
+recheck1.log:  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+recheck1.log:  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+recheck1.log:  PASS (dense rule)
+recheck2.log:  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+recheck2.log:  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+recheck2.log:rank 0 [tiling]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_1795308842
+recheck2.log:rank 1 [heldout]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_heldout_1795308856

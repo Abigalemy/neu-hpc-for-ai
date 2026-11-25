@@ -1,0 +1,46 @@
+config: hidden=2560 inter=9728 layers=36 heads=32/8 | load 5.1 s (weights copied to the GPU once)
+tile profile: BIG (QWEN3_TILES=unset)
+warm-up done (16 tokens generated)
+REQ 0: TTFT_MS 64.74  ITL_MEAN_MS 9.073  ITL_P50_MS 9.079  ITL_P99_MS 9.326  E2E_MS 9346.9  (in 3072, out 1024)
+REQ 1: TTFT_MS 63.54  ITL_MEAN_MS 9.062  ITL_P50_MS 9.077  ITL_P99_MS 9.316  E2E_MS 9334.4  (in 3072, out 1024)
+REQ 2: TTFT_MS 64.01  ITL_MEAN_MS 9.062  ITL_P50_MS 9.063  ITL_P99_MS 9.311  E2E_MS 9334.1  (in 3072, out 1024)
+AVERAGE over 3 requests: TTFT_MS 64.10  ITL_MS 9.066
+
+PROFILE prefill, 1 request of the prompt length (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  mlp_gate_up_silu       36     18.437   28.7%      194.5     597.52
+  attention              36     12.439   19.3%       36.4     223.81
+  qk_norm                36      8.989   14.0%      252.0       0.00
+  mlp_down               36      8.809   13.7%      203.5     625.28
+  o_proj                 36      3.857    6.0%      195.7     601.25
+  q_proj                 36      3.831    6.0%      197.0     605.32
+  residual_add           72      1.809    2.8%     1878.1       0.00
+  rmsnorm                73      1.799    2.8%     1258.9       0.00
+  k_proj                 36      1.293    2.0%      146.0     448.53
+  v_proj                 36      1.286    2.0%      146.7     450.75
+  rope                   36      0.955    1.5%     2372.3       0.00
+  kv_write               36      0.536    0.8%     1691.4       0.00
+  lm_head                 1      0.273    0.4%     2849.6       2.85
+  embedding               1      0.026    0.0%      606.8       0.00
+  TOTAL (stages)                64.340
+
+PROFILE decode step at context ~prompt_len (averaged) (per forward, summed over all layers; stages are timed with CUDA events)
+  stage               calls         ms   share       GB/s    TFLOP/s
+  attention              36      2.185   21.7%      208.4       0.83
+  mlp_gate_up_silu       36      1.748   17.3%     2051.7       2.05
+  mlp_down               36      1.479   14.7%     1212.1       1.21
+  o_proj                 36      0.749    7.4%     1008.2       1.01
+  q_proj                 36      0.610    6.1%     1238.0       1.24
+  rmsnorm                73      0.604    6.0%        1.2       0.00
+  residual_add           72      0.581    5.8%        1.9       0.00
+  v_proj                 36      0.480    4.8%      393.0       0.39
+  k_proj                 36      0.479    4.8%      393.7       0.39
+  qk_norm                36      0.316    3.1%        2.3       0.00
+  rope                   36      0.309    3.1%        2.4       0.00
+  lm_head                 1      0.269    2.7%     2890.9       2.89
+  kv_write               36      0.253    2.5%        1.2       0.00
+  embedding               1      0.017    0.2%        0.3       0.00
+  TOTAL (stages)                10.079
+
+
+TILE CHECK (last position of the 3072-token prompt): top-1 big=55 small=11 (DIFFERENT), cosine 0.999960, max|logit diff| 0.113 (max|logit| 11.1), small-tile top1-top2 margin 0.000

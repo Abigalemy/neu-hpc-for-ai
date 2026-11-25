@@ -1,0 +1,54 @@
+  104 |     std::printf(failed ? "MOE TILES: %d case(s) FAILED\n" : "MOE TILES: all %zu cases bit-exact (work list = full grid)\n",
+1gpu uniform   kdiv 8 rows     1 experts   0..127  BM 16  blocks per column tile: grid    128, list     9 | bit-exact
+1gpu hot8      kdiv 8 rows     1 experts   0..127  BM 16  blocks per column tile: grid    128, list     9 | bit-exact
+1gpu uniform   kdiv 8 rows     5 experts   0..127  BM 16  blocks per column tile: grid    128, list    43 | bit-exact
+1gpu hot8      kdiv 8 rows     5 experts   0..127  BM 16  blocks per column tile: grid    128, list    43 | bit-exact
+1gpu uniform   kdiv 8 rows    64 experts   0..127  BM 16  blocks per column tile: grid    512, list   160 | bit-exact
+1gpu hot8      kdiv 8 rows    64 experts   0..127  BM 16  blocks per column tile: grid    512, list   160 | bit-exact
+1gpu uniform   kdiv 8 rows   300 experts   0..127  BM 16  blocks per column tile: grid   2432, list   278 | bit-exact
+1gpu hot8      kdiv 8 rows   300 experts   0..127  BM 16  blocks per column tile: grid   2432, list   278 | bit-exact
+1gpu uniform   kdiv 8 rows  2048 experts   0..127  BM 64  blocks per column tile: grid   4096, list   384 | bit-exact
+1gpu hot8      kdiv 8 rows  2048 experts   0..127  BM 64  blocks per column tile: grid   4096, list   384 | bit-exact
+ep uniform     kdiv 1 rows     1 experts   0..127  BM 16  blocks per column tile: grid    128, list     2 | bit-exact
+ep one expert  kdiv 1 rows     1 experts   0..127  BM 16  blocks per column tile: grid    128, list     2 | bit-exact
+ep skewed      kdiv 1 rows     1 experts   0..127  BM 16  blocks per column tile: grid    128, list     2 | bit-exact
+ep uniform     kdiv 1 rows     1 experts  64..127  BM 16  blocks per column tile: grid     64, list     2 | bit-exact
+ep one expert  kdiv 1 rows     1 experts  64..127  BM 16  blocks per column tile: grid     64, list     2 | bit-exact
+ep skewed      kdiv 1 rows     1 experts  64..127  BM 16  blocks per column tile: grid     64, list     2 | bit-exact
+ep uniform     kdiv 1 rows     7 experts   0..127  BM 16  blocks per column tile: grid    128, list     8 | bit-exact
+ep one expert  kdiv 1 rows     7 experts   0..127  BM 16  blocks per column tile: grid    128, list     8 | bit-exact
+ep skewed      kdiv 1 rows     7 experts   0..127  BM 16  blocks per column tile: grid    128, list     8 | bit-exact
+ep uniform     kdiv 1 rows     7 experts  64..127  BM 16  blocks per column tile: grid     64, list     8 | bit-exact
+ep one expert  kdiv 1 rows     7 experts  64..127  BM 16  blocks per column tile: grid     64, list     8 | bit-exact
+ep skewed      kdiv 1 rows     7 experts  64..127  BM 16  blocks per column tile: grid     64, list     8 | bit-exact
+ep uniform     kdiv 1 rows   512 experts   0..127  BM 16  blocks per column tile: grid   4096, list   160 | bit-exact
+ep one expert  kdiv 1 rows   512 experts   0..127  BM 16  blocks per column tile: grid   4096, list   160 | bit-exact
+ep skewed      kdiv 1 rows   512 experts   0..127  BM 16  blocks per column tile: grid   4096, list   160 | bit-exact
+ep uniform     kdiv 1 rows   512 experts  64..127  BM 16  blocks per column tile: grid   2048, list    96 | bit-exact
+ep one expert  kdiv 1 rows   512 experts  64..127  BM 16  blocks per column tile: grid   2048, list    96 | bit-exact
+ep skewed      kdiv 1 rows   512 experts  64..127  BM 16  blocks per column tile: grid   2048, list    96 | bit-exact
+ep uniform     kdiv 1 rows  4096 experts   0..127  BM 16  blocks per column tile: grid  32768, list   384 | bit-exact
+ep one expert  kdiv 1 rows  4096 experts   0..127  BM 16  blocks per column tile: grid  32768, list   384 | bit-exact
+ep skewed      kdiv 1 rows  4096 experts   0..127  BM 16  blocks per column tile: grid  32768, list   384 | bit-exact
+ep uniform     kdiv 1 rows  4096 experts  64..127  BM 64  blocks per column tile: grid   4096, list   128 | bit-exact
+ep one expert  kdiv 1 rows  4096 experts  64..127  BM 64  blocks per column tile: grid   4096, list   128 | bit-exact
+ep skewed      kdiv 1 rows  4096 experts  64..127  BM 64  blocks per column tile: grid   4096, list   128 | bit-exact
+ep uniform     kdiv 1 rows 16384 experts   0..127  BM 64  blocks per column tile: grid  32768, list   384 | bit-exact
+ep one expert  kdiv 1 rows 16384 experts   0..127  BM 64  blocks per column tile: grid  32768, list   384 | bit-exact
+ep skewed      kdiv 1 rows 16384 experts   0..127  BM 64  blocks per column tile: grid  32768, list   384 | bit-exact
+ep uniform     kdiv 1 rows 16384 experts  64..127  BM 64  blocks per column tile: grid  16384, list   320 | bit-exact
+ep one expert  kdiv 1 rows 16384 experts  64..127  BM 64  blocks per column tile: grid  16384, list   320 | bit-exact
+ep skewed      kdiv 1 rows 16384 experts  64..127  BM 64  blocks per column tile: grid  16384, list   320 | bit-exact
+MOE TILES: all 40 cases bit-exact (work list = full grid)
+
+Qwen/Qwen3-30B-A3B [tiling, snapshot ad44e777], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_1795311385
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+Qwen/Qwen3-30B-A3B [heldout, snapshot ad44e777], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_heldout_1795311399
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+Qwen/Qwen3-0.6B [tiling, snapshot c1899de2], engine side saved to final-results:/results/moe_e2e_runs/Qwen3-0.6B_1795311402
+  PASS (dense rule)
+byte compare with the 11/18 runs (Qwen3-30B-A3B_1795058657, _heldout_1795058683): gen.bin logits.bin route.bin all same
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99532 reported)
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99464 reported)
+rank 0 [tiling]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_1795311385
+rank 1 [heldout]: logits and generated tokens IDENTICAL to the single-GPU run Qwen3-30B-A3B_heldout_1795311399

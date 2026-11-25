@@ -1,0 +1,17 @@
+PLAN: 1x H100, engine vs the stored references of ['Qwen/Qwen3-30B-A3B', 'Qwen/Qwen3-0.6B'], hard cap 20 min -> at most ~$1.32 of shared credit
+weights: 61.06 GB on the GPU (MoE, experts packed per layer)
+LOAD_S 43.87 (weights go to the GPU once, here)
+TEACHER_FORCED prefill(27 tokens) 50.0 ms, decode steps 16, avg 10.9 ms
+GENERATE prompt=27 tokens: TTFT_MS 22.6  ITL_MS 11.0 (avg over 15 steps)
+Qwen/Qwen3-30B-A3B: 43 positions (27 prefill, 16 KV-cache decode); top-1 42/43; mismatch at 35 (HF margin 0.000)
+  min cosine prefill 0.995322, decode 0.995443, mean 0.999210; max |logit error| 1.645 (max |logit| 47.0)
+  greedy: engine matches HF for 16/16 tokens (HF text ' | Study.com\nTech and Engineering Computer science Computer hardware\nExplain in two')
+  FAIL (top-1 mismatch with a clear margin, or cosine <= 0.999)
+weights: 1.50 GB on the GPU (dense)
+LOAD_S 1.46 (weights go to the GPU once, here)
+TEACHER_FORCED prefill(27 tokens) 12.2 ms, decode steps 16, avg 2.7 ms
+GENERATE prompt=27 tokens: TTFT_MS 3.1  ITL_MS 3.0 (avg over 15 steps)
+Qwen/Qwen3-0.6B: 43 positions (27 prefill, 16 KV-cache decode); top-1 43/43
+  min cosine prefill 0.999612, decode 0.999725, mean 0.999879; max |logit error| 0.375 (max |logit| 23.4)
+  greedy: engine matches HF for 16/16 tokens (HF text ' Also, explain in two sentences why the matrix multiplication is not efficient for large matrices')
+  PASS

@@ -1,0 +1,851 @@
+# Final Project: Qwen3 + MoE inference server in CUDA Tile C++
+
+Goal (from the assignment): approach vLLM performance without PyTorch in the serving path.
+
+## Summary (2026-11-24)
+
+A Qwen3 inference server written from scratch: CUDA Tile C++ kernels (`__tile_global__`) for every step of the
+forward pass, a C++ engine with a paged KV cache, and a Python HTTP server (OpenAI-compatible, continuous batching).
+PyTorch is used only to make the HF reference outputs for the tests, never in the serving path. The same code serves
+the dense Qwen3-4B and the MoE Qwen3-30B-A3B, on one GPU or with data + expert parallelism over 2 GPUs.
+
+| Part | What | Status |
+|---|---|---|
+| Part 0 | Qwen3 dense (4B) server within 10x of vLLM for any workload, incl. 128K input | **done**: every measured workload within 3.45x, with a paged KV cache (Week 7); without paging the lecture workload is 46x |
+| Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done**: whole model matches HF under the frozen MoE rule on a held-out prompt. With HF's experts forced, mean cosine is 0.99987 / 0.99988, so the remaining difference is mostly router ties |
+| Part 2 | Two-GPU all-to-all mock | **done**: `part2/`, exact on 2x H100 |
+| Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | **done** (K = 2, as agreed with the instructor): EP layer bit-exact and whole model identical to 1 GPU; vLLM's process layout (API servers, engine cores, GPU workers, DP coordinator, ZMQ) |
+| Part 4 | Within 3x of vLLM; write-up | **done**: all 6 suite workloads within 3x of vLLM for TTFT and ITL on 4B 1x H100, 30B 1x H200 and 30B 2x H200 |
+
+Worst ratio to vLLM (ours / vLLM, mean over the run) of the 6-workload suite after Part 4; details in
+[Part 4](#part-4-every-suite-workload-within-3x-of-vllm):
+
+| Setup | worst TTFT ratio | worst ITL ratio |
+|---|---|---|
+| Qwen3-4B, 1x H100 | 1.66x (decode_heavy) | 2.50x (balanced_c64) |
+| Qwen3-30B-A3B, 1x H200 | 2.09x (balanced_c64) | 2.80x (prefill_heavy) |
+| Qwen3-30B-A3B, 2x H200, DP = EP = 2 | 1.95x (balanced_c64) | 2.81x (balanced_c64) |
+
+Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100, measured 2026-11-18 with the paged KV cache):
+TTFT 23.37 s vs vLLM 10.45 s (2.24x), ITL 24.73 ms vs 10.43 ms (2.37x).
+
+## Architecture
+
+```
+client --HTTP/SSE--> API server(s)        server/ (FastAPI), part5/: tokenizer, streaming, OpenAI API
+                        |  ZMQ
+                     engine core(s)       scheduler: admission, continuous batching, KV blocks, preemption
+                        |  pipe
+                     GPU worker(s)        libqwen3engine.so (engine/qwen3_capi.cu), one per GPU
+                        |  NCCL (2 GPUs)  all-gather of expert counts, all-to-all of rows (engine/qwen3_ep.cuh)
+                     CUDA Tile kernels    kernels/*.cuh
+```
+
+One forward pass (`engine/qwen3_engine.cuh`): embedding -> per layer [RMSNorm -> QKV GEMM -> q/k RMSNorm + RoPE ->
+KV-cache scatter into the paged pool -> flash attention over the block tables (prefill, or split-KV batched decode)
+-> output GEMM -> residual -> RMSNorm -> MLP: dense gate/up + SiLU and down, or MoE: router -> stable sort by expert
+(also writes the GEMM work list) -> grouped gate/up + SiLU -> grouped down -> weighted combine -> residual] -> final
+RMSNorm -> lm_head -> argmax. With 2 GPUs, each rank holds half of the experts and its own requests. Rows go to the
+owner of their expert and come back between the sort and the combine. On 1 GPU a decode step is replayed as a CUDA
+graph, one per batch size.
+
+## What is here
+
+- `kernels/`: CUDA Tile kernels (`__tile_global__`): RMSNorm, RoPE, linear (GEMM), fused gate/up + SiLU, embedding,
+  argmax, residual add, KV-cache scatter, flash attention (causal GQA over the paged KV cache: prefill, and split-KV
+  batched decode; both read the cache blocks in place through the block tables).
+- `engine/`: safetensors loader (weights copied to the GPU once), RoPE tables incl. YaRN, the 36-layer forward pass
+  with a paged KV cache (block pool, block tables, block allocator; `qwen3_engine.cuh`), and a C API (`qwen3_capi.cu` -> `libqwen3engine.so`).
+- `server/`: OpenAI-compatible HTTP server (FastAPI, SSE streaming) with continuous batching; no PyTorch.
+- `tests/`, `gen_cases.py`, `run_tests.py`, `schema.sql`: unit tests per module against HF reference outputs stored
+  in SQLite; `e2e_test.py` (whole model vs HF), `batch_test.cu` (batched vs alone), `server/test_server.py`.
+- `part1/` (MoE weights, reference cases, whole-model check vs HF incl. the tie rule and forced routing), `part2/`
+  (all-to-all mock), `part3/` (expert-parallel layer, protocol simulation), `part4/` (profile launcher, work-list
+  simulation), `part5/` (process layout: `DESIGN.md`, `launch.py`).
+- `results/`: AIPerf summary exports of every run in the tables below, plus `summary.csv` and `comparison.csv`
+  (`python tools/summarize_results.py` rebuilds both); logs of the GPU checks under `results/part*/`.
+- `modal_*.py`, `*_check.py`, `*_sweep_modal.py`, `bench_modal.py`: Modal launchers (each prints its plan and cost
+  cap and needs `--yes` to use a GPU).
+
+## Final configuration (Part 0)
+
+- Model: `Qwen/Qwen3-4B` bf16, snapshot `1cfa9a7208912126459214e8b04321603b3df60c` (the 8K check uses
+  `Qwen/Qwen3-0.6B`, snapshot `c1899de289a04d12100db370d81485cdf75e47ca`).
+- GPU: 1x H100. Tiles chosen by device: on Hopper GEMM 128x128x64 (64x128x64 for <= 64 tokens), fused gate/up 128x64x64 (64x64x64 for 17-64 tokens, 16x64x64 below),
+  prefill attention 64x128 with split P (P = P_hi + P_lo in bf16, fp32 accumulator), decode attention split-KV
+  (16-row query tile, 128 keys per tile, ~512 blocks in total, fp32 combine). On other GPUs the small tiles that were
+  verified on the L4.
+- 128K: YaRN factor 4 over the original 32768 context = 131072 tokens for input plus output.
+- KV cache (PagedAttention, Week 7): per layer a pool of blocks of 128 tokens shared by all sequences; a sequence's
+  block table maps its logical blocks to physical ones, and the attention kernels read the blocks in place (block size
+  = the decode key tile). The server takes blocks on demand (first come, first served; a request starts when its
+  prompt fits) and, when the pool is empty, preempts the newest sequence and recomputes it later (as in vLLM /
+  nano-vllm). `--kv-tokens` sets the pool size, `--max-seqs` the most sequences decoded together.
+- Server limits used: workload suite 64 sequences, context 4224 (measured before paging, pool = 64 x 4224); Week 7
+  lecture workload 128 sequences, context 2048 (the lecture's vLLM limits; measured before paging); 128K: one sequence,
+  pool 131072 tokens (measured after paging). Greedy only.
+- Environment switches (for experiments only; none is set in the runs above): `QWEN3_TILES=small`,
+  `QWEN3_ATTN=small`, `QWEN3_YARN=<factor>`, `QWEN3_DECODE_SPLITS=<n>` (fixed decode split count).
+
+## Final configuration (MoE, Parts 1-4)
+
+- Model: `Qwen/Qwen3-30B-A3B` bf16, revision `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39` (61.1 GB, 48 layers, 128
+  experts of width 768, top-8, renormalised).
+- GPUs: 1x H200, or 2x H200 with DP = EP = 2 and TP = 1 (each rank: all non-expert weights, experts [64r, 64r + 64),
+  its own requests). Correctness runs on H100.
+- MoE layer: fused router (bf16 logits, fp32 softmax, top-8 by repeated arg-max, lower expert id on ties), count and
+  stable sort by expert. The sort also writes the list of non-empty (expert, row tile) pairs. Grouped gate/up + SiLU
+  and grouped down launch blocks only for that list: row tile 16, or 64 when an expert averages more than 32 rows.
+  The combine sums each token's 8 expert outputs in fp32, deterministically, without atomics.
+- Decode on 1 GPU: replayed as a CUDA graph per batch size (captured on first use; logits identical to running the
+  kernels directly).
+- Server limits for the suite: 64 sequences per rank, as for 4B.
+- Environment switches (debugging only; none is set in the measured runs): `QWEN3_GRAPH=0` (no CUDA graphs),
+  `QWEN3_MOE_DUMP=<file>` (record every layer's experts), `QWEN3_MOE_FORCE=<file>` with `QWEN3_MOE_FORCE_T=<T>`
+  (take the experts from a file: the forced-routing check of Part 1).
+
+## Results: our server vs vLLM (Part 0)
+
+The numbers as measured at the end of Part 0 (2026-11-18). The suite was rerun after Part 4; see
+[Part 4](#part-4-every-suite-workload-within-3x-of-vllm) for the current numbers.
+
+Qwen3-4B bf16, 1x H100, both measured with AIPerf through their HTTP servers, same AIPerf settings and seed, greedy,
+EOS ignored, prefix caching off for vLLM. 0 request errors in every run. Source: `results/comparison.csv`.
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio | ITL vLLM / ours (ms) | ratio | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 29.21 / 14.83 | 0.51x | 4.25 / 7.37 | 1.73x | 224 / 134 |
+| long_out | 3072 / 1024, 1 | 63.73 / 79.13 | 1.24x | 4.44 / 8.30 | 1.87x | 222 / 119 |
+| balanced_c16 | 256 / 256, 16 | 107.33 / 109.51 | 1.02x | 4.70 / 9.66 | 2.06x | 3126 / 1582 |
+| balanced_c64 | 256 / 256, 64 | 270.13 / 404.88 | 1.50x | 6.35 / 19.22 | 3.03x | 8610 / 3077 |
+| prefill_heavy | 2048 / 32, 8 | 204.67 / 227.10 | 1.11x | 6.99 / 15.75 | 2.25x | 601 / 356 |
+| decode_heavy | 64 / 1024, 32 | 95.96 / 154.76 | 1.61x | 5.57 / 13.03 | 2.34x | 5639 / 2424 |
+| 128K (YaRN x4), paged KV | 130816 / 128, 1 | 10446.84 / 23366.57 | 2.24x | 10.43 / 24.73 | 2.37x | |
+| lecture_c100 (Week 7) | 1000 / 500, 100; 1000 requests | 453.13 / 1137.69 | 2.51x | 13.36 / 33.43 | 2.50x | 7015 / 2803 |
+
+Notes: the six suite rows were rerun with the paged engine on 2026-11-18 (`suite_ours_1795031469`; vLLM unchanged).
+They came out 7-28% slower than the run before paging (`suite_ours_1794881935`, e.g. balanced_c64 ITL 15.01 -> 19.22
+ms), so the two engines were timed in ONE container, alternating old, new, old, new (`tools/ab_engine_bench.py`):
+the paged engine is as fast or slightly faster (decode step B=64, L=256: 12.48 / 12.58 ms vs 13.05 / 12.93 ms before
+paging; B=100, L=1000: 27.37 vs 28.18 / 28.03 ms; B=1: 6.80 / 6.95 vs 6.97 / 6.88 ms), and the Python scheduler costs
+0.012 ms more per step (fake engine, local). So the engine A/B in one container does not reproduce the slowdown; what
+remains (the container and host, or server-side effects under AIPerf) was not separated, since the two complete HTTP
+servers were not run alternately in one container. At the end of Part 0, balanced_c64 ITL was 3.03x, at the Part 4 limit;
+after Part 4 it is 2.50x.
+`lecture_c100` is the AIPerf example from the Week 7 lecture ("Performance Evaluation": concurrency 100, 1000
+requests, 1000 in / 500 out, warm-up 16 requests at concurrency 8), with the lecture's vLLM limits
+`--max-model-len 2048 --max-num-seqs 128 --gpu-memory-utilization 0.90`; our server gets the same limits (128 slots of
+2048 tokens). TTFT p99 there: vLLM 1513 ms, ours 2242 ms. It is the baseline before PagedAttention: our 128 slots
+reserve 128 x 2048 tokens of KV cache up front (2 x 2 bytes x 36 layers x 8 KV heads x 128 = 144 KiB per token, so
+38.7 GB), whatever the requests actually use. The vLLM 128K run is from an earlier session with the same settings. TTFT ratios below 1 at low concurrency
+are not a claim of faster prefill (vLLM's server has its own per-request overhead at small sizes). The 128K workload
+is 130816 + 128 tokens because the chat template adds tokens and the YaRN context (131072) covers input and output.
+
+## PagedAttention: with and without (Week 7) - an equal-memory capacity simulation
+
+One server configuration for everything: context limit 32768 tokens, the same KV memory as the 128 x 2048 lecture
+slots (262144 tokens = 38.7 GB at 144 KiB per token), the lecture workload and long prompts one after another.
+"With" = 128 sequences share the block pool and take blocks on demand. "Without" = what contiguous per-sequence
+slots give in the same memory: each sequence reserves 32768 tokens, so only 8 fit. This is SIMULATED with the same
+paged engine limited to 8 sequences (200 lecture requests there instead of 1000, as only 8 run at a time): it measures
+the capacity loss of fixed reservations, not the time of the two addressing schemes (their kernels were timed
+separately: the block-table lookup costs nothing measurable, see Correctness). The other two Week 7 comparisons, KV
+cache on / off and continuous / static batching, were measured in the Week 7 assignment, not with this engine. vLLM: `--max-model-len 32768
+--max-num-seqs 128 --gpu-memory-utilization 0.90`. Qwen3-4B, 1x H100, AIPerf, 0 request errors, no preemption
+needed. Source: `results/comparison.csv` (rows `paged/*`, `slots8/*`).
+
+| Workload | vLLM: TTFT / ITL (ms), tok/s | ours, paged: TTFT / ITL, tok/s | ratio | ours, 8 slots: TTFT / ITL, tok/s | ratio |
+|---|---|---|---|---|---|
+| lecture_c100: 1000 / 500, concurrency 100 | 863 / 10.21, 8370 | 1157 / 35.21, 2668 | 1.34x / 3.45x | 39791 / 9.06, 868 | **46.1x** / 0.89x |
+| long_c8: 16000 / 256, concurrency 8 | 1445 / 12.79, 433 | 3189 / 34.49, 171 | 2.21x / 2.70x | 3178 / 34.14, 172 | 2.20x / 2.67x |
+
+- Without paging the lecture workload fails Part 0: 92 of the 100 connections wait for one of 8 slots, so TTFT is
+  46x vLLM (p50 50.8 s) and throughput a third, although each slot reserves 32768 tokens for a request that uses
+  1500. With paging the same memory holds all 100 (100 x 1500 tokens = 57% of the pool) and TTFT is 1.34x vLLM. This
+  is the lecture's point: reserving the maximum length per sequence wastes memory (here 95%) and caps the batch.
+- The long prompts need 8 x 16.3K tokens, which fits either way, so paging changes nothing there (same numbers).
+- The ITL of the 8-slot run is lower only because it decodes 8 sequences per step instead of 100.
+- vLLM itself behaves differently with the larger context limit (lecture TTFT 863 vs 453 ms, ITL 10.2 vs 13.4 ms at
+  `--max-model-len 2048`), so both sides were measured in the same configuration.
+- Ours in this configuration: lecture ITL 3.45x vLLM, above the Part 4 limit (3x). This configuration was not
+  rerun after Part 4 (Part 4 targeted the 6-workload suite).
+
+## Part 1: Qwen3-30B-A3B on one GPU
+
+Continued from the Part 0 server (commit `ba38271`); one code base serves both models, chosen by the checkpoint's
+config (`num_experts > 0` -> MoE layers). Weights: `Qwen/Qwen3-30B-A3B` bf16 at revision
+`ad44e777bcd18fa416d9da3bd8f70d33ebb85d39` (61.1 GB, 16 shards) in our volume `qwen3-hf-cache` (`part1/download_moe.py`).
+Qwen3-30B-A3B differs from the 4B in the MLP only: every layer is a sparse MoE block, 128 experts of width
+`moe_intermediate_size` = 768 (not `intermediate_size` = 6144), top-8 with renormalised weights; attention 32 / 4 heads.
+
+MoE block (`kernels/qwen3_moe_tile.cuh`), all on the GPU, no host round trip for the routing: router (bf16 logits,
+fp32 softmax, top-8, renormalise), count per expert, stable counting sort by expert, grouped gate/up + SiLU with the
+rows gathered from x by token id (`gather_scatter_view`), grouped down, and a combine where each token gathers its 8
+expert outputs and sums them in fp32 (deterministic, no atomics).
+
+Tests: `part1/gen_moe_cases.py` makes reference cases with the HF `Qwen3MoeSparseMoeBlock` (transformers 5.23.0,
+torch 2.15.0, CPU) into `test_cases_moe.db`: the router at its real shape (2048 -> 128, top-8), blocks of 16 experts
+of width 128 with 1-128 tokens, and a designed 2-token case (token 0 -> experts 0-7, token 1 -> 4-11). `run_tests.py
+... moe`: expert sets per token (a different set only as a near-tie, reference probabilities within 1e-3), weights per
+expert, and y against HF's bf16 expert outputs summed in fp64 with a bound derived from the per-expert mlp rule (the
+8 terms can cancel, so the bound is the weighted sum of the per-term bounds; it is the acceptance tolerance of the final
+weighted sum, not a per-expert result). On H100 (2026-11-18): 10/10 cases pass, y within 15-32% of the bound; 4 router
+tokens and 1 block token are bf16 ties (equal logits) where `torch.topk` picks the other expert. In that run the
+tie token's y was left out of the comparison; the runner now recomputes its terms for the experts the GPU chose and
+compares every token (checked locally with fakes, then rerun on the H100 with the Part 4 kernels: all pass). What this covers: the router at its real shape, the
+block at 16 experts of width 128 and up to 128 tokens (both row-tile sizes, several sort tiles); the production
+shape (128 experts of width 768) and long prefills are covered by the real-layer test below. Log: `results/part1/moe_unit_h100_2026-11-18.txt`.
+
+Production shape, real weights (`part1/modal_moe_layer.py`: `tests/moe_layer_test.cu` loads one layer's router and
+128 experts with the engine's own packer, `tools/moe_layer_check.py` recomputes the layer with numpy from the
+safetensors files; a different expert choice is accepted only when the swapped experts' fp32 logits are within 2 bf16
+ulps). H100, 2026-11-18, layers 0 and 47 x 1 / 33 / 1024 tokens: all 6 pass, every token the same 8 experts, y within
+10-22% of the bound. Time of one MoE layer: 0.135 ms (1 token), 0.52-0.55 ms (33), 2.41 ms (1024 tokens), i.e. about
+6.5 ms of MoE per decode step over 48 layers. (The first run of layer 0 / 1024 stopped at the checker's own
+self-check, whose tolerance was too strict for numpy's summation order; fixed and rerun.) Log:
+`results/part1/moe_layer_real_h100_2026-11-18.txt`.
+
+The engine now runs MoE layers (`engine/qwen3_engine.cuh`): expert tensors are copied from the mmap'ed checkpoint
+straight into packed per-layer buffers [E, I, H] / [E, H, I] (one copy on the GPU; every expert tensor's shape is
+checked and the count must be 48 x 128 x 3), one MoE workspace is shared by all layers, and unsupported MoE configs
+stop with an error.
+
+Whole model vs HF (`part1/moe_e2e.py`: the HF bf16 reference is computed on a CPU container and stored, then the
+engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same 27-token prompt and checks as
+`e2e_test.py`, 16 greedy tokens, 43 positions (27 prefill, 16 KV-cache decode), 2026-11-18:
+- greedy tokens 16/16 identical to HF; top-1 42/43, the one mismatch at a position where HF's own top-2 margin is
+  0.000; mean cosine 0.99921; minimum cosine 0.9953 (below the dense criterion 0.999).
+- an explanation compatible with the data, not established as the cause: the per-layer expert choices of both sides were recorded (hooks on HF's routers,
+  `QWEN3_MOE_DUMP` in the engine). 300 of 2064 (layer, position) pairs take a different expert set, but only 6 of
+  them are primary (not explained by a difference at a lower layer at the same or an earlier position, through
+  causal attention), and all 6 are ties in HF's own bf16 router logits (0-2 ulps apart, mostly exactly equal). HF
+  rounds the router logits to bf16 before the softmax, so equal logits among 128 experts are common, and which tied
+  expert is taken is arbitrary (`torch.topk`'s order vs our lowest id). What the data show is compatible with that:
+  every position with cosine < 0.999 lies within reach of a routing difference (at that position or an earlier
+  one), and none of the 6 primary differences is far from HF's top-8 boundary. "Within reach" is not proof that the
+  later differences were caused by the ties; a test that forces the engine to use HF's experts would measure how much
+  of the difference the routing accounts for.
+- this run, as logged, FAILED the dense rule (minimum cosine) - both committed logs end in FAIL. An MoE rule was then
+  written from this run's numbers. A review found two holes in the first version of that rule (the top-1 check
+  looked at HF's own top-2 gap instead of the engine's token, and a high minimum cosine skipped the greedy and
+  routing checks); `part1/moe_e2e.py` now has a single verdict, tested locally on clean and adversarial synthetic
+  cases: top-1 mismatches only where the ENGINE's token is < 0.5 below HF's best, greedy identical, mean cosine >
+  0.999, full routing coverage, every primary difference within 2 bf16 steps of HF's logits, and every position with
+  cosine <= 0.999 within reach of a routing difference. Logs of the first run: `results/part1/moe_e2e_h100_2026-11-18.txt`,
+  `moe_e2e_routing_h100_2026-11-18.txt`.
+- the frozen rule, run unchanged on 1x H100 (2026-11-18, log `results/part1/moe_e2e_frozen_h100_2026-11-18.txt`):
+  "tiling" (the prompt the rule was written from) PASS, with the same numbers as before (top-1 42/43, greedy 16/16,
+  mean cosine 0.99921, 6 primary routing differences, all exact ties); the mismatch at position 35 is now checked
+  against the engine's own token: it is tied with HF's best (0.000 below it). "heldout" (a second prompt, 30 tokens,
+  reference made on a CPU after the rule was frozen, with the snapshot recorded) PASS: top-1 46/46, greedy 16/16,
+  mean cosine 0.99936, minimum 0.99464; 288 of 2208 (layer, position) pairs differ, 5 primary, all 5 exact ties (0
+  bf16 steps) in HF's router logits; every position with cosine <= 0.999 within reach of one of them. Dense 0.6B in the
+  same run: PASS (top-1 43/43, min cosine 0.99961). The engine's logits and routing of these runs are kept on the
+  volume (`final-results:/results/moe_e2e_runs/`). How much the "within reach" condition shows: little in these two
+  runs, because both have a routing difference at position 0 ("tiling": layer 3; "heldout": layer 2), which puts every
+  later position within reach. The informative results are top-1, greedy, full coverage and the primary differences
+  all being exact ties; they do not rule out an independent error in later layers. A forced-routing A/B would measure
+  the routing's share of the difference, not prove it is the only cause (run on 2026-11-24, below).
+- the same run checked the dense path after the MoE changes: Qwen3-0.6B top-1 43/43, min cosine 0.99961, greedy 16/16.
+- engine-only timing (single sequence, this prompt; not comparable with vLLM through AIPerf yet): TTFT 22.6 ms, ITL
+  11.0 ms.
+- HF reference with the engine's tie rule (the professor's suggestion, 2026-11-24). HF's router picks its top 8 with
+  `torch.topk`, whose order among equal values is unspecified; the engine takes the lower expert id. The reference was
+  regenerated with the HF router's top-k replaced by a stable descending sort, which keeps the lower id first among
+  equal probabilities (`part1/hf_tie_break.py`; it stops if the installed router is not the code it copies). Its
+  self-check passes on the container's transformers 5.23.0: on 4096 random rows, every row without a tie at the top-8
+  boundary keeps torch.topk's experts and weights, and built ties keep the lowest ids. The new references
+  (`moe_e2e_ref/*_tielow`, CPU, about a minute each) have the same greedy tokens as the old ones, so the saved
+  single-GPU engine runs were judged against them without a GPU (`--rejudge-runs`; log
+  `results/part1/moe_e2e_tielow_2026-11-24.txt`):
+
+  | prompt | HF tie rule | primary routing differences | (layer, position) pairs differing | mean cosine | min cosine | frozen rule |
+  |---|---|---|---|---|---|---|
+  | tiling | torch.topk | 6 | 300 | 0.99921 | 0.99532 | PASS |
+  | tiling | lower id | 4 | 309 | 0.99878 | 0.98575 | FAIL (mean cosine) |
+  | heldout | torch.topk | 5 | 288 | 0.99936 | 0.99464 | PASS |
+  | heldout | lower id | 2 | 188 | 0.99952 | 0.99555 | PASS |
+
+  The tie rule removes the differences where both sides see an exact tie. It cannot remove the rest, because the
+  engine's own bf16 router logits are not always tied where HF's are. Its router GEMM accumulates in a different
+  order, so the two roundings can land one bf16 step apart. Example: tiling, layer 2, position 0. Experts 62 and 114
+  are exactly equal in HF's logits, and HF now takes 62. The engine takes 114, so in its logits 114 is the larger of
+  the two (it takes the lower id only among exact equals). Every remaining primary difference is still 0 or 1 bf16
+  steps apart in HF's logits. HF's CPU reference is also not exactly repeatable between containers: the heldout
+  router logits differ already at layer 0, which depends only on the embeddings. The tiling result got worse with the
+  same engine output: HF's tie choices put its trajectory further from the engine's, not closer.
+- forced-routing A/B (1x H100, 2026-11-24, log `results/part1/moe_e2e_forced_h100_2026-11-24.txt`). With
+  `QWEN3_MOE_FORCE`, the engine takes HF's recorded experts for every layer and position, and its weights are still
+  its own router's probabilities of those experts. The remaining difference is then the part that does not come
+  from the routing. `tests/moe_force_test.cu` runs first: forcing the router's own choice is bit-identical to not
+  forcing it, and forced random experts get the given ids with the expected weights. All 1584 router calls of each
+  run took HF's experts, and the routing check found 0 differing pairs, which confirms the forcing took effect.
+  Against the tie-rule references:
+
+  | prompt | routing | mean cosine | min cosine | top-1 | greedy |
+  |---|---|---|---|---|---|
+  | tiling | engine's own | 0.99878 | 0.98575 | 41/43 | 16/16 |
+  | tiling | forced to HF's | **0.99987** | **0.99815** | 42/43 (the mismatch: 0.000 below HF's best) | 16/16 |
+  | heldout | engine's own | 0.99952 | 0.99555 | 46/46 | 16/16 |
+  | heldout | forced to HF's | **0.99988** | **0.99901** | 46/46 | 16/16 |
+
+  Same routing removes 89% (tiling) and 75% (heldout) of the mean 1 - cosine. With it, heldout meets the dense
+  criterion (min cosine > 0.999) on all 46 positions, and tiling meets it on 42 of 43. The one exception, tiling
+  position 37 (cosine 0.99815), is a position where HF is certain: top-1 probability 1.000, margin 13.6. The largest
+  error there is 0.625 on logits up to 34, 2.5 bf16 steps. That is rounding accumulated over 48 layers, not a wrong
+  token. So the gap between the MoE and the dense results comes mostly from the routing ties, as the earlier runs
+  suggested but could not show. The frozen MoE rule reports FAIL for the forced tiling run only because of its
+  "low cosine within reach of a routing difference" clause: with forced routing there is no difference for a low
+  position to be within reach of.
+
+### Server on Qwen3-30B-A3B vs vLLM, 1x H200 (2026-11-18, before Part 4)
+
+The first measurement and how it was read at the time. The rerun after Part 4 (every workload within 3x) is in
+[Part 4](#part-4-every-suite-workload-within-3x-of-vllm).
+
+Same 6-workload suite and AIPerf settings as Part 0 (`modal_aipref.py --suite --model Qwen/Qwen3-30B-A3B --gpu h200`
+vs `modal_vllm_aipref.py`, same flags); both servers serve the same snapshot (revision `ad44e777`: our runner checks
+it, vLLM's log prints the path it served, and its runner now checks it too). `tools/check_suite.py` accepts the pair:
+all 6 workloads complete on both sides, planned request counts, no errors, every prompt and every server-reported
+completion (usage) exactly the target length, the same AIPerf version (0.13.0) and input configuration, and the same
+prompt LENGTH per request counted by both servers (e.g. 128 synthetic tokens -> 136 with the chat template; lengths
+only, not a check that the token ids are identical). AIPerf's own re-tokenised output length differs by a few tokens on
+both sides and is not used. The servers themselves are compared as they come: memory pool and scheduling are each
+server's own (vLLM's chunked-prefill budget is its default, not pinned). Mean TTFT / ITL in ms, ratio = ours / vLLM:
+
+| Workload | ours TTFT | vLLM TTFT | TTFT x | ours ITL | vLLM ITL | ITL x |
+|---|---|---|---|---|---|---|
+| baseline (128 / 128, c1) | 42.3 | 67.6 | 0.63 | 11.02 | 4.00 | 2.76 |
+| long_out (3072 / 1024, c1) | 377 | 80.7 | 4.67 | 12.28 | 4.15 | 2.96 |
+| balanced_c16 (256 / 256) | 514 | 150 | 3.43 | 21.66 | 8.46 | 2.56 |
+| balanced_c64 (256 / 256) | 1930 | 468 | 4.13 | 43.21 | 12.74 | 3.39 |
+| prefill_heavy (2048 / 32, c8) | 1141 | 245 | 4.66 | 45.87 | 8.24 | **5.56** |
+| decode_heavy (64 / 1024, c32) | 492 | 1064 | 0.46 | 27.73 | 10.26 | 2.70 |
+
+Raw results: `results/aiperf/suite_Qwen3-30B-A3B_ours_1795057331`, `suite_Qwen3-30B-A3B_vllm_1795049169`. What I
+thought the numbers said at the time, before the stage-by-stage profile of Part 4:
+- single-sequence decode is about 2.8x slower (baseline, long_out ITL). The MoE block is six kernels per layer, and
+  the grouped gate/up and down launch blocks for all 128 experts whether a given expert has rows or not (one real
+  layer took 0.135 ms for one token on an H100, engine only; 48 layers would be about 6.5 ms of an 11 ms step, an
+  extrapolation, not a measurement on the H200). How much of the gap the empty blocks are is not measured; an A/B of
+  one layer, including the cost of building the work list, comes first.
+- prefill_heavy ITL is the worst ratio (45.87 vs 8.24 ms). A hypothesis at the time: our scheduler runs every
+  newly admitted prefill (2048 tokens) before the next decode step (that much is in the code), so running sequences
+  may wait behind it; how vLLM interleaved them in this run and how much of the gap the blocking accounts for are not
+  broken down. A timeline of prefill start/end against token gaps, then a chunked-prefill A/B, would test it.
+- decode_heavy TTFT below 1 (concurrency 32): our scheduler admits new requests ahead of the next decode step, so
+  first tokens come early and running sequences pay in ITL. baseline TTFT below 1 cannot be that (concurrency 1: no
+  other request is running); its end-to-end TTFT is lower, and where the difference comes from (HTTP, tokenisation,
+  prefill) is not broken down.
+- `long_out` TTFT (4.67x) is a single request at concurrency 1, so nothing waits on it: the prefill time of 3072
+  tokens is the first thing to look at (this is the HTTP first-token latency, so it also includes the server path).
+
+Over 3x, i.e. the Part 4 list for this model (ratio of means): `long_out` TTFT (target <= 242 ms), `balanced_c16` TTFT
+(<= 450 ms), `balanced_c64` TTFT (<= 1403 ms) and ITL (<= 38.2 ms), `prefill_heavy` TTFT (<= 735 ms) and ITL (<= 24.7
+ms); for Qwen3-4B `balanced_c64` ITL (3.03x) and the paged lecture configuration ITL (3.45x). Part 4 brought
+all six suite workloads under 3x. The per-stage profile showed that the empty blocks of the expert GEMMs, not the
+prefill blocking, were the main cost (see Part 4).
+
+Getting this run to start took three tries, none of which reached the benchmark: (1) newer `huggingface_hub` rejects
+a cached snapshot without README / LICENSE / .gitattributes (`snapshot_download(local_files_only=True)`), so the runner
+now resolves `refs/main` itself and checks the revision, the file set and the lengths of what the engine reads
+(`local_snapshot`: pinned revision, the `.safetensors` in the directory = the index's shards, each file at least as
+long as its header declares; not the contents); (2) AIPerf
+loads the tokenizer by repo name offline, through the same check, so the three small files were fetched at the pinned
+revision (`part1/download_moe.py --complete`, which then loads the tokenizer by name offline in a fresh process); (3)
+the image build stopped at a flaky server test: a finished request emitted its last token before releasing its
+slot and blocks, so a client could see the end of its stream before the blocks were back. The scheduler now
+releases first, on the error path too, and a test checks the order at the moment the final event is emitted
+(it fails on the old code every time). `modal_aipref.py --compat --model ...` now runs AIPerf with that model's
+tokenizer in the same image and checks that the engine and AIPerf resolve the same snapshot; it passed before the
+H200 run.
+
+`tools/moe_debug.py` checks every stage (count, off, sorted, inv, gate/up, down, combine) from
+the GPU's own intermediates: all exact or within 0.3% on 4 cases.
+
+Two findings on the way: `gather_scatter_view` takes element offsets (not tile coordinates) in every dimension other
+than the gathered one (a probe in `tests/moe_test.cu`); and a prefix sum written as a mma with a lower-triangular bf16
+matrix left positions of the sort unwritten on the H100, replaced by an integer masked row sum.
+
+## Part 2: two-GPU all-to-all mock
+
+`part2/` implements the figure of the Week 8 handout: two workers (one GPU each), four experts (0, 1 on worker 0;
+2, 3 on worker 1), tokens and top-1 routing hard-wired as in the figure (worker 0: Today->3, is->3, hot->1; worker 1:
+I->2, feel->0, happy->3), experts mocked as e_k(x) = (k + 1) x + k on 128-wide rows.
+
+| Step (figure column) | Implementation |
+|---|---|
+| Routing | hard-wired expert and gate weight per token (`a2a_plan.h`) |
+| Permutation | stable sort by expert on the host; rows gathered on the GPU with the CUDA Tile `gather_scatter_view` (`gather_rows`) |
+| All-to-all (dispatch) | counts exchanged first, then rows and expert ids with grouped `ncclSend` / `ncclRecv` (counts differ per peer) |
+| Computation | each received row through its local expert (`run_experts`) |
+| All-to-all (combine) | the dispatch inverted: the rows go back to their worker in the order they were sent |
+| Un-permutation + scale | rows scattered back to their original positions with `gather_scatter_view`, times the gate weight (`scatter_scale`) |
+
+One host thread per GPU plays one worker (one MPI rank in the Week 5 "MPI with CUDA" notebook; the NCCL unique id,
+which rank 0 would broadcast with MPI, is shared between the threads). About 160 non-comment lines (`a2a_mock.cu` 125,
+`a2a_plan.h` 39). Checks: `test_plan.cpp` simulates the whole pipeline on the host (the all-to-all as copies) and is
+run while the image is built (CPU); on 2x H100 (2026-11-18, NCCL 2.32.3) the permuted orders match the figure
+(hot, Today, is / feel, I, happy) and all 6 outputs are exact (`results/part2/a2a_mock_2xH100_2026-11-18.txt`).
+Rows past the end of a tile get an out-of-range index, which the masked gather / scatter skips (verified by this run:
+5 padding rows per tile, results exact, no memory error).
+
+## Part 3 + Part 5: data + expert parallelism on 2 GPUs, vLLM's process layout
+
+**Design.** Rank r keeps every non-expert weight and its own requests (data parallelism) and only experts
+[64r, 64r + 64) of each layer (expert parallelism, `engine/qwen3_ep.cuh`). One MoE layer: local route and stable sort
+(Part 1; sorted by expert = grouped by owner rank) -> all-gather of the per-expert counts (one host copy gives send and
+receive counts) -> grouped NCCL send / recv of rows and expert ids -> the owner's grouped GEMMs on its experts ->
+all-to-all back with the counts swapped, which yields exactly Part 1's sorted buffer -> Part 1's weighted combine.
+Receive buffers are sized for the worst case (all tokens of all ranks on one rank's experts); startup fails if they
+do not fit. Every MoE layer is a collective, so every rank runs every forward pass: each pass starts with an
+all-reduce "does anyone have work", an idle rank joins with 0 tokens, and when nobody has work the ranks park until
+the coordinator wakes them all (checked with real processes, `part3/protocol_sim.py`).
+
+**Process layout** (Week 9; `part5/DESIGN.md`, `part5/launch.py`): HTTP load balancer -> K API servers (HTTP, tokenizer,
+streaming) -> ZMQ, any API server to any engine core -> K engine cores (scheduler, KV admission and preemption) ->
+Pipe -> K GPU workers (one per GPU, NCCL between them), plus one DP coordinator (park / wake, load table for routing).
+
+**Correctness.** One real layer on 2x H100: bit-exact vs the single-GPU layer in 6 cases incl. a hotspot where every
+token goes to rank 0's experts (`results/part3/ep_layer_h100x2_2026-11-18.txt`). Whole model on 2x H100: logits and
+tokens identical to 1 GPU (`results/part3/moe_e2e_ep2_h100x2_2026-11-18.txt`). Through all the Part 5 processes on
+2x H100: 4/4 texts identical to the 1-GPU server one at a time, 8/8 all at once
+(`results/part5/smoke_h100x2_2026-11-19.txt`). CPU tests: `part5/test_part5.py` (K = 1, 3; abort frees KV blocks;
+killing any process stops the group).
+
+**Performance, Qwen3-30B-A3B, AIPerf suite, before Part 4** (2026-11-19; the rerun after Part 4 is in
+[Part 4](#part-4-every-suite-workload-within-3x-of-vllm); ours `suite_Qwen3-30B-A3B_ep2_ours_1795147115`, vLLM
+`--data-parallel-size 2 --tensor-parallel-size 1 --enable-expert-parallel`, `suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843`;
+1-GPU rows from Part 1; `tools/check_suite.py`: all workloads complete and comparable). Averages:
+
+| Workload | TTFT ms: ours 1 / ours 2 / vLLM 1 / vLLM 2 | ratio 2 GPUs | ITL ms: ours 1 / ours 2 / vLLM 1 / vLLM 2 | ratio 2 GPUs | tok/s: ours 2 / vLLM 2 |
+|---|---|---|---|---|---|
+| baseline (128/128, c1) | 42 / 59 / 68 / 103 | 0.57 | 11.02 / 14.44 / 4.00 / 4.97 | 2.91 | 67 / 174 |
+| long_out (3072/1024, c1) | 377 / 497 / 81 / 112 | 4.43 | 12.28 / 15.86 / 4.15 / 5.10 | 3.11 | 61 / 192 |
+| balanced_c16 (256/256) | 514 / 510 / 150 / 385 | 1.32 | 21.66 / 23.97 / 8.46 / 8.11 | 2.95 | 618 / 1663 |
+| balanced_c64 (256/256) | 1930 / 1751 / 468 / 320 | 5.47 | 43.21 / 43.85 / 12.74 / 9.21 | 4.76 | 1259 / 6116 |
+| prefill_heavy (2048/32, c8) | 1141 / 1471 / 245 / 259 | 5.67 | 45.87 / 50.66 / 8.24 / 8.75 | **5.79** | 84 / 476 |
+| decode_heavy (64/1024, c32) | 492 / 452 / 1064 / 219 | 2.06 | 27.73 / 28.61 / 10.26 / 8.68 | 3.30 | 1101 / 3593 |
+
+What the numbers show:
+- One request at a time, 2 GPUs are slower than 1 for both servers (ITL +31% ours, +24% vLLM): every MoE layer adds
+  the count exchange and two all-to-alls.
+- At high concurrency vLLM gains from the second GPU (balanced_c64 ITL 12.74 -> 9.21 ms, throughput +39%;
+  decode_heavy +27%) and ours does not (43.2 -> 43.9 ms). With half the batch per GPU, vLLM's step gets shorter; ours
+  stays the same, so our step time is not dominated by work that scales with the batch. A hypothesis at the
+  time: the per-layer host synchronisation for the counts (48 per step) and fixed per-layer costs. The 2x H200
+  profile (`results/part4/profile_30B_h200x2_*.txt`) put most of the time in the expert GEMMs instead. With the
+  work list and the new tiles, balanced_c64 ITL on 2 GPUs went from 43.85 to 25.83 ms (4.76x -> 2.81x).
+
+## Part 4: every suite workload within 3x of vLLM
+
+Every workload of the 6-workload suite is now within 3x of vLLM for both TTFT and ITL, on all three setups: Qwen3-4B
+on 1x H100, Qwen3-30B-A3B on 1x H200, and Qwen3-30B-A3B on 2x H200. The worst ratio is 2.81x (30B on 2 GPUs,
+balanced_c64 ITL). Our side was rerun after the Part 4 changes (4B and 2 GPUs 2026-11-24, 1 GPU 2026-11-21). The vLLM
+runs are the same ones as before. Every run had 0 request errors. The ratios are ratios of means, from
+`results/comparison.csv` (`tools/summarize_results.py`); the ratio before Part 4 is in parentheses.
+
+**Qwen3-4B, 1x H100** (ours `suite_ours_1795582887`, vLLM `suite_vllm_1794881615`)
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio (before Part 4) | ITL vLLM / ours (ms) | ratio (before Part 4) | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 29.21 / 12.38 | **0.42x** (0.51x) | 4.25 / 6.76 | **1.59x** (1.73x) | 224 / 147 |
+| long_out | 3072 / 1024, 1 | 63.73 / 77.26 | **1.21x** (1.24x) | 4.44 / 7.36 | **1.66x** (1.87x) | 222 / 135 |
+| balanced_c16 | 256 / 256, 16 | 107.33 / 108.83 | **1.01x** (1.02x) | 4.70 / 8.69 | **1.85x** (2.06x) | 3126 / 1758 |
+| balanced_c64 | 256 / 256, 64 | 270.13 / 405.22 | **1.50x** (1.50x) | 6.35 / 15.89 | **2.50x** (3.03x) | 8610 / 3667 |
+| prefill_heavy | 2048 / 32, 8 | 204.67 / 228.58 | **1.12x** (1.11x) | 6.99 / 14.78 | **2.11x** (2.25x) | 601 / 371 |
+| decode_heavy | 64 / 1024, 32 | 95.96 / 159.11 | **1.66x** (1.61x) | 5.57 / 11.64 | **2.09x** (2.34x) | 5639 / 2711 |
+
+**Qwen3-30B-A3B, 1x H200** (ours `suite_Qwen3-30B-A3B_ours_1795326093`, vLLM `suite_Qwen3-30B-A3B_vllm_1795049169`)
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio (before Part 4) | ITL vLLM / ours (ms) | ratio (before Part 4) | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 67.61 / 25.58 | **0.38x** (0.63x) | 4.00 / 7.38 | **1.85x** (2.76x) | 222 / 133 |
+| long_out | 3072 / 1024, 1 | 80.65 / 129.64 | **1.61x** (4.67x) | 4.15 / 8.19 | **1.97x** (2.96x) | 236 / 120 |
+| balanced_c16 | 256 / 256, 16 | 149.95 / 258.08 | **1.72x** (3.43x) | 8.46 / 16.13 | **1.91x** (2.56x) | 1771 / 936 |
+| balanced_c64 | 256 / 256, 64 | 467.52 / 978.16 | **2.09x** (4.13x) | 12.74 / 30.38 | **2.39x** (3.39x) | 4396 / 1874 |
+| prefill_heavy | 2048 / 32, 8 | 245.02 / 395.64 | **1.61x** (4.66x) | 8.24 / 23.08 | **2.80x** (5.56x) | 507 / 229 |
+| decode_heavy | 64 / 1024, 32 | 1064.34 / 325.52 | **0.31x** (0.46x) | 10.26 / 21.12 | **2.06x** (2.70x) | 2830 / 1493 |
+
+**Qwen3-30B-A3B, 2x H200 (DP = EP = 2; vLLM --data-parallel-size 2 --enable-expert-parallel)** (ours `suite_Qwen3-30B-A3B_ep2_ours_1795581836`, vLLM `suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843`)
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio (before Part 4) | ITL vLLM / ours (ms) | ratio (before Part 4) | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 102.90 / 27.66 | **0.27x** (0.57x) | 4.97 / 11.39 | **2.29x** (2.91x) | 174 / 87 |
+| long_out | 3072 / 1024, 1 | 112.13 / 169.67 | **1.51x** (4.43x) | 5.10 / 12.74 | **2.50x** (3.11x) | 192 / 77 |
+| balanced_c16 | 256 / 256, 16 | 384.85 / 192.21 | **0.50x** (1.32x) | 8.11 / 18.10 | **2.23x** (2.95x) | 1663 / 848 |
+| balanced_c64 | 256 / 256, 64 | 320.04 / 625.47 | **1.95x** (5.47x) | 9.21 / 25.83 | **2.81x** (4.76x) | 6116 / 2263 |
+| prefill_heavy | 2048 / 32, 8 | 259.37 / 412.15 | **1.59x** (5.67x) | 8.75 / 23.63 | **2.70x** (5.79x) | 476 / 223 |
+| decode_heavy | 64 / 1024, 32 | 218.80 / 228.75 | **1.05x** (2.06x) | 8.68 / 21.08 | **2.43x** (3.30x) | 3593 / 1501 |
+
+What changed (each step checked bit-exact or byte-identical before it was timed; profiles in `results/part4/`):
+1. Per-stage profile of the MoE and EP layers with the host clock (`tests/moe_profile_test.cu`). On 1x H200 the
+   expert GEMMs took most of a long prefill, at 30-40 TFLOP/s: most of the blocks of their grid had no rows.
+2. Work list for the expert GEMMs: blocks are launched only for the (expert, row tile) pairs that have rows
+   (`part4/tile_list_sim.py` checked the indexing on the CPU first; `tests/moe_tiles_test.cu`: same output as the full
+   grid, bit for bit). 2048-token prefill 251 -> 183 ms on 1 GPU, 594 -> 259 ms on 2 GPUs.
+3. Expert GEMM tiles and alignment hints chosen by a sweep (`tests/moe_sweep_test.cu`, bit-exact): 2048-token
+   prefill 183 -> 86 ms on 1 GPU.
+4. The sort kernel writes the work list itself, so each MoE layer needs one launch fewer (bit-exact).
+5. Decode steps as CUDA graphs, one per batch size, on 1 GPU. Logits are identical with and without the graph on
+   19 steps at batch 1 / 8 / 32 / 64. Decode step 8.14 -> 7.33 ms at batch 1 and 20.32 -> 19.03 ms at batch 64
+   (30B, 1x H200). Graphs are off with expert parallelism, so the 2-GPU gains come from steps 2-4.
+
+Rejected: chunked prefill. A simulation of the scheduler (it matched the measured prefill_heavy run) showed that
+it raises the mean ITL here. Every forward reads all the expert weights, so splitting a prefill into chunks adds
+whole forwards.
+
+Caveat: runs of our server in different containers have differed by up to 7-28% (Known limitations). The 4B gains
+of 5-17% in ITL are within that range; only the 30B changes (up to 3.5x in TTFT) are clearly larger than that noise.
+The lecture and paged rows of Part 0 were not rerun.
+
+## Correctness checks
+
+- Unit tests per module against HF (SQLite cases, `modal_test_h100.py`): RMSNorm, RoPE, linear, MLP, embedding,
+  argmax, attention (36 cases, prefill and decode, heads 32/8, 32/4, 16/8; bf16 bound derived from the arithmetic,
+  |d| <= 2^-8 (max|V| + 2|e|)). All pass on the H100 with the final tiles; attention was rerun with the paged kernels
+  (2026-11-18).
+- Paged vs contiguous attention (`tests/paged_attention_test.cu`, H100, 2026-11-18): the same K/V once contiguous and
+  once in a shuffled block pool whose other rows hold large stale values; prefill (64x128 split-P and 16x16 fp32-P,
+  lengths 1-3000 incl. block edges 127/128/129, full and chunked) and batched decode (up to 100 sequences): 28/28
+  outputs bit-identical. Speed (`tests/paged_bench_test.cu`): decode 500 us vs 497 us per layer at 128K, prefill
+  16K 7.94 ms vs 7.65 ms, i.e. the block-table lookup costs nothing measurable.
+- Whole model vs HF (`e2e_test.py`, rerun with the paged KV cache on 2026-11-18, identical numbers): Qwen3-0.6B with an 8192-token prompt and YaRN x4: top-1 60/64 (every mismatch an
+  HF near-tie, margin <= 0.062), min cosine prefill 0.999789 / decode 0.999687 (criterion > 0.999), greedy tokens 16/16,
+  RoPE tables bit-identical. Qwen3-4B, 43 positions: criterion met (see the development log).
+- Batched decode vs decoding alone (`batch_check.py`, Qwen3-4B, 4 sequences of 27-3000 tokens, 16 steps): with a fixed
+  split count, 64/64 logits rows bit-identical (rerun with the paged KV cache on 2026-11-18, same result).
+- Server (`server/test_server.py`, 14 tests, fake engine with the engine's block accounting): stream format, exact
+  lengths and usage, EOS handling, rejections, batching equals running alone, more requests than slots, disconnects,
+  engine errors, UTF-8 split over tokens; paging: four short requests run together in a pool of one max_len sequence,
+  preemption + recompute gives exactly the output of running alone with no block leaked, a request larger than the
+  pool is rejected. AIPerf compatibility checked on a CPU against the fake-engine server.
+- MoE (Part 1, details there). Router and block unit tests vs HF's `Qwen3MoeSparseMoeBlock`, 10/10 pass. One real
+  layer at the production shape vs numpy (layers 0 and 47, 1 / 33 / 1024 tokens): 6/6 pass. Whole model vs HF on
+  two prompts under the frozen MoE rule: PASS, greedy 16/16. With HF's experts forced: mean cosine 0.99987 /
+  0.99988, min 0.99815 / 0.99901. `tools/moe_debug.py` checks every intermediate of the block.
+- Expert parallelism (Part 3): one real layer on 2 GPUs is bit-exact vs 1 GPU in 6 cases, incl. all tokens on one
+  rank's experts. The whole model on 2 GPUs gives the same logits and tokens as on 1 GPU, also after Part 4 (rerun
+  2026-11-21). Through all the Part 5 processes, the texts are identical to the 1-GPU server.
+- Part 4 changes: the work-list GEMMs equal the full grid bit for bit in 40 cases, and the list written by the sort
+  kernel equals the separate list kernel (`tests/moe_tiles_test.cu`, `part4/tile_list_sim.py`). The tile sweep is
+  bit-exact. CUDA graph vs direct launches: identical logits for 19 steps at batch 1 / 8 / 32 / 64
+  (`tests/moe_profile_test.cu`). Whole model byte-identical to the 2026-11-18 run after each change (1 GPU, and
+  2 GPUs vs 1 GPU); 0.6B byte-identical through the graph path.
+
+## Known limitations
+
+- Run-to-run variance between containers is large for our server: two suite runs came out 7-28% apart with engines
+  that time the same in one container. Differences of that size between single runs are not evidence of a change;
+  the 4B gains of Part 4 are within that range.
+- Not rerun after Part 4: the Week 7 lecture rows and the paged / 8-slot comparison (paged lecture ITL 3.45x, above
+  3x), and the 128K row (2.24x / 2.37x). The 2048-context lecture row was measured before paging.
+- MoE correctness against HF: equal bf16 router logits are common, and HF and the engine can break such ties
+  differently even with the same tie rule, because their router GEMMs round differently. This is why the MoE rule
+  is not the dense rule. With HF's experts forced, 88 of 89 positions meet the dense criterion; the remaining one is
+  a confident position with an error of 2.5 bf16 steps (Part 1).
+- CUDA graphs are used on 1 GPU only. With expert parallelism every MoE layer has a host-side count exchange, so
+  the 2-GPU decode step is not captured.
+- A prefill stalls the decode of the other running sequences: there is no chunked-prefill interleaving. It was
+  simulated and rejected for the MoE model (Part 4), not tried for the dense one.
+- Stale rows of a reused block are not zeroed: masked keys get P = 0 exactly, which needs finite stale values (the pool
+  is zeroed at start). Zeroing them in the attention loop cost 1.9x (decode) / 2.5x (prefill) and was removed
+  (`tests/paged_bench_test.cu`).
+- Greedy only (`temperature` > 0 is rejected); `min_tokens` does not mask EOS like vLLM.
+- The old 64x128 attention kernel was less accurate for a single query (decode); the default decode path now uses
+  the split-KV kernel, which meets the criterion. The root cause in the old kernel was not identified.
+
+## How to reproduce
+
+```bash
+python server/test_server.py                       # local, no GPU
+modal run modal_aipref.py --compat                 # CPU only: AIPerf vs the fake-engine server
+modal run modal_test_h100.py --yes                 # unit tests, 1x H100
+modal run e2e_test.py --yes --model Qwen/Qwen3-0.6B --gpu h100 --long 8192 --yarn 4 --ab
+modal run batch_check.py --yes --splits ,4
+modal run modal_vllm_aipref.py --yes --suite       # vLLM, workload suite
+modal run modal_aipref.py --yes --suite            # ours, workload suite
+modal run modal_vllm_aipref.py --yes --isl 130816 --osl 128 --yarn
+modal run modal_aipref.py --yes --isl 130816 --osl 128 --yarn --requests 2
+modal run modal_vllm_aipref.py --yes --lecture     # vLLM, Week 7 lecture workload
+modal run modal_aipref.py --yes --lecture          # ours, Week 7 lecture workload
+modal run modal_vllm_aipref.py --yes --mode paged  # vLLM, PagedAttention comparison configuration
+modal run modal_aipref.py --yes --mode paged       # ours, paged (128 sequences share the pool)
+modal run modal_aipref.py --yes --mode slots8      # ours, same pool, 8 sequences (= contiguous slots)
+modal run compile_check.py                         # CPU only: compile the engine and every test
+modal run part1/download_moe.py --yes              # Part 1: Qwen3-30B-A3B weights into qwen3-hf-cache (CPU)
+modal run part1/gen_moe_cases.py                   # Part 1: MoE reference cases -> test_cases_moe.db (CPU)
+modal run part1/modal_moe_layer.py --yes           # Part 1: one real MoE layer, production shape, vs numpy
+modal run part1/moe_e2e.py --ref --yes             # Part 1: HF reference of the whole model (CPU), with routing
+modal run part1/moe_e2e.py --ref --yes --prompts heldout   # Part 1: HF reference of the held-out prompt (CPU)
+modal run part1/moe_e2e.py --yes --prompts tiling,heldout  # Part 1: engine vs both references on 1x H100 (+ dense 0.6B)
+modal run modal_test_h100.py --yes --tests moe,moe_debug   # Part 1: MoE unit tests + stage-by-stage check
+modal run part1/download_moe.py --complete         # Part 1: small non-weight files + offline tokenizer check (CPU)
+modal run modal_aipref.py --compat --model Qwen/Qwen3-30B-A3B            # CPU: AIPerf + snapshot check for 30B
+modal run modal_vllm_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200   # Part 1: vLLM suite
+modal run modal_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200        # Part 1: ours, suite
+modal run part2/modal_a2a.py --yes                 # Part 2: all-to-all mock on 2x H100
+modal run hw_check.py --yes                        # 2x H200 available? peer access, NCCL in the image
+modal run part3/modal_ep_layer.py --yes            # Part 3: one real MoE layer on 2 GPUs vs 1 GPU, bit for bit
+modal run part1/moe_e2e.py --yes --ep --prompts tiling,heldout   # Part 3: whole model on 2x H100, vs the 1-GPU run
+python part5/test_part5.py                         # Part 5: process layout, CPU only (K = 1, 3)
+modal run part5/modal_smoke.py --yes               # Part 5: all processes on 2x H100 vs the 1-GPU server
+modal run modal_vllm_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200 --world 2   # vLLM DP2 EP suite
+modal run modal_aipref.py --yes --suite --model Qwen/Qwen3-30B-A3B --gpu h200 --world 2        # ours, 2x H200 suite
+modal run part4/modal_profile.py --yes [--world 2] # Part 4: per-stage profile, 1 or 2x H200 (+ CUDA graph A/B on 1)
+python part4/tile_list_sim.py                      # Part 4: work-list indexing, CPU only
+modal run modal_test_h100.py --yes --tests moe_tiles,moe_sweep,moe_force   # Part 4 / Part 1: work list, tiles, forced router
+modal run part1/moe_e2e.py --tie-check-only        # Part 1: tie-rule patch self-check on the image's transformers (CPU)
+modal run part1/moe_e2e.py --ref --tie low --yes --prompts tiling,heldout   # references with the engine's tie rule (CPU)
+modal run part1/moe_e2e.py --rejudge-runs --tie low --prompts tiling,heldout    # saved engine runs vs them (CPU)
+modal run part1/moe_e2e.py --yes --force-routing --tie low --prompts tiling,heldout   # forced-routing A/B, 1x H100
+modal run tools/ab_engine_bench.py --yes           # engine before paging (8bcdbd5) vs now, one container
+modal run modal_test_h100.py --yes --tests paged,paged_bench   # paged vs contiguous attention: bits and timing
+python tools/summarize_results.py                  # rebuild results/*.csv from results/aiperf
+python tools/check_suite.py OURS_DIR VLLM_DIR      # accept a paired suite run before reporting it (no GPU, no Modal)
+python tools/check_suite.py --sync                 # the runners' workload lists agree with workloads.py
+```
+
+Weights come from the Modal volume `qwen3-hf-cache`; unit-test cases come from `modal run gen_cases.py`
+(`test_cases.db`, not committed). Raw AIPerf output (per-request logs) stays on the volume `final-results`.
+
+## Design rules
+- Understand every line; Qwen3 only (head_dim 128), no generic code.
+- Attention must be fused (FlashAttention) and must use the KV cache; weights loaded to the GPU once.
+- Tile kernels (`__tile_global__`), not SIMT `__global__`.
+- Correctness check before any benchmark; record the commit with each measurement.
+
+## Development log (history)
+
+Kept as the record of how the engine got here. Numbers in this section are superseded by the tables above, and some
+switches mentioned here no longer exist (`QWEN3_DECODE_SPLIT` was removed once the split-KV decode became the only
+decode path on Hopper). Engine-only measurements here time forward + argmax without the HTTP server.
+
+Original plan (dates as planned on 2026-11-16):
+
+| Stage | Dates | Part | Outcome |
+|---|---|---|---|
+| 0. Setup, vLLM baseline | 11/16 | prep | done |
+| 1. Dense modules + tests | 11/17-11/18 | Part 0 | done 11/16 |
+| 2. End-to-end generation | 11/18-11/19 | Part 0 | done 11/16 |
+| 3. Reach 10x of vLLM, 128K YaRN, serving | 11/20-11/22 | Part 0 | done 11/17 |
+| 4. Two-GPU all-to-all mock | 11/23 | Part 2 | |
+| 5. Single-GPU Qwen3-30B-A3B | 11/24-11/26 | Part 1 | |
+| 6. DP + EP, multi-process architecture | 11/27-11/28 | Part 3, Part 5 | |
+| 7. Performance to 3x, write-up | 11/29-11/30 | Part 4 + submission | |
+
+Notes from stages 1-2: RMSNorm passes all 90 synthetic cases (bf16: 89/90 bit-identical, 1 differs by one bf16 ulp);
+RoPE 32 cases (bf16 bit-identical); MLP 20 cases; embedding bit-exact; lm_head and argmax (first index wins ties) pass;
+real Qwen3-4B weights pass for embedding, the RMSNorms of layers 0 and 35, MLP layers 0 and 35, lm_head and argmax
+(`real_weights_test.py`). First end-to-end run vs HF: Qwen3-0.6B 43/43 top-1, Qwen3-4B 40/43 (the 3 mismatches HF
+near-ties). First L4 timings (27-token prompt): 4B TTFT 44.5 ms / ITL 43.3 ms.
+
+### First baselines (2026-11-16)
+
+vLLM, Qwen3-4B, bf16, 1x H100, single sequence (concurrency 1), 3072 input / 1024 output tokens, 5 requests, prefix caching off, measured with AIPerf on 2026-11-16. Raw output is on Modal volume `final-results` (`/results_store/vllm_isl3072_osl1024_1794855146`).
+
+| Metric | vLLM | Part 0 target (10x) | Part 4 target (3x) |
+|---|---|---|---|
+| TTFT avg (ms) | 59.09 (p50 57.08) | <= ~591 | <= ~177 |
+| ITL avg (ms) | 4.46 | <= ~44.6 | <= ~13.4 |
+| Request latency (ms) | 4618.8 | | |
+
+Our engine (Qwen3-4B bf16, 1x H100, same workload: 1 sequence, 3072 in / 1024 out, greedy, EOS ignored; `bench_modal.py`, 3 requests after a warm-up, 2026-11-16; raw output on volume `final-results`):
+
+| Metric | vLLM | ours | ratio (ours / vLLM) | Part 0 limit (10x) | Part 4 limit (3x) |
+|---|---|---|---|---|---|
+| TTFT avg (ms) | 59.09 | 1042.6 | 17.6x | <= ~591 (not met) | <= ~177 |
+| ITL avg (ms) | 4.46 | 21.12 | 4.7x | <= ~44.6 (met) | <= ~13.4 |
+
+Caveats: ours is engine-only (no HTTP server, no tokenizer; timing around forward + argmax with a host sync every step), vLLM was measured with AIPerf through its server. Numbers are very stable across the 3 requests (TTFT 1042.5-1042.7 ms, ITL 21.12 ms). The prefill runs at roughly 24 TFLOP/s effective (2 * 4B * 3072 tokens in 1.04 s), a few percent of the H100's bf16 peak, so there is a lot of room; where the time goes has NOT been profiled yet.
+
+### Profile of our engine (Qwen3-4B, H100, context ~3072; CUDA events around every stage; 2026-11-16)
+
+Prefill of 3072 tokens, 1035 ms in total (stage sum 1035.3 ms):
+
+| Stage | ms | share | achieved |
+|---|---|---|---|
+| MLP gate/up + SiLU | 282.2 | 27.3% | 39 TFLOP/s |
+| MLP down | 239.8 | 23.2% | 23 TFLOP/s |
+| attention | 235.5 | 22.8% | 11.8 TFLOP/s |
+| q_proj + o_proj + k_proj + v_proj | 263.1 | 25.4% | 22 TFLOP/s |
+| everything else (norms, RoPE, adds, KV write, lm_head, embedding) | ~15 | 1.4% | |
+
+Decode step at context ~3072, 20.4 ms (stage sum):
+
+| Stage | ms | share | achieved |
+|---|---|---|---|
+| attention | 10.12 | 49.6% | 45 GB/s of the cache (the cache is only ~0.46 GB per step, ~0.14 ms at HBM speed) |
+| MLP (gate/up + down) | 4.46 | 21.9% | 0.8-1.6 TB/s of weights |
+| q/k/v/o projections | 3.28 | 16.1% | k/v only 0.26 TB/s, q/o 0.7-1.0 TB/s |
+| small kernels (norms, RoPE, add, KV write) | ~2.0 | 9.8% | ~8 us each, ~15 launches per layer |
+| lm_head | 0.58 | 2.9% | 1.3 TB/s |
+
+Reading: the dense GEMMs run at ~2-4% of the H100's bf16 peak because the tiles are tiny (16x32x32, chosen only to get launches to work; 64x64 and 128x128 tiles failed to launch on bf16). Decode attention launches only 32 blocks (one per query head, each walking ~194 key tiles of 16 one after another) on a 132-SM GPU. These are the biggest levers; they are hypotheses to test, not yet changes.
+
+### After the GEMM tile change (2026-11-16)
+
+Cause found: the earlier launch failures of big bf16 tiles were specific to the L4 (99 KB shared memory per block); on the H100 all 27 swept plain-GEMM configurations and all 9 fused gate/up configurations launch and give bit-identical results to the 16x32x32 baseline (`gemm_sweep_modal.py`). Measured on a 3072x2560 @ 2560x9728 bf16 GEMM: 16x32x32 21 TFLOP/s -> 128x128x64 630 TFLOP/s. The fused gate/up kernel (two accumulators) must NOT use 128x128 (95-166 TFLOP/s, registers spill); 128x64x64 gives 601 TFLOP/s. The engine now picks tiles by device (>= 200 KB opt-in shared memory -> big tiles) and by token count; `QWEN3_TILES=small` forces the old tiles.
+
+| Metric | vLLM | ours before | ours now | ratio now | Part 0 (10x) | Part 4 (3x) |
+|---|---|---|---|---|---|---|
+| TTFT avg (ms) | 59.09 | 1042.6 | **297.3** | 5.0x | met | needs <= ~177 |
+| ITL avg (ms) | 4.46 | 21.12 | **17.83** | 4.0x | met | needs <= ~13.4 |
+
+(3 requests of 3072 in / 1024 out after a warm-up, stable to +-0.1 ms; engine only, see the caveats above; raw output on volume `final-results`.) The unit-test suite passes on the H100 with the big tiles; on the 3072-token prompt the last-position logits of the big and small tiles were identical (cosine 1.000000, max diff 0.000, same top-1). Not yet independently confirmed that the "small" run really took the small path (the benchmark did not print the tile profile; it will from now on).
+
+Profile after the change (H100, context ~3072):
+- prefill 298 ms: **attention 249.6 ms = 83.6%** (still 11.2 TFLOP/s); all GEMMs together ~35 ms (620-710 TFLOP/s); the rest ~14 ms.
+- decode step 17.3 ms: **attention 10.56 ms = 61%** (43 GB/s of the cache); MLP 2.6 ms, projections 2.0 ms, small kernels ~2 ms, lm_head 0.23 ms (3.4 TB/s).
+Attention is now the bottleneck of both phases. 128K is still not measured (needs YaRN).
+
+### Attention tile sweep (H100, Hq 32 / Hkv 8, 3072 keys, 2026-11-16; `attn_sweep_modal.py`)
+
+All 13 configurations launch on the H100. What matters is the precision of P in the second matmul: with P kept in fp32 every configuration is slow (2.4-11 TFLOP/s) because the fp32 mma has no tensor-core fast path; with P cast to bf16 (what FlashAttention-2 does) the same kernel runs at up to 260 TFLOP/s.
+
+| Config (BR x BC, P) | prefill 3072 | decode (1 query x 3072 keys), per layer |
+|---|---|---|
+| 16x16, fp32 (what the engine used so far) | 6.87 ms, 11 TFLOP/s | 283 us (x 36 layers ~ 10.2 ms) |
+| 16x64, bf16 | 1.38 ms | 58 us |
+| 64x64, bf16 | 0.322 ms | 46 us |
+| **64x128, bf16** | **0.297 ms, 260 TFLOP/s** | **44.9 us (x 36 ~ 1.6 ms)** |
+
+Accuracy cost of bf16 P: max difference to the fp32-P kernel ~4.6e-3 of the largest output value (about one bf16 step). `launch_flash_attention` now uses 64x128 / bf16 P on devices with >= 200 KB shared memory (Hopper) and keeps the verified 16x16 / fp32 P elsewhere. Verification after this change (all on the H100):
+- Unit tests: every module passes; the attention bf16 cases pass 36/36 against a bound derived from the arithmetic, |d| <= 2^-8 (max|V| + 2|e|) (bf16 unit roundoff is 2^-8; a first version of the bound used 2^-9 by mistake, two cases failed by exactly one bf16 step, the derivation was corrected, not tuned).
+- End-to-end vs HF (Qwen3-4B, 43 teacher-forced positions, same HF reference for all rows, `e2e_test.py --gpu h100 --ab`):
+
+| Engine configuration | top-1 | min cosine, prefill | min cosine, decode | max abs logit error |
+|---|---|---|---|---|
+| default: big GEMM tiles + bf16 P (64x128) | 41/43 | 0.999606 | **0.998993** | 0.781 |
+| big GEMM tiles + small attention (fp32 P) | 41/43 | 0.999592 | 0.999399 | 0.531 |
+| all small tiles (verified on the L4) | 41/43 | 0.999592 | 0.999399 | 0.531 |
+
+  The pre-set criterion (min cosine > 0.999) is missed by the default configuration by ~7e-6. Rows 2 and 3 are identical, so the big GEMM tiles change nothing numerically; the drop comes from rounding P to bf16 (the worst position has an HF top1-top2 margin of 2.6, so it is not an HF near-tie). Top-1 and the greedy tokens are the same in all three rows. The HF reference itself is noisy across containers (its own greedy text differed between the L4 and H100 runs).
+- NOT yet measured with the new attention: the real TTFT/ITL (the ITL of roughly 9 ms is only an estimate from the per-layer numbers).
+- Split-P mode (P = P_hi + P_lo, two bf16 mmas, same fp32 accumulator), swept on the H100 (`attn_sweep_modal.py`):
+
+| 64x128 | prefill 3072 | decode per layer | max diff to fp32-P (prefill / decode) |
+|---|---|---|---|
+| fp32 P (old default 16x16) | 6.92 ms | 285 us | reference |
+| bf16 P | 0.299 ms | 44.6 us | 4.59e-3 / 4.39e-3 |
+| **split P** | **0.354 ms** | **54.2 us** | **2.29e-3 / 1.10e-3** |
+
+  The split costs ~18-21% over bf16 P and is still ~19x (prefill) / ~5x (decode) faster than fp32 P. It is now the default on Hopper (64x128, mode 2). NOT yet verified: unit tests, the end-to-end A/B with this default (the criterion min cosine > 0.999 must be met, not re-defined), and the real TTFT/ITL.
+
+### After the attention change (2026-11-16): split-P, 64x128 tiles on Hopper
+
+Verification of this default on the H100: attention unit tests 36/36 (worst error back to ~2.5e-3, as with the original fp32-P kernel); 4B end-to-end vs HF (`e2e_test.py --gpu h100 --ab`): top-1 41/43 (both mismatches are exact HF ties, margin 0.000), min cosine prefill 0.999623 / decode 0.999130 (criterion > 0.999 met, not changed), greedy 16/16 identical to HF, RoPE tables bit-identical. Caveat: HF's own CPU bf16 reference moves by ~5e-4 in this metric between containers (the identical all-small-tile engine configuration scored 0.999399 against one HF run and 0.999766 against another), which is as large as the differences between our attention variants, so 0.999 cannot separate bf16-P, split-P and fp32-P; a cleaner reference (HF in fp32) would be needed for that.
+
+| Metric (1 sequence, 3072 in / 1024 out, 3 requests) | vLLM | ours | ratio | Part 0 (10x) | Part 4 (3x) |
+|---|---|---|---|---|---|
+| TTFT avg (ms) | 59.09 | **64.10** | 1.08x | met | met (<= ~177) |
+| ITL avg (ms) | 4.46 | **9.07** | 2.03x | met | met (<= ~13.4) |
+
+History of our TTFT / ITL: 1042.6 / 21.12 ms (16x32x32 GEMM tiles, 16x16 fp32-P attention) -> 297.3 / 17.83 ms (big GEMM tiles) -> **64.1 / 9.07 ms** (+ 64x128 split-P attention). Engine only (no HTTP server / tokenizer, host sync every decode step); vLLM numbers come from AIPerf through its server, so ours is somewhat optimistic. Stable to +-0.6 ms (TTFT) and +-0.01 ms (ITL) over the 3 requests.
+
+Profile now (H100, context ~3072):
+- prefill 64.3 ms: MLP gate/up 18.4 (29%) + down 8.8 (14%) at ~600 TFLOP/s; attention 12.4 (19%, 224 TFLOP/s); **per-head q/k RMSNorm 9.0 ms (14%) at only 252 GB/s** (30k tiny blocks, a clear target); q/o/k/v projections ~10.3 ms; rest ~5 ms.
+- decode step 10.1 ms (stage sum): MLP 3.2, attention 2.2 (208 GB/s of the cache), projections 2.3 (k/v only 0.39 TB/s), small kernels (RMSNorm, add, q/k norm, RoPE, KV write) ~2.1 ms in ~15 launches per layer, lm_head 0.27 ms. The HBM floor for reading the 8 GB of weights is ~2.4 ms, so decode is ~3.8x above it.
+
+Last-position logits of the 3072-token prompt, default vs all-small tiles: cosine 0.999960, max |logit diff| 0.113 (max |logit| 11.1). The reported "top-1 differs" (55 vs 11) is a tie artefact: the small-tile run itself has a first-place margin of 0.000 on this random-token prompt, so the argmax is arbitrary.
+
+Not covered by these numbers: 128K input (needs YaRN, the weekly report asks for it), concurrency / batching, "any workload".
+
+### 128K input (2026-11-16): YaRN + first measurement
+
+YaRN is implemented following HF `_compute_yarn_parameters` (`engine/qwen3_rope_table.h`; enabled by `rope_scaling` in the config or `QWEN3_YARN=<factor>`, original context 32768, like vLLM's `--rope-scaling` for Qwen3). The tables were compared with HF's `Qwen3RotaryEmbedding` on a CPU container (`rope_table_check.py`, positions 0..131079): HF's attention_scaling 1.138629 matches 0.1 ln 4 + 1; 125 of 8.39M cos entries and 136 of 8.39M sin entries differ, each by exactly one bf16 step (likely fp32 cos/sin implementation differences on values next to a bf16 rounding boundary; that explanation is not separately verified). Default RoPE: 1 of 262,656 entries differs by one bf16 step.
+
+**The 128K workload is 130816 input + 128 output tokens.** With YaRN factor 4 the context is 32768 x 4 = 131072 tokens for input and output together, and the chat endpoint adds role tokens, so 128 tokens are kept free. (A first run used 131072 + 128, which exceeds the context; corrected.)
+
+| Metric (1 sequence, 130816 in / 128 out, YaRN factor 4, 1x H100, 2 requests) | vLLM | ours | ratio | Part 0 (10x) | Part 4 (3x) |
+|---|---|---|---|---|---|
+| TTFT avg | 10,446.8 ms | **23,338.7 ms** | **2.23x** | met | met |
+| ITL avg | 10.43 ms | **28.80 ms** | **2.76x** | met | met (small margin) |
+
+vLLM: `modal_vllm_aipref.py --isl 130816 --osl 128 --yarn`, AIPerf through its server (input length 130,816 for both requests, error rate 0%, output length 127.5 on average). Ours: `bench_modal.py --prompt-len 130816 --gen-len 128 --yarn 4`, engine only. Our earlier ITL at 128K was 79.3 ms with the old decode path; the split-KV decode brought it to 28.8 ms.
+
+How YaRN was enabled in vLLM (this took five attempts; recorded so nobody repeats them): `--rope-scaling` is not a valid flag in the current vLLM; `--hf-overrides` with `rope_scaling` or with `rope_parameters` was accepted but the max length stayed at 40960; a config.json with only `rope_scaling` made transformers apply YaRN but warn that 40960/32768 implies factor 1.25, and vLLM still derived 40960. What works: a model directory (weights symlinked) whose config.json has `rope_scaling` = {yarn, factor 4, original 32768} AND `max_position_embeddings` = 131072. Evidence: inside the container, transformers parses the config as {rope_type: yarn, factor 4.0, original_max_position_embeddings 32768, rope_theta 1e6} with no factor-mismatch warning, and the script refuses to start vLLM otherwise. This vLLM derives its max length from `max_position_embeddings` only, so "vLLM accepted 131072" alone does not prove YaRN; we did not verify which rotary class vLLM instantiated. For timing this barely matters (RoPE is a lookup in a precomputed cos/sin table either way). `VLLM_ALLOW_LONG_MAX_MODEL_LEN` was never set.
+
+Earlier measurement with the old decode path and the over-long workload (131072 in / 128 out), kept for the record:
+
+| Metric | ours (old decode) |
+|---|---|
+| TTFT avg | 22.99 s |
+| ITL avg | 79.3 ms |
+
+Profile at 128K: prefill 23.0 s = **attention 19.8 s (86%) at 256 TFLOP/s** (quadratic in the length), MLP 1.9 s, projections ~0.7 s, q/k norm 0.44 s. Decode step 81.6 ms = **attention 74.0 ms (91%) at 261 GB/s**: the step reads ~19.3 GB of KV cache, which takes ~5.8 ms at HBM speed, so decode attention is ~13x above its floor. Cause: one block per query head (32 blocks on a 132-SM GPU), each walking ~1024 key tiles one after another. Next: split the KV length across blocks (flash-decoding) and combine.
+
+Correctness at long context (128K itself cannot be compared with HF on a CPU): Qwen3-0.6B, 8192-token prompt, YaRN factor 4 on both sides, 16 HF greedy tokens, last 64 positions compared, same HF reference for all rows (`e2e_test.py --gpu h100 --long 8192 --yarn 4 --ab`):
+
+| Engine configuration | top-1 | min cosine, prefill | min cosine, decode | max abs logit error |
+|---|---|---|---|---|
+| default: big GEMM tiles + 64x128 split-P attention | 60/64 | 0.999789 | **0.998630** | 0.562 |
+| big GEMM tiles + small attention (fp32 P) | 60/64 | 0.999559 | 0.999810 | 0.319 |
+| all small tiles | 60/64 | 0.999559 | 0.999810 | 0.319 |
+
+- YaRN end to end is correct: RoPE tables identical to HF on all 8232 positions; every top-1 mismatch is an HF near-tie (margin 0.000 or 0.062); greedy tokens 16/16 identical.
+- The default configuration FAILS the pre-set criterion on the decode path (0.998630 < 0.999; worst position has an HF margin of 2.6). The same direction showed up in all three A/B runs (decode, default vs small attention in the same run: 0.998993 vs 0.999399, 0.999130 vs 0.999766, 0.998630 vs 0.999810), while the prefill path of the big attention is as good or better. The within-run gaps (6e-4 to 1.2e-3) are larger than the HF noise seen so far (~5e-4), so this is a real accuracy deficit of the 64x128 attention kernel when n_q = 1, and calling these differences "HF noise" earlier was not accurate. Split P did not fix it, so it is not the rounding of P. Cause: unknown so far.
+- Split-KV decode (new default decode path on Hopper; `QWEN3_DECODE_SPLIT=0` switches it off): before running it on a GPU, its split rule, index math and combine were simulated in numpy (`tools/split_kv_sim.py`, runs locally: 13 lengths incl. tile boundaries and 131072, exact in float64, worst float32 error 1.3e-6). On the H100: attention unit tests 36/36; the same 8K A/B with four configurations:
+
+| Engine configuration (same HF reference) | top-1 | min cosine, prefill | min cosine, decode | max abs logit error |
+|---|---|---|---|---|
+| **default: decode = split-KV kernel** | 60/64 | 0.999789 | **0.999687** | **0.312** |
+| default but decode with the 64x128 kernel | 60/64 | 0.999789 | 0.998630 | 0.562 |
+| big GEMM tiles + small attention | 60/64 | 0.999559 | 0.999810 | 0.319 |
+| all small tiles | 60/64 | 0.999559 | 0.999810 | 0.319 |
+
+  The default now passes (criterion unchanged) and its decode accuracy matches the small fp32-P attention (max error 0.312 vs 0.319). The old 64x128 decode reproduced its deficit to the digit (0.998630, 0.562, same as the previous run), confirming it is a property of that kernel with a single query. Root cause still not identified; a hypothesis consistent with the data is the long serial accumulation (64 key tiles into one accumulator inside the mma) that the split kernel avoids (4 tiles per block, fp32 combine). Not verified.
+- Decode at 128K with the split-KV kernel: attention 23.8 ms of a 31.5 ms step (810 GB/s of cache; floor ~5.8 ms). Each query head reads its KV head separately (4 query heads per KV head), relying on L2; packing the 4 heads into one block is the next lever (hypothesis).
+
+### HTTP server (OpenAI-compatible, no PyTorch), 2026-11-16
+
+- `engine/qwen3_capi.cu` -> `libqwen3engine.so`: C interface (`qe_create` with a number of KV-cache slots, `qe_prefill`
+  of one slot with chunked prefill for long prompts, `qe_decode_batch` of several slots in one step, `qe_vocab`,
+  `qe_max_len`, `qe_max_chunk`, `qe_max_seqs`).
+- `server/server.py`: FastAPI; `/v1/chat/completions` and `/v1/completions` (both with SSE streaming), `/v1/models`,
+  `/health`; `max_tokens` / `max_completion_tokens`, `min_tokens`, `ignore_eos`, `stream_options.include_usage`,
+  `chat_template_kwargs`. Greedy only: `temperature` > 0 is rejected with 400 instead of being silently ignored.
+  Lengths are checked before the engine is called (the engine exits on invalid arguments). Incremental detokenisation
+  with a sliding window, so the per-token cost does not grow with the output length. Tokenizer and chat template from
+  HF `tokenizers` / `transformers` (no PyTorch needed for them).
+- Continuous batching: a scheduler thread admits waiting requests into free KV-cache slots (prefill one request at a
+  time), then decodes every running sequence in one batched step; finished or disconnected requests free their slot at
+  once; an engine error fails only the requests involved. Limitation: a prefill stalls the decode of the others (no
+  chunked prefill interleaving). `min_tokens` does not mask
+  EOS like vLLM does: an early EOS is kept as a (silent) token and generation continues.
+- `server/test_server.py`: 11 tests with a fake engine and fake tokenizers, run locally and again inside the Modal image
+  at build time (stream format and [DONE], exact lengths and usage, EOS stop vs ignore_eos, max_completion_tokens
+  precedence, non-stream responses, completions with text and token ids, four 400 cases, three concurrent requests decoded in one
+  batch with output equal to running alone, more requests than slots, a client disconnect frees its slot, an engine
+  error fails only its request, a 3-byte UTF-8 character split over tokens). They found real bugs that are fixed: an
+  explicit `max_tokens: 0` was replaced by the default; a failing prefill could leak its slot; an exception could stop
+  the engine thread silently.
+- `modal_aipref.py`: the library is compiled for sm_90 and its exported symbols checked while the image is built on a
+  CPU; the GPU runs the server plus AIPerf with the same settings as `modal_vllm_aipref.py` (tokenizer given as the local
+  snapshot directory, offline). `--compat` runs AIPerf against the fake-engine server on a CPU first (0 errors at
+  concurrency 1 and 8).
+
+### Batched decode correctness (2026-11-17)
+
+`tests/batch_test.cu` (`batch_check.py`, Qwen3-4B, H100): 4 sequences of 27 / 300 / 1000 / 3000 tokens, each decoded
+16 steps alone in slot 0, then all four together in slots 0-3 with the same tokens (teacher forcing).
+
+- First run: min cosine 0.99926 against my pre-set 0.9999 -> FAIL (top-1 identical everywhere). Diagnosis with a fixed
+  split count (`QWEN3_DECODE_SPLITS=4`): every sequence whose key tiles were grouped the same way in both runs was
+  bit-identical; the rest differed only because the tiles-per-split was computed from the longest sequence of the batch,
+  i.e. a different fp32 summation order, not wrong data.
+- Fix: each sequence now splits its own key tiles (`s_b = min(target, n_tiles_b)`), so its result does not depend on
+  the other sequences in the batch. Rerun: with a fixed split count **64/64 rows bit-identical** (new criterion for this
+  test, stricter than a cosine bound); with the default rule (split count depends on the batch size) min cosine 0.99926,
+  top-1 0 mismatches, reported as informational. Attention unit tests 36/36 and the 8K YaRN A/B against HF (decode min
+  cosine 0.999687, unchanged) rerun after the change.
+
+### Workload suite (2026-11-17)
+
+Moved to "Results: our server vs vLLM (Part 0)" at the top; run directories are listed in `results/comparison.csv`.
+
+## Tile toolchain notes
+- Compile: `nvcc --enable-tile -std=c++20 -arch=sm_80 file.cu`; include `cuda_tile.h`; kernels use `__tile_global__`; block dim must be 1.
+- Image `nvidia/cuda:13.5.0-devel-ubuntu24.04` has `cuda_tile.h`; every kernel here is compiled for sm_90 (H100) at image build time on a CPU (`tile_check.py` was the first check) and runs on the L4 (sm_89, small tiles) and the H100.
+- Big tiles need the >= 200 KB opt-in shared memory of Hopper; on the L4 (99 KB) 64x64 and larger bf16 tiles fail to launch with "invalid argument", so tiles are chosen by device.
+- Reference samples: NVIDIA/cuda-samples `cpp/9_CUDA_Tile` (tileLayerNorm, tileRope, tileMatmul, tileBmm).

@@ -1,0 +1,50 @@
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+NVIDIA H100 80GB HBM3
+moe_block_designed two_tokens_overlap: T=2 E=16 K=8 H=2048 I=128
+  ok   count got [1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0] want [1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0]
+  ok   off got [0, 1, 2, 3, 4, 6, 8, 10, 12, 13, 14, 15, 16, 16, 16, 16] want [0, 1, 2, 3, 4, 6, 8, 10, 12, 13, 14, 15, 16, 16, 16, 16]
+  ok   sorted got [0, 1, 2, 3, 4, 8, 5, 9, 6, 10, 7, 11, 12, 13, 14, 15] want [0, 1, 2, 3, 4, 8, 5, 9, 6, 10, 7, 11, 12, 13, 14, 15]
+  ok   inv got [0, 1, 2, 3, 4, 6, 8, 10, 5, 7, 9, 11, 12, 13, 14, 15] want [0, 1, 2, 3, 4, 6, 8, 10, 5, 7, 9, 11, 12, 13, 14, 15]
+  ok   gate_up (hbuf) max err 2.16e-03 of max|h|; row0 got [-0.00793457 -0.0020752  -0.01116943  0.01391602] want [-0.00793457 -0.0020752  -0.01116943  0.01391602]
+  ok   down (ysorted) max err 1.27e-04 of max|y|; row0 got [-0.01043701  0.00332642  0.00775146 -0.00759888] want [-0.01043701  0.00332642  0.00775146 -0.00759888]
+  ok   combine (y) max err 3.21e-03 of max|y|; row0 got [ 0.00180817 -0.00190735  0.00375366  0.00463867] want [ 0.00180558 -0.00190984  0.00376094  0.00464821]
+moe_block t5: T=5 E=16 K=8 H=2048 I=128
+  ok   count got [1, 1, 5, 1, 4, 3, 3, 3, 1, 4, 1, 2, 4, 2, 5, 0] want [1, 1, 5, 1, 4, 3, 3, 3, 1, 4, 1, 2, 4, 2, 5, 0]
+  ok   off got [0, 1, 2, 7, 8, 12, 15, 18, 21, 22, 26, 27, 29, 33, 35, 40] want [0, 1, 2, 7, 8, 12, 15, 18, 21, 22, 26, 27, 29, 33, 35, 40]
+  ok   sorted got [15, 24, 1, 13, 20, 26, 37, 35, 5, 21, 30, 38, 7, 16, 36, 10, 17, 27, 0, 11, 39, 4, 2, 8] want [15, 24, 1, 13, 20, 26, 37, 35, 5, 21, 30, 38, 7, 16, 36, 10, 17, 27, 0, 11, 39, 4, 2, 8]
+  ok   inv got [18, 2, 22, 35, 21, 8, 33, 12, 23, 36, 15, 19, 29, 3, 27, 0, 13, 16, 28, 24, 4, 9, 37, 30] want [18, 2, 22, 35, 21, 8, 33, 12, 23, 36, 15, 19, 29, 3, 27, 0, 13, 16, 28, 24, 4, 9, 37, 30]
+  ok   gate_up (hbuf) max err 2.70e-03 of max|h|; row0 got [-0.05664062  0.02893066  1.109375    0.07519531] want [-0.05664062  0.02893066  1.109375    0.07519531]
+  ok   down (ysorted) max err 1.17e-03 of max|y|; row0 got [ 0.68359375  0.43164062 -0.6328125   0.125     ] want [ 0.68359375  0.43164062 -0.6328125   0.125     ]
+  ok   combine (y) max err 2.76e-03 of max|y|; row0 got [-0.24511719 -0.17675781  0.06079102  0.31640625] want [-0.24498844 -0.17659092  0.06074691  0.31629598]
+moe_block t33: T=33 E=16 K=8 H=2048 I=128
+  ok   count got [14, 16, 17, 19, 14, 19, 15, 18, 15, 15, 24, 16, 16, 15, 16, 15] want [14, 16, 17, 19, 14, 19, 15, 18, 15, 15, 24, 16, 16, 15, 16, 15]
+  ok   off got [0, 14, 30, 47, 66, 80, 99, 114, 132, 147, 162, 186, 202, 218, 233, 249] want [0, 14, 30, 47, 66, 80, 99, 114, 132, 147, 162, 186, 202, 218, 233, 249]
+  ok   sorted got [0, 10, 19, 27, 109, 132, 156, 188, 197, 202, 215, 228, 236, 259, 2, 13, 50, 63, 76, 80, 115, 134, 138, 164] want [0, 10, 19, 27, 109, 132, 156, 188, 197, 202, 215, 228, 236, 259, 2, 13, 50, 63, 76, 80, 115, 134, 138, 164]
+  ok   inv got [0, 99, 14, 186, 114, 233, 47, 162, 80, 249, 1, 218, 234, 15, 147, 132, 250, 163, 48, 2, 202, 66, 115, 81] want [0, 99, 14, 186, 114, 233, 47, 162, 80, 249, 1, 218, 234, 15, 147, 132, 250, 163, 48, 2, 202, 66, 115, 81]
+  ok   gate_up (hbuf) max err 2.22e-03 of max|h|; row0 got [-0.00909424 -0.01806641 -0.07080078  0.00500488] want [-0.00909424 -0.01806641 -0.07080078  0.00500488]
+  ok   down (ysorted) max err 1.05e-03 of max|y|; row0 got [ 0.09033203 -0.23242188 -0.33984375  0.578125  ] want [ 0.09033203 -0.23242188 -0.33984375  0.578125  ]
+  ok   combine (y) max err 2.69e-03 of max|y|; row0 got [-0.06103516 -0.07177734 -0.20605469  0.13574219] want [-0.06105661 -0.07161999 -0.20628679  0.13547993]
+moe_block t128: T=128 E=16 K=8 H=2048 I=128
+  ok   count got [57, 68, 54, 62, 69, 55, 73, 50, 64, 72, 74, 61, 61, 66, 77, 61] want [57, 68, 54, 62, 69, 55, 73, 50, 64, 72, 74, 61, 61, 66, 77, 61]
+  ok   off got [0, 57, 125, 179, 241, 310, 365, 438, 488, 552, 624, 698, 759, 820, 886, 963] want [0, 57, 125, 179, 241, 310, 365, 438, 488, 552, 624, 698, 759, 820, 886, 963]
+  ok   sorted got [24, 48, 63, 73, 81, 94, 128, 171, 206, 231, 233, 269, 278, 282, 292, 301, 309, 313, 326, 365, 368, 414, 442, 470] want [24, 48, 63, 73, 81, 94, 128, 171, 206, 231, 233, 269, 278, 282, 292, 301, 309, 313, 326, 365, 368, 414, 442, 470]
+  ok   inv got [698, 365, 57, 963, 552, 759, 179, 820, 624, 886, 553, 760, 366, 180, 310, 241, 625, 311, 58, 367, 438, 242, 887, 821] want [698, 365, 57, 963, 552, 759, 179, 820, 624, 886, 553, 760, 366, 180, 310, 241, 625, 311, 58, 367, 438, 242, 887, 821]
+  ok   gate_up (hbuf) max err 1.92e-03 of max|h|; row0 got [ 0.06054688 -0.01477051  0.20605469  0.0534668 ] want [ 0.06054688 -0.01477051  0.20605469  0.0534668 ]
+  ok   down (ysorted) max err 1.94e-03 of max|y|; row0 got [ 0.671875   -0.00090408 -0.5546875   0.73046875] want [ 0.671875   -0.00090408 -0.5546875   0.73046875]
+  ok   combine (y) max err 2.56e-03 of max|y|; row0 got [-0.31640625 -0.12304688  0.02624512  0.31835938] want [-0.31578588 -0.12281704  0.02630484  0.31846344]
+MOE DEBUG: all stages ok
+  ok   moe_router E=128 t1: experts: 1/1 tokens same set
+  ok   moe_router E=128 t2: experts: 2/2 tokens same set
+  ok   moe_router E=128 t7: experts: 6/7 tokens same set, 1 near-tie
+  ok   moe_router E=128 t64: experts: 61/64 tokens same set, 3 near-tie
+  ok   moe_block E=16 t1: experts: 1/1 tokens same set; y: max err 2.24e-03 of max|e| = 0.15 of the bound (ok); for information: vs fp32 path 5.26e-03, vs HF's bf16 sum 4.53e-03
+  ok   moe_block E=16 t2: experts: 2/2 tokens same set; y: max err 2.94e-03 of max|e| = 0.18 of the bound (ok); for information: vs fp32 path 6.71e-03, vs HF's bf16 sum 1.29e-02
+  ok   moe_block E=16 t5: experts: 5/5 tokens same set; y: max err 4.22e-03 of max|e| = 0.32 of the bound (ok); for information: vs fp32 path 4.30e-03, vs HF's bf16 sum 7.15e-03
+  ok   moe_block E=16 t33: experts: 33/33 tokens same set; y: max err 2.91e-03 of max|e| = 0.22 of the bound (ok); for information: vs fp32 path 4.52e-03, vs HF's bf16 sum 5.60e-03
+  ok   moe_block E=16 t128: experts: 127/128 tokens same set, 1 near-tie; y: max err 5.26e-03 of max|e| = 0.31 of the bound (ok); for information: vs fp32 path 1.12e-01, vs HF's bf16 sum 1.12e-01
+  ok   moe_block_designed E=16 two_tokens_overlap: experts: 2/2 tokens same set; y: max err 3.21e-03 of max|e| = 0.24 of the bound (ok); for information: vs fp32 path 4.81e-03, vs HF's bf16 sum 1.10e-02
+  moe_router E=128 top-8       cases=4   tol=4   strict=4   worst=0.000e+00
+  moe_block E=16 top-8         cases=5   tol=5   strict=5   worst=5.259e-03
+  moe_block_designed E=16 top-8 cases=1   tol=1   strict=1   worst=3.212e-03
+ALL PASS (tolerance)

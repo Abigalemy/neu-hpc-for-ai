@@ -1,0 +1,480 @@
+"""Part 1: whole-model check of Qwen3-30B-A3B in our engine against HF Transformers, in two steps so that the slow
+CPU reference does not keep a GPU waiting:
+
+  modal run part1/moe_e2e.py --ref --yes            # CPU only: HF bf16 reference -> volume final-results:/moe_e2e_ref
+  modal run part1/moe_e2e.py --ref --yes --model Qwen/Qwen3-0.6B   # the same on the small model (to test this script)
+  modal run part1/moe_e2e.py --yes                  # 1x H100: engine vs the stored reference (+ dense 0.6B regression)
+  modal run part1/moe_e2e.py --ref --yes --prompts heldout          # a prompt the MoE rule was NOT written from
+  modal run part1/moe_e2e.py --yes --prompts tiling,heldout
+  modal run part1/moe_e2e.py --yes --ep --prompts tiling,heldout     # Part 3: 2 GPUs, one prompt per rank
+  modal run part1/moe_e2e.py --tie-check-only                          # CPU: the tie-break patch on this image's transformers
+  modal run part1/moe_e2e.py --ref --tie low --yes --prompts tiling,heldout   # CPU: reference with the engine's tie rule
+  modal run part1/moe_e2e.py --rejudge-runs --tie low --prompts tiling,heldout     # CPU: saved engine runs vs that reference
+  modal run part1/moe_e2e.py --yes --force-routing --tie low --prompts tiling,heldout   # 1x H100: engine with HF's experts
+
+--force-routing (forced-routing A/B): the engine takes HF's recorded experts of every layer and position
+(QWEN3_MOE_FORCE, weights still from its own router), so the remaining logits difference is what does not come from
+the routing; the routing check must then find no difference at all (it sees the forced choice). The run is saved as
+<prompt>_forced<tie>_<time> and is never taken as "the latest single-GPU run".
+
+--tie low (the professor's suggestion): HF's router takes the lower expert id among equal router probabilities, as
+the engine does (part1/hf_tie_break.py); without it torch.topk's unspecified order decides. The reference goes to its
+own directory (suffix _tielow); the original references stay as they are. --rejudge-runs needs no GPU: it judges the
+latest saved single-GPU engine run of each prompt (final-results:/results/moe_e2e_runs/) against the reference.
+
+Same checks as e2e_test.py: teacher forcing (prefill the prompt in one chunk, then HF's own continuation one token at
+a time through the KV cache), logits of every position vs HF (top-1, cosine, max error), and greedy generation.
+Pass: every top-1 mismatch is a near tie in HF's logits (margin < 0.5) and the minimum cosine is > 0.999. For an MoE
+model the per-layer expert choices are also compared with HF's (router hooks / QWEN3_MOE_DUMP): if every primary
+routing difference (one that no earlier difference can explain) is a tie in HF's bf16 router logits, the minimum
+cosine is reported but not required, as long as the mean cosine is > 0.999 and the greedy tokens are identical.
+"""
+import json
+import os
+
+import modal
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # final/
+app = modal.App("final-moe-e2e")
+hf_cache = modal.Volume.from_name("qwen3-hf-cache", create_if_missing=False)
+results = modal.Volume.from_name("final-results", create_if_missing=False)   # ours
+image = (
+    modal.Image.from_registry("nvidia/cuda:13.5.0-devel-ubuntu24.04", add_python="3.12")
+    .pip_install("numpy", "transformers", "torch", extra_index_url="https://download.pytorch.org/whl/cpu")
+    .add_local_dir(HERE, "/root/final", ignore=[".venv", "__pycache__", "*.pyc", "build", "test_cases*.db", "results"], copy=True)
+    .run_commands("cd /root/final && mkdir -p build && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 tests/engine_test.cu "
+                  "-o build/engine_test -lnccl && test -x build/engine_test && nvcc --enable-tile -std=c++20 -arch=sm_90 -O2 "
+                  "tests/moe_force_test.cu -o build/moe_force_test")
+)
+PROMPTS = {   # "tiling" is the prompt the MoE rule was written from; "heldout" checks the frozen rule on new data
+    "tiling": ("Explain in two sentences why tiling a matrix multiplication in GPU shared memory makes it faster. "
+               "Then name one limit of the technique."),
+    "heldout": ("Rivers shape valleys over thousands of years. Describe in a few sentences how erosion and deposition "
+                "work together, and give one way people use rivers today."),
+}
+N_GEN = 16
+REF_DIR = "/results/moe_e2e_ref"
+RUN_DIR = "/results/moe_e2e_runs"
+PRICE_H100 = 3.95
+LEGACY_REFS = {("Qwen/Qwen3-30B-A3B", "tiling"), ("Qwen/Qwen3-0.6B", "tiling")}   # made before meta had "snapshot"
+REVISIONS = {"Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",     # README: the weights in use
+             "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca"}
+
+
+def snapshot(model):
+    """The pinned snapshot directory (README revision), not whatever happens to be first in the cache."""
+    root = f"/hf_cache/hub/models--{model.replace('/', '--')}"
+    rev = REVISIONS.get(model) or open(f"{root}/refs/main").read().strip()
+    path = f"{root}/snapshots/{rev}"
+    assert os.path.isdir(path), f"snapshot {rev} of {model} is not in the cache"
+    return path
+
+
+def ref_dir(model, prompt_id, tie="topk"):
+    return (f"{REF_DIR}/{model.split('/')[-1]}" + ("" if prompt_id == "tiling" else f"_{prompt_id}")
+            + ("" if tie == "topk" else f"_tie{tie}"))
+
+
+def run_base(model, prompt_id):
+    """Directory-name prefix of the saved engine runs of this prompt (the engine side does not depend on --tie)."""
+    return os.path.basename(ref_dir(model, prompt_id))
+
+
+@app.function(image=image, cpu=16, memory=128 * 1024, volumes={"/hf_cache": hf_cache.read_only(), "/results": results},
+              timeout=60 * 60)   # CPU only; hard cap 60 min
+def reference(model: str, prompt_id: str = "tiling", tie: str = "topk"):
+    import sys
+    import time
+    import torch
+    import transformers
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    torch.set_num_threads(16)
+    t0 = time.time()
+    if tie == "low":
+        sys.path.insert(0, "/root/final/part1")
+        import hf_tie_break
+        for line in hf_tie_break.self_check():             # the patch on this transformers, before it is used
+            print("tie check: " + line, flush=True)
+        hf_tie_break.patch()
+    else:
+        assert tie == "topk", tie
+    snap = snapshot(model)
+    tok = AutoTokenizer.from_pretrained(snap)
+    m = AutoModelForCausalLM.from_pretrained(snap, dtype=torch.bfloat16).eval()
+    print(f"loaded {model} in {time.time() - t0:.0f} s (torch {torch.__version__}, transformers {transformers.__version__})", flush=True)
+    ids = tok(PROMPTS[prompt_id], return_tensors="pt")["input_ids"]
+    with torch.no_grad():
+        full = m.generate(ids, max_new_tokens=N_GEN, do_sample=False)[0]
+        print(f"generated in {time.time() - t0:.0f} s: {tok.decode(full[ids.shape[1]:])!r}", flush=True)
+        keep = min(full.shape[0], 64)
+        # MoE: record every layer's router logits and chosen experts during this teacher-forced pass (hooks on the
+        # Qwen3MoeTopKRouter modules, whose output is (router_logits, router_scores, router_indices))
+        route_logits, route_idx, hooks = {}, {}, []
+        for li, layer in enumerate(m.model.layers):
+            gate = getattr(layer.mlp, "gate", None)
+            if gate is None or not hasattr(gate, "top_k"):
+                continue
+            def hook(mod, inp, out, li=li):
+                route_logits[li] = out[0].float().reshape(-1, out[0].shape[-1]).clone()
+                route_idx[li] = out[2].reshape(-1, out[2].shape[-1]).to(torch.int32).clone()
+            hooks.append(gate.register_forward_hook(hook))
+        logits = m(full[None], logits_to_keep=keep).logits[0].float()
+        for h in hooks:
+            h.remove()
+    d = ref_dir(model, prompt_id, tie)
+    os.makedirs(d, exist_ok=True)
+    open(f"{d}/tokens.bin", "wb").write(full.to(torch.int32).numpy().tobytes())
+    open(f"{d}/logits.f32", "wb").write(logits.numpy().tobytes())
+    if route_idx:   # [layers, tokens, K] int32 and [layers, tokens, E] fp32 (HF's bf16 logits, widened)
+        L = sorted(route_idx)
+        open(f"{d}/route_idx.i32", "wb").write(torch.stack([route_idx[l] for l in L]).numpy().tobytes())
+        open(f"{d}/route_logits.f32", "wb").write(torch.stack([route_logits[l] for l in L]).numpy().tobytes())
+        print(f"router choices of {len(L)} layers recorded", flush=True)
+    json.dump({"model": model, "prompt_id": prompt_id, "snapshot": os.path.basename(snap), "tie": tie, "n_prompt": int(ids.shape[1]), "n_total": int(full.shape[0]), "keep": keep,
+               "vocab": int(logits.shape[1]), "transformers": transformers.__version__, "torch": torch.__version__,
+               "text": tok.decode(full[ids.shape[1]:])}, open(f"{d}/meta.json", "w"))
+    results.commit()
+    print(f"reference saved to final-results:{d} ({time.time() - t0:.0f} s in all)")
+
+
+def read_dump(path, K):
+    """Engine routing dump (QWEN3_MOE_DUMP): {(layer, position): list of K experts}, first occurrence only (the
+    teacher-forced pass of engine_test, a single sequence; its later generating pass is ignored). Single-sequence use
+    only: the key has no sequence id."""
+    import numpy as np
+    raw = np.fromfile(path, np.int32)
+    out, i = {}, 0
+    while i < raw.size:
+        layer, n = int(raw[i]), int(raw[i + 1]); i += 2
+        pos = raw[i:i + n]; i += n
+        idx = raw[i:i + n * K].reshape(n, K); i += n * K
+        for p_, row in zip(pos, idx):
+            out.setdefault((layer, int(p_)), row.tolist())
+    return out
+
+
+def bf16_steps(a, b):
+    """Number of representable bf16 values between a and b (both bf16 numbers), via their ordered bit patterns."""
+    import numpy as np
+    def key(v):
+        u = int(np.float32(v).view(np.uint32)) >> 16
+        return -(u & 0x7FFF) if u & 0x8000 else u
+    return abs(key(a) - key(b))
+
+
+def routing_analysis(hidx, hlog, dump, E):
+    """Compare the engine's expert choices with HF's. hidx [L, T, K], hlog [L, T, E] (HF's bf16 router logits).
+    Returns a dict: coverage problems, every difference with its bf16 step distance (max over the swapped experts'
+    HF logits), the primary differences (no difference at a lower layer at the same or an earlier position, i.e. not
+    within reach of an earlier one through causal attention), and the primary ones that are not within 2 steps."""
+    L, T, K = hidx.shape
+    missing = [(l, t) for l in range(L) for t in range(T) if (l, t) not in dump]
+    invalid = [(l, t) for (l, t), row in dump.items()
+               if l < L and t < T and (len(set(row)) != K or not all(0 <= e < E for e in row))]
+    flips = []
+    for l in range(L):
+        for t in range(T):
+            row = dump.get((l, t))
+            if row is None or (l, t) in invalid:
+                continue
+            g, h = set(row), set(hidx[l, t].tolist())
+            if g != h:
+                sw = sorted(g ^ h)
+                v = [float(hlog[l, t, e]) for e in sw]
+                steps = max(bf16_steps(a, b) for a in v for b in v)
+                flips.append({"layer": l, "pos": t, "engine": sorted(g - h), "hf": sorted(h - g), "steps": steps})
+    primary = [f for f in flips if not any(g["layer"] < f["layer"] and g["pos"] <= f["pos"] for g in flips)]
+    return {"pairs": L * T, "missing": missing, "invalid": invalid, "flips": flips, "primary": primary,
+            "primary_far": [f for f in primary if f["steps"] > 2]}
+
+
+def verdict(ref, mine, n_prompt, first_keep, gen, exp, routing=None):
+    """The pass decision, as a pure function of the data (tested locally with synthetic cases).
+    Always: every top-1 mismatch must be a near tie FOR THE TOKEN THE ENGINE CHOSE (HF's best score minus HF's score
+    of the engine's token < 0.5, not HF's own top-2 gap).
+    Dense (routing None): additionally min cosine > 0.999 (as e2e_test.py).
+    MoE (routing given): additionally greedy identical, mean cosine > 0.999, full routing coverage (every (layer,
+    position) dumped, K distinct in-range experts), every primary routing difference within 2 bf16 steps of HF's
+    logits, and every position with cosine <= 0.999 within reach of a routing difference (one at that position or
+    an earlier one). The minimum cosine is reported, not required. Returns (ok, lines)."""
+    import numpy as np
+    cos = (ref * mine).sum(1) / (np.linalg.norm(ref, axis=1) * np.linalg.norm(mine, axis=1))
+    choice = mine.argmax(1)
+    mism = np.nonzero(ref.argmax(1) != choice)[0]
+    gaps = {int(i): float(ref[i].max() - ref[i, choice[i]]) for i in mism}
+    ranks = {int(i): int((ref[i] > ref[i, choice[i]]).sum()) + 1 for i in mism}
+    top1_ok = all(g < 0.5 for g in gaps.values())
+    same = next((i for i in range(len(exp)) if gen[i] != exp[i]), len(exp))
+    b = n_prompt - first_keep
+    lines = [f"{len(cos)} positions ({b} prefill, {len(cos) - b} KV-cache decode); top-1 {len(cos) - len(mism)}/{len(cos)}"
+             + "".join(f"; mismatch at {first_keep + i}: engine's token is HF's #{ranks[i]}, {gaps[i]:.3f} below HF's best"
+                       for i in gaps),
+             f"min cosine prefill {cos[:b].min():.6f}, decode {cos[b:].min() if len(cos) > b else 1:.6f}, mean {cos.mean():.6f}",
+             f"greedy: engine matches HF for {same}/{len(exp)} tokens"]
+    if routing is None:
+        ok = top1_ok and cos.min() > 0.999
+        return ok, lines + ["PASS (dense rule)" if ok else "FAIL (dense rule: top-1 / min cosine)"]
+    r = routing
+    cover_ok = not r["missing"] and not r["invalid"]
+    lines.append(f"routing: {r['pairs']} (layer, position) pairs, {len(r['missing'])} missing, {len(r['invalid'])} invalid; "
+                 f"{len(r['flips'])} with a different expert set")
+    exact = sum(1 for f in r["primary"] if f["steps"] == 0)
+    lines.append(f"primary differences: {len(r['primary'])}: {exact} exact ties (0 steps), "
+                 f"{len(r['primary']) - exact - len(r['primary_far'])} near the top-8 boundary (1-2 steps), "
+                 f"{len(r['primary_far'])} further apart")
+    for f in r["primary"]:
+        lines.append(f"  primary: layer {f['layer']} position {f['pos']}: engine {f['engine']} vs HF {f['hf']}, "
+                     f"{f['steps']} bf16 steps apart in HF's logits")
+    low = [i for i in np.nonzero(cos <= 0.999)[0]]
+    unexplained = [first_keep + i for i in low if not any(f["pos"] <= first_keep + i for f in r["flips"])]
+    for i in low:
+        lines.append(f"  cosine {cos[i]:.5f} at position {first_keep + i}: "
+                     + ("NO routing difference at or before it" if first_keep + i in unexplained
+                        else "within reach of a routing difference (at or before this position)"))
+    checks = {"top-1": top1_ok, "greedy": same == len(exp), "mean cosine": cos.mean() > 0.999, "coverage": cover_ok,
+              "primary within 2 steps": not r["primary_far"], "low cosine reachable": not unexplained}
+    ok = all(checks.values())
+    lines.append(("PASS" if ok else "FAIL") + " (MoE rule: " + ", ".join(f"{k} {'ok' if v else 'NO'}" for k, v in checks.items())
+                 + f"; min cosine {cos.min():.5f} reported)")
+    return ok, lines
+
+
+def load_ref(model, prompt_id, tie, say):
+    """The stored reference and its checks; returns (d, meta, snap, cfg, moe) or None (reason said)."""
+    d = ref_dir(model, prompt_id, tie)
+    meta = json.load(open(f"{d}/meta.json"))
+    snap = snapshot(model)
+    if meta.get("tie", "topk") != tie:
+        say(f"reference {d} was made with tie rule {meta.get('tie', 'topk')}, not {tie}: stop")
+        return None
+    if meta.get("snapshot") is None:
+        # references made before the snapshot was recorded; the cache held only this one snapshot of each model then
+        if (model, prompt_id) not in LEGACY_REFS or tie != "topk":
+            say("reference has no snapshot recorded: regenerate it")
+            return None
+        say(f"legacy reference (snapshot not recorded; the cache held only {os.path.basename(snap)[:8]} then)")
+    elif meta["snapshot"] != os.path.basename(snap):
+        say(f"reference made with snapshot {meta['snapshot']}, engine would use {os.path.basename(snap)}: stop")
+        return None
+    cfg = json.load(open(f"{snap}/config.json"))
+    moe = cfg.get("num_experts", 0) > 0
+    if moe and not os.path.exists(f"{d}/route_idx.i32"):
+        say("MoE model but the reference has no routing record: regenerate it")
+        return None
+    return d, meta, snap, cfg, moe
+
+
+def judge(model, prompt_id, tie, ref_info, run, label, say):
+    """The frozen rule on one engine run (a directory with logits.bin, gen.bin and, for MoE, route.bin) against the
+    reference; returns 0 = pass."""
+    import numpy as np
+    d, meta, snap, cfg, moe = ref_info
+    n_prompt, n_total, keep, V = meta["n_prompt"], meta["n_total"], meta["keep"], meta["vocab"]
+    ref = np.fromfile(f"{d}/logits.f32", np.float32).reshape(keep, V)
+    toks = np.fromfile(f"{d}/tokens.bin", np.int32)
+    mine = (np.fromfile(f"{run}/logits.bin", np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(keep, V)
+    routing = None
+    if moe:
+        # the expected shape comes from the model's config, not from the reference file's length: a reference that
+        # lost a layer would otherwise shrink the coverage check with it
+        T, L, E, K = n_total, cfg["num_hidden_layers"], cfg["num_experts"], cfg["num_experts_per_tok"]
+        hidx = np.fromfile(f"{d}/route_idx.i32", np.int32)
+        hlog = np.fromfile(f"{d}/route_logits.f32", np.float32)
+        if hidx.size != L * T * K or hlog.size != L * T * E:
+            say(f"reference routing has {hidx.size} / {hlog.size} values, config wants [{L},{T},{K}] / [{L},{T},{E}]")
+            return 1
+        routing = routing_analysis(hidx.reshape(L, T, K), hlog.reshape(L, T, E), read_dump(f"{run}/route.bin", K), E)
+    ok, lines = verdict(ref, mine, n_prompt, n_total - keep, np.fromfile(f"{run}/gen.bin", np.int32), toks[n_prompt:], routing)
+    say(f"{model} [{prompt_id}, snapshot {os.path.basename(snap)[:8]}, HF tie rule {tie}{label}], engine side "
+        f"final-results:{run}")
+    for line in lines:
+        say("  " + line)
+    return 0 if ok else 1
+
+
+def compare(model, prompt_id="tiling", rank=0, world=1, nccl_hex="", tie="topk", force=False):
+    """Engine (tests/engine_test.cu) on the stored reference tokens; saves the engine's logits and routing.
+    Returns (0 = pass, printed lines). world > 1: this is rank `rank` of an expert-parallel group (Part 3), on GPU
+    `rank` only, running its own prompt while the other ranks run theirs (see engine())."""
+    lines_out = []
+    say = lines_out.append
+    import shutil
+    import subprocess
+    import time
+    info = load_ref(model, prompt_id, tie, say)
+    if info is None:
+        return 1, lines_out
+    d, meta, snap, cfg, moe = info
+    n_prompt, n_total = meta["n_prompt"], meta["n_total"]
+    env = dict(os.environ)
+    tmp = f"/tmp/r{rank}_"
+    if moe:
+        env["QWEN3_MOE_DUMP"] = tmp + "route.bin"
+    if force:
+        assert moe and world == 1
+        env.update(QWEN3_MOE_FORCE=f"{d}/route_idx.i32", QWEN3_MOE_FORCE_T=str(n_total))
+    if world > 1:
+        env.update(CUDA_VISIBLE_DEVICES=str(rank), QWEN3_RANK=str(rank), QWEN3_WORLD=str(world), QWEN3_NCCL_ID=nccl_hex)
+    r = subprocess.run(["/root/final/build/engine_test", snap, f"{d}/tokens.bin", str(n_total), str(n_prompt),
+                        tmp + "logits.bin", tmp + "rope.bin", tmp + "gen.bin", str(n_total - n_prompt)],
+                       capture_output=True, text=True, env=env, timeout=900)   # a rank whose peer died waits in NCCL
+    say(r.stdout.strip())
+    if r.returncode:
+        say("engine_test failed: " + r.stderr[-2000:])
+        return 1, lines_out
+    out = (f"{RUN_DIR}/{run_base(model, prompt_id)}{f'_ep{world}r{rank}' if world > 1 else ''}"
+           f"{f'_forced{tie}' if force else ''}_{int(time.time())}")
+    os.makedirs(out, exist_ok=True)                                 # keep the engine's side for later analysis
+    for f in ("logits.bin", "gen.bin") + (("route.bin",) if moe else ()):
+        shutil.copy(tmp + f, f"{out}/{f}")
+    rc = judge(model, prompt_id, tie, info, out, (f", rank {rank} of {world}" if world > 1 else "")
+               + (", FORCED to HF's experts" if force else ""), say)
+    results.commit()
+    return rc, lines_out
+
+
+def latest_single_run(model, prompt_id):
+    import glob
+    import re
+    base = run_base(model, prompt_id)
+    runs = sorted(d for d in glob.glob(f"{RUN_DIR}/{base}_*") if re.fullmatch(rf"{re.escape(base)}_\d+", os.path.basename(d)))
+    return runs[-1] if runs else None
+
+
+@app.function(image=image, cpu=2, memory=8 * 1024, volumes={"/hf_cache": hf_cache.read_only(), "/results": results},
+              timeout=10 * 60)   # CPU only; hard cap 10 min
+def rejudge(jobs: list, tie: str) -> int:
+    """No GPU: the latest saved single-GPU engine run of each (model, prompt) against the reference made with `tie`."""
+    rc = 0
+    for m, pid in jobs:
+        lines = []
+        info = load_ref(m, pid, tie, lines.append)
+        run = latest_single_run(m, pid)
+        if info is None or run is None:
+            lines.append(f"{m} [{pid}]: " + ("no saved engine run" if run is None else "no usable reference"))
+            rc |= 1
+        elif open(f"{info[0]}/tokens.bin", "rb").read() != open(f"{ref_dir(m, pid)}/tokens.bin", "rb").read():
+            # the saved runs were teacher-forced on the original reference's tokens: reusable only if they are the same
+            lines.append(f"{m} [{pid}]: the {tie} reference generated different tokens than the one the saved engine "
+                         f"run was fed; run the engine on it (GPU) instead")
+            rc |= 1
+        else:
+            rc |= judge(m, pid, tie, info, run, ", saved engine run", lines.append)
+        print("\n".join(lines), flush=True)
+    return rc
+
+
+@app.function(image=image, cpu=4, memory=16 * 1024, timeout=10 * 60)   # CPU only; hard cap 10 min
+def tie_check():
+    import sys
+    import transformers
+    sys.path.insert(0, "/root/final/part1")
+    import hf_tie_break
+    print(f"transformers {transformers.__version__}")
+    for line in hf_tie_break.self_check():
+        print(line)
+    print("TIE BREAK CHECK PASSED")
+
+
+@app.function(image=image, gpu="H100", volumes={"/hf_cache": hf_cache.read_only(), "/results": results},
+              timeout=20 * 60)   # hard cap 20 min
+def engine(jobs: list, tie: str = "topk", force: bool = False) -> int:
+    import subprocess
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
+    rc = 0
+    if force:   # the forced router itself first (seconds): forced = own choice must change nothing
+        r = subprocess.run(["/root/final/build/moe_force_test"], capture_output=True, text=True)
+        print(r.stdout + r.stderr[-2000:], flush=True)
+        if r.returncode:
+            return 1
+    for m, pid in jobs:
+        r, lines = compare(m, pid, tie=tie, force=force)
+        print("\n".join(lines), flush=True)
+        rc |= r
+    return rc
+
+
+@app.function(image=image, gpu="H100:2", volumes={"/hf_cache": hf_cache.read_only(), "/results": results},
+              timeout=20 * 60)   # hard cap 20 min
+def engine_ep(jobs: list, tie: str = "topk") -> int:
+    """Part 3: expert parallelism over 2 GPUs, one process per GPU (CUDA_VISIBLE_DEVICES), each rank with its own
+    prompt from `jobs` (data parallelism), all at the same time; every rank is judged by the same frozen rule."""
+    import ctypes
+    import subprocess
+    import threading
+    subprocess.run(["nvidia-smi", "--query-gpu=index,name,uuid", "--format=csv,noheader"])
+    nccl = ctypes.CDLL("libnccl.so.2")
+    uid = ctypes.create_string_buffer(128)                  # sizeof(ncclUniqueId) = NCCL_UNIQUE_ID_BYTES = 128
+    assert nccl.ncclGetUniqueId(uid) == 0
+    world = len(jobs)
+    res = [None] * world
+    th = [threading.Thread(target=lambda r=r: res.__setitem__(r, compare(*jobs[r], rank=r, world=world, tie=tie,
+                                                                          nccl_hex=uid.raw.hex())))
+          for r in range(world)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    rc = 0
+    for r, (code, lines) in enumerate(res):
+        print(f"===== rank {r} of {world}", flush=True)
+        print("\n".join(lines), flush=True)
+        rc |= code
+    # the EP layer is bit-exact vs one GPU (tests/ep_layer_test.cu), so the whole model on 2 GPUs must give the SAME
+    # logits and tokens as the single-GPU run of the same reference (the latest one saved on the volume)
+    import glob
+    for r, (m, pid) in enumerate(jobs):
+        base = run_base(m, pid)
+        s1 = latest_single_run(m, pid)
+        single = [s1] if s1 else []
+        ep_runs = sorted(glob.glob(f"{RUN_DIR}/{base}_ep{world}r{r}_*"))
+        if not single or not ep_runs:
+            print(f"rank {r} [{pid}]: no single-GPU run to compare with")
+            rc |= 1
+            continue
+        same = all(open(f"{single[-1]}/{f}", "rb").read() == open(f"{ep_runs[-1]}/{f}", "rb").read()
+                   for f in ("logits.bin", "gen.bin"))
+        print(f"rank {r} [{pid}]: logits and generated tokens {'IDENTICAL to' if same else 'DIFFER from'} the single-GPU "
+              f"run {os.path.basename(single[-1])}")
+        rc |= 0 if same else 1
+    return rc
+
+
+@app.local_entrypoint()
+def main(model: str = "Qwen/Qwen3-30B-A3B", ref: bool = False, prompts: str = "tiling", dense_check: bool = True,
+         ep: bool = False, yes: bool = False, tie: str = "topk", force_routing: bool = False, rejudge_runs: bool = False, tie_check_only: bool = False):
+    assert tie in ("topk", "low"), tie
+    pids = prompts.split(",")
+    if tie_check_only:
+        tie_check.remote()
+        return
+    if rejudge_runs:
+        raise SystemExit(rejudge.remote([(model, pid) for pid in pids], tie))
+    if ref:
+        print(f"PLAN: CPU only (16 cores, 128 GiB, no GPU): HF reference for {model} (tie rule {tie}), prompts {pids} "
+              f"+ {N_GEN} greedy tokens each, hard cap 60 min per prompt")
+        if yes:
+            for pid in pids:
+                reference.remote(model, pid, tie)
+        else:
+            print("Dry run only. Pass --yes to start.")
+        return
+    if ep:
+        jobs = [(model, pid) for pid in pids]
+        assert len(jobs) == 2, "--ep runs one prompt per GPU: give two prompts"
+        print(f"PLAN: 2x H100, expert parallelism, rank 0 = {jobs[0]}, rank 1 = {jobs[1]} at the same time, hard cap "
+              f"20 min -> at most ~${2 * 20 / 60 * PRICE_H100:.2f} of shared credit")
+        if not yes:
+            print("Dry run only. Pass --yes to start.")
+            return
+        raise SystemExit(engine_ep.remote(jobs, tie))
+    models = [(model, pid) for pid in pids] + ([("Qwen/Qwen3-0.6B", "tiling")] if dense_check and model != "Qwen/Qwen3-0.6B" and tie == "topk" and not force_routing else [])
+    print(f"PLAN: 1x H100, engine vs the stored references of {models}, hard cap 20 min -> at most "
+          f"~${20 / 60 * PRICE_H100:.2f} of shared credit")
+    if not yes:
+        print("Dry run only. Pass --yes to start.")
+        return
+    if force_routing:
+        assert not ep, "--force-routing is one GPU only"
+        print("forced routing: the engine takes HF's experts (QWEN3_MOE_FORCE); moe_force_test runs first")
+    raise SystemExit(engine.remote(models, tie, force_routing))
