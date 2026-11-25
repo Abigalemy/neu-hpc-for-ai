@@ -124,14 +124,17 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
     # Now: config.json with rope_scaling AND max_position_embeddings = 131072 (the consistent form transformers asks
     # for); evidence = the config as transformers parses it (printed and checked below, before vLLM starts).
     # For timing it hardly matters: RoPE is a lookup in a precomputed cos/sin table either way.
-    serve_path = model
+    from huggingface_hub import snapshot_download
+    # the pinned revision (PINNED), from the cache only: snapshot_download raises if that revision is not cached
+    serve_path = snapshot_download(model, revision=PINNED.get(model), local_files_only=True)
+    snap = serve_path
+    print(f"weights: {snap} (revision {os.path.basename(os.path.realpath(snap))})", flush=True)
     if yarn:
         if os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN"):
             raise RuntimeError("VLLM_ALLOW_LONG_MAX_MODEL_LEN must not be set: it would hide a missing YaRN")
         check_yarn_lengths(isl, osl)
-        from huggingface_hub import snapshot_download
         serve_path = "/tmp/qwen3-yarn"
-        cfg = make_yarn_model_dir(snapshot_download(model, local_files_only=True), serve_path)
+        cfg = make_yarn_model_dir(snap, serve_path)
         print("config.json: max_position_embeddings", cfg.get("max_position_embeddings"), "rope_scaling", cfg["rope_scaling"], flush=True)
         # Evidence that the YaRN config is what the model code will see: parse it the way vLLM does (transformers).
         from transformers import AutoConfig

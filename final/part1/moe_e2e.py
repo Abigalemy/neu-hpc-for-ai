@@ -204,16 +204,19 @@ def verdict(ref, mine, n_prompt, first_keep, gen, exp, routing=None):
     gaps = {int(i): float(ref[i].max() - ref[i, choice[i]]) for i in mism}
     ranks = {int(i): int((ref[i] > ref[i, choice[i]]).sum()) + 1 for i in mism}
     top1_ok = all(g < 0.5 for g in gaps.values())
-    same = next((i for i in range(len(exp)) if gen[i] != exp[i]), len(exp))
+    n = min(len(gen), len(exp))
+    same = next((i for i in range(n) if gen[i] != exp[i]), n)
+    greedy_ok = len(gen) == len(exp) and same == len(exp)     # same length too: a longer or shorter output fails
     b = n_prompt - first_keep
     lines = [f"{len(cos)} positions ({b} prefill, {len(cos) - b} KV-cache decode); top-1 {len(cos) - len(mism)}/{len(cos)}"
              + "".join(f"; mismatch at {first_keep + i}: engine's token is HF's #{ranks[i]}, {gaps[i]:.3f} below HF's best"
                        for i in gaps),
              f"min cosine prefill {cos[:b].min():.6f}, decode {cos[b:].min() if len(cos) > b else 1:.6f}, mean {cos.mean():.6f}",
-             f"greedy: engine matches HF for {same}/{len(exp)} tokens"]
+             f"greedy: engine produced {len(gen)} tokens, matches HF for {same}/{len(exp)}"]
     if routing is None:
-        ok = top1_ok and cos.min() > 0.999
-        return ok, lines + ["PASS (dense rule)" if ok else "FAIL (dense rule: top-1 / min cosine)"]
+        ok = top1_ok and cos.min() > 0.999 and greedy_ok      # e2e_test.py's rule minus RoPE (checked there)
+        return ok, lines + ["PASS (dense rule: top-1, min cosine, greedy)" if ok
+                            else "FAIL (dense rule: top-1 / min cosine / greedy)"]
     r = routing
     cover_ok = not r["missing"] and not r["invalid"]
     lines.append(f"routing: {r['pairs']} (layer, position) pairs, {len(r['missing'])} missing, {len(r['invalid'])} invalid; "
@@ -231,7 +234,7 @@ def verdict(ref, mine, n_prompt, first_keep, gen, exp, routing=None):
         lines.append(f"  cosine {cos[i]:.5f} at position {first_keep + i}: "
                      + ("NO routing difference at or before it" if first_keep + i in unexplained
                         else "within reach of a routing difference (at or before this position)"))
-    checks = {"top-1": top1_ok, "greedy": same == len(exp), "mean cosine": cos.mean() > 0.999, "coverage": cover_ok,
+    checks = {"top-1": top1_ok, "greedy": greedy_ok, "mean cosine": cos.mean() > 0.999, "coverage": cover_ok,
               "primary within 2 steps": not r["primary_far"], "low cosine reachable": not unexplained}
     ok = all(checks.values())
     lines.append(("PASS" if ok else "FAIL") + " (MoE rule: " + ", ".join(f"{k} {'ok' if v else 'NO'}" for k, v in checks.items())

@@ -9,10 +9,15 @@ prefill(n tokens) and decode(batch b) in ms, linear between the measured points.
   interleaved  one prefill chunk per step, then a decode step of the running sequences
   mixed        one prefill chunk per step with the running sequences' decode tokens in the same forward
                (assumed cost: the chunk's prefill time + 0.15 ms per decode row)
-A model, not a measurement: "now" gives 389 ms / 25.6 ms against the measured 391 / 24.4, the check that the model is
-close enough to compare policies. In it every chunked policy raises the mean ITL: each chunk is a forward of its own
-with the fixed cost of a forward (34 ms at 256 tokens: the 48 MoE layers' expert weights, of which a chunk of a few
-hundred tokens x top-8 touches most), and the running sequences wait for each of them.
+In every policy a request's first token is sent when its last prefill chunk returns (server.py: prefill, then
+_accept, then the decode step).
+A model, not a measurement: "now" gives 389 ms / 25.6 ms against 391 / 24.4 ms measured with the same engine
+(suite_Qwen3-30B-A3B_ours_1795323744, an intermediate Part 4 run; the final run 1795326093 measured 395.6 / 23.1 ms), the
+check that the model is close enough to compare policies. In it every chunked policy raises the mean ITL: each chunk
+is a forward of its own, a 256-token prefill already takes 34 ms in total (measured, computation included; a chunk of
+a few hundred tokens x top-8 touches most of the 128 experts of each layer), and the running sequences wait for each
+chunk. The mixed policy's 0.15 ms per decode row is an assumption, not a measurement. The model supports "chunked
+prefill would not lower ITL on this workload", not a ranking of every scheduling policy.
 """
 import numpy as np
 
@@ -58,16 +63,20 @@ def sim(policy, isl=2048, osl=32, conc=8, nreq=16, chunk=512):
             else:
                 if pf:
                     t += prefill(n)
+                    pf["left"] -= n
+                    if pf["left"] == 0:          # first token sent when its prefill returns, as server.py does
+                        pf["toks"].append(t)
                 if dec:
                     t += decode(len(dec))
                     for r in dec:
                         r["toks"].append(t)
-            if pf:
+            if pf and policy == "mixed":
                 pf["left"] -= n
                 if pf["left"] == 0:
                     pf["toks"].append(t)
-                    waiting.pop(0)
-                    running.append(pf)
+            if pf and pf["left"] == 0:
+                waiting.pop(0)
+                running.append(pf)
         for r in [r for r in running if len(r["toks"]) >= osl]:
             running.remove(r)
             done.append(r)
@@ -78,7 +87,7 @@ def sim(policy, isl=2048, osl=32, conc=8, nreq=16, chunk=512):
 
 
 if __name__ == "__main__":
-    print("prefill_heavy (2048 in, 32 out, concurrency 8), 30B 1x H200; measured then: ours 391 / 24.4 ms, vLLM 245 / 8.2 ms")
+    print("prefill_heavy (2048 in, 32 out, concurrency 8), 30B 1x H200; measured: ours 391 / 24.4 ms (run 1795323744), vLLM 245 / 8.2 ms")
     print("  now (whole prefills, then decode):", sim("now"))
     for c in (2048, 1024, 512):
         print(f"  chunk {c}: interleaved {sim('inter', chunk=c)};  mixed {sim('mixed', chunk=c)}")
