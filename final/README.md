@@ -188,10 +188,58 @@ engine runs on 1x H100 80 GB; weights 61.06 GB on the GPU, loaded in 44 s). Same
   runs, because both have a routing difference at position 0 ("tiling": layer 3; "heldout": layer 2), which puts every
   later position within reach. The informative results are top-1, greedy, full coverage and the primary differences
   all being exact ties; they do not rule out an independent error in later layers. A forced-routing A/B would measure
-  the routing's share of the difference, not prove it is the only cause.
+  the routing's share of the difference, not prove it is the only cause (run on 2026-11-24, below).
 - the same run checked the dense path after the MoE changes: Qwen3-0.6B top-1 43/43, min cosine 0.99961, greedy 16/16.
 - engine-only timing (single sequence, this prompt; not comparable with vLLM through AIPerf yet): TTFT 22.6 ms, ITL
   11.0 ms.
+- HF reference with the engine's tie rule (the professor's suggestion, 2026-11-24). HF's router picks its top 8 with
+  `torch.topk`, whose order among equal values is unspecified; the engine takes the lower expert id. The reference was
+  regenerated with the HF router's top-k replaced by a stable descending sort, which keeps the lower id first among
+  equal probabilities (`part1/hf_tie_break.py`; it stops if the installed router is not the code it copies). Its
+  self-check passes on the container's transformers 5.23.0: on 4096 random rows, every row without a tie at the top-8
+  boundary keeps torch.topk's experts and weights, and built ties keep the lowest ids. The new references
+  (`moe_e2e_ref/*_tielow`, CPU, about a minute each) have the same greedy tokens as the old ones, so the saved
+  single-GPU engine runs were judged against them without a GPU (`--rejudge-runs`; log
+  `results/part1/moe_e2e_tielow_2026-11-24.txt`):
+
+  | prompt | HF tie rule | primary routing differences | (layer, position) pairs differing | mean cosine | min cosine | frozen rule |
+  |---|---|---|---|---|---|---|
+  | tiling | torch.topk | 6 | 300 | 0.99921 | 0.99532 | PASS |
+  | tiling | lower id | 4 | 309 | 0.99878 | 0.98575 | FAIL (mean cosine) |
+  | heldout | torch.topk | 5 | 288 | 0.99936 | 0.99464 | PASS |
+  | heldout | lower id | 2 | 188 | 0.99952 | 0.99555 | PASS |
+
+  The tie rule removes the differences where both sides see an exact tie. It cannot remove the rest, because the
+  engine's own bf16 router logits are not always tied where HF's are. Its router GEMM accumulates in a different
+  order, so the two roundings can land one bf16 step apart. Example: tiling, layer 2, position 0. Experts 62 and 114
+  are exactly equal in HF's logits, and HF now takes 62. The engine takes 114, so in its logits 114 is the larger of
+  the two (it takes the lower id only among exact equals). Every remaining primary difference is still 0 or 1 bf16
+  steps apart in HF's logits. HF's CPU reference is also not exactly repeatable between containers: the heldout
+  router logits differ already at layer 0, which depends only on the embeddings. The tiling result got worse with the
+  same engine output: HF's tie choices put its trajectory further from the engine's, not closer.
+- forced-routing A/B (1x H100, 2026-11-24, log `results/part1/moe_e2e_forced_h100_2026-11-24.txt`). With
+  `QWEN3_MOE_FORCE`, the engine takes HF's recorded experts for every layer and position, and its weights are still
+  its own router's probabilities of those experts. The remaining difference is then the part that does not come
+  from the routing. `tests/moe_force_test.cu` runs first: forcing the router's own choice is bit-identical to not
+  forcing it, and forced random experts get the given ids with the expected weights. All 1584 router calls of each
+  run took HF's experts, and the routing check found 0 differing pairs, which confirms the forcing took effect.
+  Against the tie-rule references:
+
+  | prompt | routing | mean cosine | min cosine | top-1 | greedy |
+  |---|---|---|---|---|---|
+  | tiling | engine's own | 0.99878 | 0.98575 | 41/43 | 16/16 |
+  | tiling | forced to HF's | **0.99987** | **0.99815** | 42/43 (the mismatch: 0.000 below HF's best) | 16/16 |
+  | heldout | engine's own | 0.99952 | 0.99555 | 46/46 | 16/16 |
+  | heldout | forced to HF's | **0.99988** | **0.99901** | 46/46 | 16/16 |
+
+  Same routing removes 89% (tiling) and 75% (heldout) of the mean 1 - cosine. With it, heldout meets the dense
+  criterion (min cosine > 0.999) on all 46 positions, and tiling meets it on 42 of 43. The one exception, tiling
+  position 37 (cosine 0.99815), is a position where HF is certain: top-1 probability 1.000, margin 13.6. The largest
+  error there is 0.625 on logits up to 34, 2.5 bf16 steps. That is rounding accumulated over 48 layers, not a wrong
+  token. So the gap between the MoE and the dense results comes mostly from the routing ties, as the earlier runs
+  suggested but could not show. The frozen MoE rule reports FAIL for the forced tiling run only because of its
+  "low cosine within reach of a routing difference" clause: with forced routing there is no difference for a low
+  position to be within reach of.
 
 ### Server on Qwen3-30B-A3B vs vLLM, 1x H200 (2026-11-18)
 

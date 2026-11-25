@@ -1,0 +1,43 @@
+# Forced-routing A/B, 1x H100, 2026-11-24: the engine takes HF's recorded experts (QWEN3_MOE_FORCE), weights from its own router
+# modal run part1/moe_e2e.py --yes --force-routing --tie low --prompts tiling,heldout   (references: *_tielow)
+PLAN: 1x H100, engine vs the stored references of [('Qwen/Qwen3-30B-A3B', 'tiling'), ('Qwen/Qwen3-30B-A3B', 'heldout')], hard cap 20 min -> at most ~$1.32 of shared credit
+forced routing: the engine takes HF's experts (QWEN3_MOE_FORCE); moe_force_test runs first
+n   1: forced = own choice bit-identical; forced = random experts: indices as given, weights worst rel err 2.71e-03 ok
+n   5: forced = own choice bit-identical; forced = random experts: indices as given, weights worst rel err 3.00e-03 ok
+n  16: forced = own choice bit-identical; forced = random experts: indices as given, weights worst rel err 3.55e-03 ok
+n  17: forced = own choice bit-identical; forced = random experts: indices as given, weights worst rel err 3.81e-03 ok
+n 300: forced = own choice bit-identical; forced = random experts: indices as given, weights worst rel err 3.78e-03 ok
+MOE FORCE: all cases pass
+weights: 61.06 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1 blocks of 128 tokens = 128 tokens, 0.01 GB (48 layers)
+MoE workspace: 51 tokens, 0.00 GB
+config: hidden=2048 inter=6144 layers=48 heads=32/4 vocab=151936 tied=0
+LOAD_S 43.67 (weights go to the GPU once, here)
+LOGITS_KEPT rows=43 first_position=0
+TEACHER_FORCED prefill(27 tokens) 47.0 ms, decode steps 16, avg 9.3 ms
+MOE_FORCE: 1584 MoE router calls took the experts from the file, 0 chose them
+GENERATE prompt=27 tokens: TTFT_MS 19.6  ITL_MS 9.7 (avg over 15 steps)
+Qwen/Qwen3-30B-A3B [tiling, snapshot ad44e777, HF tie rule low, FORCED to HF's experts], engine side final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_forcedlow_1795581133
+  43 positions (27 prefill, 16 KV-cache decode); top-1 42/43; mismatch at 18: engine's token is HF's #1, 0.000 below HF's best
+  min cosine prefill 0.999742, decode 0.998153, mean 0.999867
+  greedy: engine matches HF for 16/16 tokens
+  routing: 2064 (layer, position) pairs, 0 missing, 0 invalid; 0 with a different expert set
+  primary differences: 0: 0 exact ties (0 steps), 0 near the top-8 boundary (1-2 steps), 0 further apart
+    cosine 0.99815 at position 37: NO routing difference at or before it
+  FAIL (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable NO; min cosine 0.99815 reported)
+weights: 61.06 GB on the GPU (MoE, experts packed per layer)
+KV cache: 1 blocks of 128 tokens = 128 tokens, 0.01 GB (48 layers)
+MoE workspace: 54 tokens, 0.00 GB
+config: hidden=2048 inter=6144 layers=48 heads=32/4 vocab=151936 tied=0
+LOAD_S 10.97 (weights go to the GPU once, here)
+LOGITS_KEPT rows=46 first_position=0
+TEACHER_FORCED prefill(30 tokens) 40.5 ms, decode steps 16, avg 9.3 ms
+MOE_FORCE: 1584 MoE router calls took the experts from the file, 0 chose them
+GENERATE prompt=30 tokens: TTFT_MS 19.9  ITL_MS 9.6 (avg over 15 steps)
+Qwen/Qwen3-30B-A3B [heldout, snapshot ad44e777, HF tie rule low, FORCED to HF's experts], engine side final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_heldout_forcedlow_1795581146
+  46 positions (30 prefill, 16 KV-cache decode); top-1 46/46
+  min cosine prefill 0.999837, decode 0.999008, mean 0.999879
+  greedy: engine matches HF for 16/16 tokens
+  routing: 2208 (layer, position) pairs, 0 missing, 0 invalid; 0 with a different expert set
+  primary differences: 0: 0 exact ties (0 steps), 0 near the top-8 boundary (1-2 steps), 0 further apart
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99901 reported)

@@ -80,6 +80,8 @@ int main(int argc, char** argv) {
         gen.push_back(next);
     }
     write_file(argv[7], gen.data(), gen.size() * sizeof(int));
+    if (std::getenv("QWEN3_MOE_FORCE"))
+        std::printf("MOE_FORCE: %lld MoE router calls took the experts from the file, %lld chose them\n", eng.forced_calls, eng.own_calls);
     std::printf("GENERATE prompt=%d tokens: TTFT_MS %.1f  ITL_MS %.1f (avg over %d steps)\n", n_prompt, ttft,
                 n_gen > 1 ? itl / (n_gen - 1) : 0.0, n_gen - 1);
 

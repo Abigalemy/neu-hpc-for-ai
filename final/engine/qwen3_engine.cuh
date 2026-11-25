@@ -545,7 +545,8 @@ private:
                         if (n > moe_ws_.max_tokens) { std::fprintf(stderr, "moe: %d tokens (workspace %d)\n", n, moe_ws_.max_tokens); std::exit(2); }
                         const int A = n * cfg.top_k;
                         stage("moe_router", (double)cfg.experts * H * 2, 2.0 * nn * cfg.experts * H, [&] {
-                            CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk, s_)));
+                            CKL((launch_moe_router<bf16, 128, 8>(h_, L.router, moe_ws_.idx, moe_ws_.w, n, H, cfg.norm_topk, s_,
+                                                                 forced_experts(l, n, h_pos))));
                         });
                         // Part 4: the sort also writes the work list (only the non-empty (expert, row tile) pairs get a
                         // block in the GEMMs; same tiles, same results)
@@ -607,7 +608,7 @@ private:
     // with use_graphs off (QWEN3_GRAPH=0).
     bool graphable() const {
         static const bool small = [] { const char* e = std::getenv("QWEN3_ATTN"); return e && std::string(e) == "small"; }();
-        return use_graphs && !small && ep_.world == 1 && !profile && !moe_dump_ && tile_profile() == TileProfile::BIG;
+        return use_graphs && !small && ep_.world == 1 && !profile && !moe_dump_ && force_T_ == 0 && tile_profile() == TileProfile::BIG;
     }
     template <typename F>
     cudaGraphExec_t capture(F&& pass) {
@@ -643,6 +644,46 @@ private:
         std::fwrite(h_pos, sizeof(int), n, moe_dump_);
         std::fwrite(idx.data(), sizeof(int), idx.size(), moe_dump_);
         std::fflush(moe_dump_);
+    }
+
+    // QWEN3_MOE_FORCE=<file> with QWEN3_MOE_FORCE_T=<T> (Part 1 check only, one GPU, one sequence): the experts of
+    // every MoE layer at positions < T are taken from the file, int32 [MoE layers, T, K] in layer order (HF's
+    // route_idx.i32 from part1/moe_e2e.py), instead of being chosen by the router; their weights are still the
+    // engine's own router probabilities. A pass with a position >= T routes itself. forced_calls / own_calls count them.
+public:
+    long long forced_calls = 0, own_calls = 0;
+private:
+    int force_T_ = [] { const char* t = std::getenv("QWEN3_MOE_FORCE_T"); return std::getenv("QWEN3_MOE_FORCE") && t ? std::atoi(t) : 0; }();
+    std::vector<int> force_idx_;
+    int* d_force_ = nullptr;
+    std::map<int, int> moe_ordinal_;   // layer -> index among the MoE layers
+    const int* forced_experts(int layer, int n, const int* h_pos) {
+        if (force_T_ == 0) return nullptr;
+        const int K = cfg.top_k;
+        if (force_idx_.empty()) {
+            int m = 0;
+            for (int l = 0; l < cfg.layers; ++l) if (layers_[l].router) moe_ordinal_[l] = m++;
+            std::FILE* f = std::fopen(std::getenv("QWEN3_MOE_FORCE"), "rb");
+            if (!f) { std::fprintf(stderr, "QWEN3_MOE_FORCE: cannot open\n"); std::exit(2); }
+            force_idx_.resize((size_t)m * force_T_ * K);
+            const size_t got = std::fread(force_idx_.data(), sizeof(int), force_idx_.size(), f);
+            const bool more = std::fgetc(f) != EOF;
+            std::fclose(f);
+            if (got != force_idx_.size() || more) {
+                std::fprintf(stderr, "QWEN3_MOE_FORCE: file is not [%d, %d, %d] int32\n", m, force_T_, K); std::exit(2);
+            }
+            if (ep_.world > 1) { std::fprintf(stderr, "QWEN3_MOE_FORCE: one GPU only\n"); std::exit(2); }
+            d_force_ = alloc<int>((size_t)moe_ws_.max_tokens * K);
+        }
+        for (int i = 0; i < n; ++i)
+            if (h_pos[i] >= force_T_) { ++own_calls; return nullptr; }
+        std::vector<int> rows((size_t)n * K);
+        const int mo = moe_ordinal_.at(layer);
+        for (int i = 0; i < n; ++i)
+            std::copy_n(&force_idx_[((size_t)mo * force_T_ + h_pos[i]) * K], K, &rows[(size_t)i * K]);
+        CK(cudaMemcpy(d_force_, rows.data(), rows.size() * sizeof(int), cudaMemcpyHostToDevice));
+        ++forced_calls;
+        return d_force_;
     }
 
     void upload_tables() {   // device copy of the block tables that changed since the last forward

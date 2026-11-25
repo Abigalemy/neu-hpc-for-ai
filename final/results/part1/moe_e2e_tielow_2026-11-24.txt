@@ -1,0 +1,94 @@
+# HF reference with the engine's tie rule (part1/hf_tie_break.py), CPU container, 2026-11-24
+# modal run part1/moe_e2e.py --ref --tie low --yes --prompts tiling / heldout
+├── ✓ Uploaded /Users/mengyu/neu-hpc-for-ai/final/part1/moe_e2e.py
+├── ✓ Uploaded /Users/mengyu/neu-hpc-for-ai/final
+tie check: 4096 random rows: 241 with a tie at the top-8 boundary; every other row takes the same 8 experts as torch.topk, same weights
+tie check: built ties (experts [5, 9, 40, 77, 100] with equal logits): 5 of 256 rows split the group at the top-8 boundary, each keeps the lowest ids
+loaded Qwen/Qwen3-30B-A3B in 60 s (torch 2.15.0+cpu, transformers 5.23.0)
+generated in 66 s: ' | Study.com\nTech and Engineering Computer science Computer hardware\nExplain in two'
+router choices of 48 layers recorded
+reference saved to final-results:/results/moe_e2e_ref/Qwen3-30B-A3B_tielow (72 s in all)
+├── ✓ Uploaded /Users/mengyu/neu-hpc-for-ai/final/part1/moe_e2e.py
+├── ✓ Uploaded /Users/mengyu/neu-hpc-for-ai/final
+tie check: 4096 random rows: 241 with a tie at the top-8 boundary; every other row takes the same 8 experts as torch.topk, same weights
+tie check: built ties (experts [5, 9, 40, 77, 100] with equal logits): 5 of 256 rows split the group at the top-8 boundary, each keeps the lowest ids
+loaded Qwen/Qwen3-30B-A3B in 33 s (torch 2.15.0+cpu, transformers 5.23.0)
+generated in 36 s: ' - eNotes.com\nScience\nStart Free Trial\nQuestions & Answers\nR'
+router choices of 48 layers recorded
+reference saved to final-results:/results/moe_e2e_ref/Qwen3-30B-A3B_heldout_tielow (39 s in all)
+
+# modal run part1/moe_e2e.py --rejudge-runs --tie low --prompts tiling,heldout  (saved 1-GPU engine runs, no GPU)
+   Use the NVIDIA Container Toolkit to start this container with GPU support; see
+   https://docs.nvidia.com/datacenter/cloud-native/ .
+Qwen/Qwen3-30B-A3B [tiling, snapshot ad44e777, HF tie rule low, saved engine run], engine side final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_1795325974
+  43 positions (27 prefill, 16 KV-cache decode); top-1 41/43; mismatch at 11: engine's token is HF's #2, 0.125 below HF's best; mismatch at 18: engine's token is HF's #1, 0.000 below HF's best
+  min cosine prefill 0.996293, decode 0.985754, mean 0.998775
+  greedy: engine matches HF for 16/16 tokens
+  routing: 2064 (layer, position) pairs, 0 missing, 0 invalid; 309 with a different expert set
+  primary differences: 4: 4 exact ties (0 steps), 0 near the top-8 boundary (1-2 steps), 0 further apart
+    primary: layer 0 position 28: engine [105] vs HF [30], 0 bf16 steps apart in HF's logits
+    primary: layer 1 position 20: engine [113] vs HF [45], 0 bf16 steps apart in HF's logits
+    primary: layer 2 position 0: engine [114] vs HF [62], 0 bf16 steps apart in HF's logits
+    primary: layer 2 position 3: engine [70] vs HF [69], 0 bf16 steps apart in HF's logits
+    cosine 0.99679 at position 7: within reach of a routing difference (at or before this position)
+    cosine 0.99670 at position 8: within reach of a routing difference (at or before this position)
+    cosine 0.99636 at position 11: within reach of a routing difference (at or before this position)
+    cosine 0.99838 at position 13: within reach of a routing difference (at or before this position)
+    cosine 0.99629 at position 16: within reach of a routing difference (at or before this position)
+    cosine 0.99755 at position 30: within reach of a routing difference (at or before this position)
+    cosine 0.99656 at position 33: within reach of a routing difference (at or before this position)
+    cosine 0.99844 at position 34: within reach of a routing difference (at or before this position)
+    cosine 0.99820 at position 35: within reach of a routing difference (at or before this position)
+    cosine 0.98575 at position 37: within reach of a routing difference (at or before this position)
+    cosine 0.99807 at position 41: within reach of a routing difference (at or before this position)
+  FAIL (MoE rule: top-1 ok, greedy ok, mean cosine NO, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.98575 reported)
+Qwen/Qwen3-30B-A3B [heldout, snapshot ad44e777, HF tie rule low, saved engine run], engine side final-results:/results/moe_e2e_runs/Qwen3-30B-A3B_heldout_1795325987
+  46 positions (30 prefill, 16 KV-cache decode); top-1 46/46
+  min cosine prefill 0.995550, decode 0.997500, mean 0.999523
+  greedy: engine matches HF for 16/16 tokens
+  routing: 2208 (layer, position) pairs, 0 missing, 0 invalid; 188 with a different expert set
+  primary differences: 2: 1 exact ties (0 steps), 1 near the top-8 boundary (1-2 steps), 0 further apart
+    primary: layer 1 position 15: engine [92] vs HF [101], 1 bf16 steps apart in HF's logits
+    primary: layer 2 position 0: engine [102] vs HF [2], 0 bf16 steps apart in HF's logits
+    cosine 0.99555 at position 6: within reach of a routing difference (at or before this position)
+    cosine 0.99872 at position 15: within reach of a routing difference (at or before this position)
+    cosine 0.99777 at position 33: within reach of a routing difference (at or before this position)
+    cosine 0.99750 at position 35: within reach of a routing difference (at or before this position)
+    cosine 0.99877 at position 41: within reach of a routing difference (at or before this position)
+    cosine 0.99855 at position 43: within reach of a routing difference (at or before this position)
+  PASS (MoE rule: top-1 ok, greedy ok, mean cosine ok, coverage ok, primary within 2 steps ok, low cosine reachable ok; min cosine 0.99555 reported)
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 590, in loop_coro
+    await asyncio.wait_for(async_f(), timeout=timeout)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/runner.py", line 69, in _heartbeat
+    await client._stub.AppHeartbeat(request, retry=Retry(attempt_timeout=HEARTBEAT_TIMEOUT))
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 590, in loop_coro
+    await asyncio.wait_for(async_f(), timeout=timeout)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/runner.py", line 69, in _heartbeat
+    await client._stub.AppHeartbeat(request, retry=Retry(attempt_timeout=HEARTBEAT_TIMEOUT))
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 590, in loop_coro
+    await asyncio.wait_for(async_f(), timeout=timeout)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/runner.py", line 69, in _heartbeat
+    await client._stub.AppHeartbeat(request, retry=Retry(attempt_timeout=HEARTBEAT_TIMEOUT))
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 590, in loop_coro
+    await asyncio.wait_for(async_f(), timeout=timeout)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/runner.py", line 69, in _heartbeat
+    await client._stub.AppHeartbeat(request, retry=Retry(attempt_timeout=HEARTBEAT_TIMEOUT))
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/_utils/async_utils.py", line 590, in loop_coro
+    await asyncio.wait_for(async_f(), timeout=timeout)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/Users/mengyu/neu-hpc-for-ai/final/.venv/lib/python3.13/site-packages/modal/runner.py", line 69, in _heartbeat
+    await client._stub.AppHeartbeat(request, retry=Retry(attempt_timeout=HEARTBEAT_TIMEOUT))

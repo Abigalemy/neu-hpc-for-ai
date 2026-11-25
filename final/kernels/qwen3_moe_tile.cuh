@@ -47,9 +47,12 @@ struct MoeWorkspace {     // device scratch for up to max_tokens tokens (A = max
 };
 
 // ---- 1. router ---------------------------------------------------------------------------------------------------
-template <typename T, int E, int K, bool NORM, int BR, int BK>
+// FORCE (Part 1 check only, QWEN3_MOE_FORCE): the K experts of each token are read from FIDX [n, K] instead of being
+// chosen; their weights are this kernel's own probabilities of those experts (renormalised as usual), so only the
+// choice is taken from outside.
+template <typename T, int E, int K, bool NORM, int BR, int BK, bool FORCE = false>
 __tile_global__ void moe_router_kernel(const T* __restrict__ _X, const T* __restrict__ _WR, int* __restrict__ IDX,
-                                       T* __restrict__ W, int n_tokens, int _hid) {
+                                       T* __restrict__ W, int n_tokens, int _hid, const int* __restrict__ FIDX = nullptr) {
     using namespace ct::literals;
     using f32_te = ct::tile<float, ct::shape<BR, E>>;
     using f32_tk = ct::tile<float, ct::shape<BR, K>>;
@@ -80,6 +83,15 @@ __tile_global__ void moe_router_kernel(const T* __restrict__ _X, const T* __rest
     auto kcol = ct::broadcast<ct::shape<BR, K>>(ct::iota<ct::tile<int, ct::shape<1, K>>>());
     auto wsel = ct::zeros<f32_tk>();
     auto isel = ct::zeros<i32_tk>();
+    if constexpr (FORCE) {
+        auto pF = ct::partition_view{ct::tensor_span{FIDX, ct::extents{n_tokens, ct::integral_constant<K>{}}}, ct::shape<BR, K>{}};
+        isel = pF.load_masked(tb, 0);
+        for (int j = 0; j < K; ++j) {
+            auto fj = ct::element_cast<float>(ct::sum(ct::select(kcol == j, isel, ct::zeros<i32_tk>()), 1_ic));   // [BR, 1]
+            auto wj = ct::sum(ct::select(col == fj, p, ct::zeros<f32_te>()), 1_ic);                              // p[fj]
+            wsel = ct::select(kcol == j, ct::broadcast<ct::shape<BR, K>>(wj), wsel);
+        }
+    } else
     for (int j = 0; j < K; ++j) {
         auto mx = ct::reduce_max(p, 1_ic);                                          // [BR, 1]
         auto rev = ct::select(p == mx, (float)(E - 1) - col, ct::full<f32_te>(-1.0f));
@@ -387,9 +399,15 @@ __tile_global__ void moe_combine_kernel(const T* __restrict__ YS, int n_assign, 
 // ---- host side ------------------------------------------------------------------------------------------------------
 // Router only (also used by the unit test): IDX [n, K], W [n, K].
 template <typename T, int E, int K>
-cudaError_t launch_moe_router(const T* x, const T* wr, int* idx, T* w, int n, int hid, bool norm_topk, cudaStream_t s = 0) {
+cudaError_t launch_moe_router(const T* x, const T* wr, int* idx, T* w, int n, int hid, bool norm_topk, cudaStream_t s = 0,
+                              const int* forced = nullptr) {
     constexpr int BR = 16, BK = 64;
     if (hid % BK) { std::fprintf(stderr, "moe router: hidden %d not a multiple of %d\n", hid, BK); return cudaErrorInvalidValue; }
+    if (forced) {   // Part 1 check only: the experts come from `forced`
+        if (norm_topk) moe_router_kernel<T, E, K, true, BR, BK, true><<<(n + BR - 1) / BR, 1, 0, s>>>(x, wr, idx, w, n, hid, forced);
+        else moe_router_kernel<T, E, K, false, BR, BK, true><<<(n + BR - 1) / BR, 1, 0, s>>>(x, wr, idx, w, n, hid, forced);
+        return cudaGetLastError();
+    }
     if (norm_topk) moe_router_kernel<T, E, K, true, BR, BK><<<(n + BR - 1) / BR, 1, 0, s>>>(x, wr, idx, w, n, hid);
     else moe_router_kernel<T, E, K, false, BR, BK><<<(n + BR - 1) / BR, 1, 0, s>>>(x, wr, idx, w, n, hid);
     return cudaGetLastError();
