@@ -10,11 +10,13 @@ import os
 import sys
 from contextlib import redirect_stdout
 
+import tempfile
+
 import numpy as np
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [HERE, os.path.join(HERE, "server")]
-from e2e_test import dense_verdict, judge_variants, pinned_snapshot, MAX_GEN   # noqa: E402
+from e2e_test import dense_verdict, judge_variants, pinned_snapshot, output_problems, MAX_GEN   # noqa: E402
 sys.path.insert(0, os.path.join(HERE, "part1"))
 from moe_e2e import verdict as moe_verdict  # noqa: E402
 import run_tests                           # noqa: E402
@@ -95,6 +97,8 @@ check("dense: id = vocab size -> FAIL", not ok)
 ok, _ = dense_verdict(ref, ref, exp.copy(), exp, 3, 1)
 check("dense: one RoPE table entry differs -> FAIL", not ok)
 low = ref.copy(); low[4] = rng.normal(0, 3, V)
+low[4, ref[4].argmax()] = low[4].max() + 1           # the engine still picks HF's best: only the cosine is wrong
+holds("low cosine", low[4].argmax() == ref[4].argmax() and cosines(ref, low).min() < 0.999)
 ok, _ = dense_verdict(ref, low, exp.copy(), exp, 3, 0)
 check("dense: one row with low cosine -> FAIL", not ok)
 
@@ -104,6 +108,15 @@ check("dense A/B: first variant's RoPE wrong, last right -> FAIL", not ok)
 ok, _ = judge_variants(ref, [("first", ref, exp.copy(), 0), ("last", ref, exp.copy(), 0)], exp, 3)
 check("dense A/B: both right -> pass", ok)
 check(f"dense: generation limit is 63 (64 kept rows, the first prediction is the prompt's last row)", MAX_GEN == 63)
+
+# a run that wrote nothing, or too little: a clear problem list, not an exception later
+with tempfile.TemporaryDirectory() as d:
+    a, b = os.path.join(d, "rope.bin"), os.path.join(d, "gen.bin")
+    open(b, "wb").write(b"\0" * 12)
+    probs = output_problems({a: 16, b: 16})
+    check("dense: missing and short output files -> both named", len(probs) == 2 and "not written" in probs[0])
+    open(a, "wb").write(b"\0" * 16); open(b, "wb").write(b"\0" * 16)
+    check("dense: output files of the right size -> no problem", output_problems({a: 16, b: 16}) == [])
 
 # the dense branch of part1/moe_e2e.py's verdict (the 0.6B check run with the MoE model)
 ok, _ = moe_verdict(ref, ref, 3, 0, exp.copy(), exp)
@@ -115,7 +128,6 @@ ok, _ = moe_verdict(ref, ref, 3, 0, g, exp)
 check("moe_e2e dense: greedy differs -> FAIL", not ok)
 
 # pinned snapshot: two revisions cached, refs/main on the other one
-import tempfile   # noqa: E402
 with tempfile.TemporaryDirectory() as hub:
     base = os.path.join(hub, "models--Qwen--Qwen3-4B")
     for rev in ("1cfa9a7208912126459214e8b04321603b3df60c", "ffff"):
