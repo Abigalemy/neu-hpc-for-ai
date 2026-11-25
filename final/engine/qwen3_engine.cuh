@@ -191,6 +191,9 @@ public:
             std::fprintf(stderr, "expert parallelism: rank %d of world %d (1..8, needs an NCCL id)\n", rank, world);
             std::exit(2);
         }
+        if (force_T_ && world > 1) {   // before NCCL and the weights: the forced-routing check is one GPU only
+            std::fprintf(stderr, "QWEN3_MOE_FORCE: one GPU only (not with EP)\n"); std::exit(2);
+        }
         if (world > 1) {
             ncclUniqueId id;
             std::memcpy(&id, nccl_id, sizeof id);
@@ -324,6 +327,7 @@ public:
 
         // 4) RoPE tables [max_len, 64] (cos, sin), built like HF: fp32 inverse frequencies, rounded to bf16
         build_rope_tables();
+        if (force_T_) load_force_file();   // checked here, before the engine is used (or a server reports ready)
     }
 
     // ---- block manager (PagedAttention) ---------------------------------------------------------------------------
@@ -538,7 +542,6 @@ private:
                     const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
                     const double ex_flops = 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H);
                     if (ep_.world > 1) {
-                        if (force_T_) { std::fprintf(stderr, "QWEN3_MOE_FORCE: one GPU only (not with EP)\n"); std::exit(2); }
                         moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
                                                    moe_ws_, ep_ws_, ep_, 0, ncclBfloat16,
                                                    [&](const char* name, auto&& f) { stage(name, 0, 0, f); });
@@ -657,17 +660,21 @@ private:
     int force_T_ = [] {
         if (!std::getenv("QWEN3_MOE_FORCE")) return 0;
         const char* t = std::getenv("QWEN3_MOE_FORCE_T");
-        const int T = t ? std::atoi(t) : 0;
-        if (T <= 0) { std::fprintf(stderr, "QWEN3_MOE_FORCE needs QWEN3_MOE_FORCE_T > 0\n"); std::exit(2); }
-        return T;
+        char* end = nullptr;
+        const long T = t ? std::strtol(t, &end, 10) : 0;
+        if (!t || end == t || *end != '\0' || T <= 0 || T > (1 << 30)) {   // "12x", "" and "0" are errors
+            std::fprintf(stderr, "QWEN3_MOE_FORCE needs QWEN3_MOE_FORCE_T, a positive integer (got %s)\n", t ? t : "nothing");
+            std::exit(2);
+        }
+        return (int)T;
     }();
     std::vector<int> force_idx_;
     int* d_force_ = nullptr;
     std::map<int, int> moe_ordinal_;   // layer -> index among the MoE layers
-    const int* forced_experts(int layer, int n, const int* h_pos) {
-        if (force_T_ == 0) return nullptr;
+    void load_force_file() {
         const int K = cfg.top_k;
-        if (force_idx_.empty()) {
+        if (cfg.experts == 0) { std::fprintf(stderr, "QWEN3_MOE_FORCE: not an MoE model\n"); std::exit(2); }
+        {
             int m = 0;
             for (int l = 0; l < cfg.layers; ++l) if (layers_[l].router) moe_ordinal_[l] = m++;
             std::FILE* f = std::fopen(std::getenv("QWEN3_MOE_FORCE"), "rb");
@@ -690,6 +697,10 @@ private:
             }
             d_force_ = alloc<int>((size_t)moe_ws_.max_tokens * K);
         }
+    }
+    const int* forced_experts(int layer, int n, const int* h_pos) {
+        if (force_T_ == 0) return nullptr;
+        const int K = cfg.top_k;
         for (int i = 0; i < n; ++i)
             if (h_pos[i] >= force_T_) { ++own_calls; return nullptr; }
         std::vector<int> rows((size_t)n * K);

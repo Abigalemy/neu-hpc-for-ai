@@ -13,9 +13,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# seconds a call may take before the worker counts as hung (alive but making no progress, e.g. stuck in a collective):
-# the engine core then exits, which the launcher's watchdog sees, and the group stops. Loading the weights (the first
-# message) has its own, longer limit. Neither applies while the core is parked: then no call is in flight.
+# Per-call REPLY timeout, in seconds: if the worker sends no reply to one call within it (alive but hung, e.g. stuck
+# in a collective), the engine core exits, which the launcher's watchdog sees, and the group stops. It bounds the
+# whole call, not the progress inside it: one prefill call runs all its chunks, and an EP idle_tick waits for the
+# other ranks and computes their experts, so a call that is slow but progressing longer than this is also stopped
+# (600 s is far above any call of the reported workloads; raise it for longer prompts). The send() of the request is
+# not inside the timeout. Loading the weights (the first message) has its own, longer limit. Neither applies while
+# the core is parked: then no call is in flight.
 CALL_TIMEOUT = float(os.environ.get("QWEN3_WORKER_TIMEOUT", "600"))
 LOAD_TIMEOUT = float(os.environ.get("QWEN3_WORKER_LOAD_TIMEOUT", "3600"))
 

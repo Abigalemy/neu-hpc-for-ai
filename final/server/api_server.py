@@ -98,16 +98,17 @@ class EngineClient:
         finished = added = False
         try:                                             # from here on, pending[rid] is removed whatever happens
             e = self._pick()
-            self.sent[e] += 1
-            self.since[e] += 1
             self._send(e, {"type": "ADD", "id": rid, "prompt_ids": list(prompt_ids), "max_new": max_new,
                            "min_new": min_new, "ignore_eos": ignore_eos})
             added = True
+            self.sent[e] += 1                            # counted once the request was actually sent
+            self.since[e] += 1
             while True:
                 tok, fin = await q.get()
+                if fin:                                  # set before the yield: a consumer that closes the generator
+                    finished = True                      # on the last token must not send an ABORT for it
                 yield tok, fin
                 if fin:
-                    finished = True
                     return
         finally:
             self.pending.pop(rid, None)

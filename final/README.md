@@ -414,11 +414,11 @@ the coordinator wakes them all (checked with real processes, `part3/protocol_sim
 | one expert of one layer: gate, up, down, each 2048 x 768 | 3 x 2048 x 768 x 2 B = 9 MiB |
 | one expert id across the 48 layers | 48 x 9 MiB = 432 MiB |
 | experts per GPU: 64 of 128 | 64 x 432 MiB = **27 GiB** (all 128 on one GPU: 54 GiB) |
-| non-expert weights, copied on every rank: attention 48 x 2048 x (4096 + 512 + 512) + 48 x 4096 x 2048, routers 48 x 2048 x 128, embedding and lm_head (untied) 2 x 151936 x 2048 | about 1.55 G parameters = 2.9 GiB |
+| non-expert weights, copied on every rank: attention 48 x 2048 x (4096 + 512 + 512) + 48 x 4096 x 2048, routers 48 x 2048 x 128, embedding and lm_head (untied) 2 x 151936 x 2048 | 1,540,882,432 parameters = 2.87 GiB |
 | KV cache: 48 layers x (K + V) x 4 KV heads x 128 x 2 B | 96 KiB per token (the suite's pool, per rank: 64 sequences x 4224 tokens = 270336 tokens = 24.8 GiB) |
 | EP receive buffers and the MoE workspace | sized at startup for the worst case (all tokens of all ranks on one rank) |
 
-So about 55 GiB per GPU (27 + 2.9 + 24.8) of the 141 GB of an H200 with the suite's settings, before the workspaces. The engine allocates the weights first and the
+So about 55 GiB per GPU (27 + 2.87 + 24.75 = 54.6) of the 141 GB of an H200 with the suite's settings, before the workspaces. The engine allocates the weights first and the
 buffers after them, and stops with an error if an allocation fails; there is no separate budget check before the
 first allocation.
 
@@ -432,7 +432,8 @@ tokens identical to 1 GPU (`results/part3/moe_e2e_ep2_h100x2_2026-11-18.txt`). T
 2x H100: 4/4 texts identical to the 1-GPU server one at a time, 8/8 all at once
 (`results/part5/smoke_h100x2_2026-11-19.txt`). CPU tests: `part5/test_part5.py` (K = 1, 3; abort frees KV blocks;
 killing any process stops the group); `tools/test_verdicts.py`: a GPU worker that stays alive but stops replying
-makes its engine core exit after `QWEN3_WORKER_TIMEOUT` (600 s per call; 3600 s for loading the weights), so the
+makes its engine core exit after `QWEN3_WORKER_TIMEOUT`, a per-call reply timeout (600 s for one call, which bounds
+the whole call, not the progress inside it; 3600 s for loading the weights), so the
 launcher stops the group, and a request whose first send fails leaves nothing pending.
 
 **Performance, Qwen3-30B-A3B, AIPerf suite, before Part 4** (2026-11-19; the rerun after Part 4 is in
@@ -517,11 +518,14 @@ What changed (each step checked bit-exact or byte-identical before it was timed;
 
 Not done: chunked prefill. A scheduler simulation (`part4/sched_sim.py`, CPU; output
 `results/part4/sched_sim_2026-11-25.txt`) with the step times of the 1x H200 profile reproduces the measured
-prefill_heavy run (389 / 25.6 ms modelled vs 391 / 24.4 ms measured, TTFT / ITL) and predicts a higher mean ITL
-for every chunked policy it models: 27.9-43.5 ms for chunks of 2048, 1024 and 512 tokens, interleaved or mixed with
-the decode rows. Each chunk is a forward of its own with the fixed cost of a forward (34 ms at 256 tokens), and a
-chunk of a few hundred tokens x top-8 already touches most of the 128 experts of each layer. This is a model's
-prediction for this one workload, not a measurement of a chunked scheduler.
+prefill_heavy run (389 / 25.6 ms modelled vs 391 / 24.4 ms measured in the intermediate Part 4 run
+`suite_Qwen3-30B-A3B_ours_1795323744`, TTFT / ITL; the final run measured 395.6 / 23.1 ms) and predicts a higher
+mean ITL for every chunked policy it models: 27.9-43.9 ms for chunks of 2048, 1024 and 512 tokens, interleaved or
+mixed with the decode rows (a request's first token is sent when its last chunk returns, as our server does). Each
+chunk is a forward of its own: a 256-token prefill takes 34 ms in total (measured, computation included), and a chunk
+of a few hundred tokens x top-8 already touches most of the 128 experts of each layer. The mixed policy's cost per
+decode row (0.15 ms) is an assumption. This is a model's prediction for this one workload: it supports not doing
+chunked prefill here, not a ranking of scheduling policies, and it is not a measurement of a chunked scheduler.
 
 Caveat: runs of our server in different containers have differed by up to 7-28% (Known limitations). The 4B gains
 of 5-17% in ITL are within that range; only the 30B changes (up to 3.5x in TTFT) are clearly larger than that noise.
@@ -580,11 +584,18 @@ The lecture and paged rows of Part 0 were not rerun.
 - Each ratio to vLLM is one measured run per server, not an interval: 2.81x means that run met 3x, not that every run
   will. The vLLM image installs `vllm` without a pinned version, and the runs' resolved vLLM version and
   chunked-prefill token budget are not recorded in `results/` (vLLM's own defaults were used, with the flags shown).
-- The acceptance scripts were tightened on 2026-11-25, after the runs above (`tools/test_verdicts.py` has a
-  counterexample for each): `e2e_test.py` judged a top-1 mismatch by HF's own top-2 gap instead of HF's score of the
-  engine's token, and did not include the greedy and RoPE checks or the A/B variants in its exit code; `run_tests.py`
-  passed a module with no cases and an unknown test name, and its MoE "strict" column repeated the tolerance count
-  (now N/A: MoE is judged against a bound). The dense end-to-end runs were not repeated under the corrected rule.
+- The acceptance scripts were tightened on 2026-11-25, after the runs above. `e2e_test.py` judged a top-1 mismatch
+  by HF's own top-2 gap instead of HF's score of the engine's token; it did not include the greedy and RoPE checks or
+  the A/B variants in its exit code, accepted a greedy output of the wrong length or with an id outside the
+  vocabulary, and judged every A/B variant with the last variant's RoPE tables. `run_tests.py` passed a module with
+  no cases and an unknown test name, and its MoE "strict" column repeated the tolerance count (now N/A: MoE is judged
+  against a bound). The dense branch of `part1/moe_e2e.py` (the 0.6B check) did not require the greedy tokens.
+  `tools/test_verdicts.py` has a CPU counterexample for each of these Python decisions, built so that only the
+  targeted check can catch it, and each one passed the previous code. Not covered there: the C++ side
+  (`QWEN3_MOE_FORCE` refused with EP before NCCL starts, its file checked at engine start, `tests/engine_test.cu`
+  keeping only the last 64 rows), which is compiled but not run since, and the timeout through a whole process group
+  (the test runs one engine-core proxy with a fake worker). The dense end-to-end runs were not repeated under the
+  corrected rule.
 - Some dense checks are recorded only in this README and the development log, not as log files under `results/`:
   the 36 attention cases and the 28/28 paged vs contiguous attention cases.
 - Stale rows of a reused block are not zeroed: masked keys get P = 0 exactly, which needs finite stale values (the pool
@@ -599,10 +610,11 @@ The lecture and paged rows of Part 0 were not rerun.
 Run from `final/`. Prerequisites: the Modal volume `qwen3-hf-cache` with the weights (`part1/download_moe.py` for
 30B), and the unit-test database `test_cases.db` (not committed), made on the CPU by `modal run gen_cases.py`
 before `modal_test_h100.py`. `part1/moe_e2e.py` also runs the dense Qwen3-0.6B check, which needs that model in the
-volume. Every `--yes` command uses a GPU and prints its cost cap first.
+volume, and its own HF reference (`moe_e2e.py --ref --yes --model Qwen/Qwen3-0.6B`, CPU). Commands with `--yes`
+use Modal credit and print their cost cap first; most use a GPU, those marked CPU do not.
 
 ```bash
-python tools/test_verdicts.py                      # local, no GPU: every pass/fail decision fails on a counterexample
+python tools/test_verdicts.py                      # local, no GPU: the Python pass/fail decisions vs counterexamples
 python server/test_server.py                       # local, no GPU
 modal run modal_aipref.py --compat                 # CPU only: AIPerf vs the fake-engine server
 modal run modal_test_h100.py --yes                 # unit tests, 1x H100
@@ -622,6 +634,7 @@ modal run part1/download_moe.py --yes              # Part 1: Qwen3-30B-A3B weigh
 modal run part1/gen_moe_cases.py                   # Part 1: MoE reference cases -> test_cases_moe.db (CPU)
 modal run part1/modal_moe_layer.py --yes           # Part 1: one real MoE layer, production shape, vs numpy
 modal run part1/moe_e2e.py --ref --yes             # Part 1: HF reference of the whole model (CPU), with routing
+modal run part1/moe_e2e.py --ref --yes --model Qwen/Qwen3-0.6B   # the dense 0.6B reference the MoE runs also check (CPU)
 modal run part1/moe_e2e.py --ref --yes --prompts heldout   # Part 1: HF reference of the held-out prompt (CPU)
 modal run part1/moe_e2e.py --yes --prompts tiling,heldout  # Part 1: engine vs both references on 1x H100 (+ dense 0.6B)
 modal run modal_test_h100.py --yes --tests moe,moe_debug   # Part 1: MoE unit tests + stage-by-stage check

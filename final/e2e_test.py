@@ -51,8 +51,11 @@ def dense_verdict(ref, mine, gen, exp, gen_row0, rope_bad):
         logits at that position); after a difference the two continuations have different prefixes, so later tokens
         are not compared
       * RoPE tables bit-identical
+    The greedy output must have exactly len(exp) tokens, each a valid id in [0, vocab): checked before anything is
+    indexed with it (numpy would read id -2 as the second-to-last column).
     Returns (ok, lines)."""
     import numpy as np
+    gen, exp = np.asarray(gen), np.asarray(exp)
     rows = np.arange(len(ref))
     choice = mine.argmax(1)
     best = ref.max(1)
@@ -61,20 +64,25 @@ def dense_verdict(ref, mine, gen, exp, gen_row0, rope_bad):
     top1_ok = bool(np.all(gap[mism] < NEAR_TIE))
     cos = (ref * mine).sum(1) / (np.linalg.norm(ref, axis=1) * np.linalg.norm(mine, axis=1))
     cos_ok = bool(cos.min() > MIN_COS)
-    n = min(len(gen), len(exp))
-    first = next((i for i in range(n) if gen[i] != exp[i]), None)
-    if len(gen) < len(exp) and first is None:
-        greedy_ok, why = False, f"engine produced {len(gen)} of {len(exp)} tokens"
-    elif first is None:
-        greedy_ok, why = True, f"{len(exp)}/{len(exp)} identical"
+    V = ref.shape[1]
+    first = None
+    if len(gen) != len(exp):
+        greedy_ok, why = False, f"engine produced {len(gen)} tokens, HF {len(exp)}"
+    elif len(gen) and (gen.min() < 0 or gen.max() >= V):
+        greedy_ok, why = False, f"engine produced an id outside [0, {V}): {int(gen.min())}..{int(gen.max())}"
     else:
-        r = gen_row0 + first
-        if 0 <= r < len(ref):
-            g = float(best[r] - ref[r, gen[first]])
-            greedy_ok, why = g < NEAR_TIE, (f"first difference at token {first}: the engine's token is {g:.3f} below "
-                                            f"HF's best there")
+        first = next((i for i in range(len(exp)) if gen[i] != exp[i]), None)
+        if first is None:
+            greedy_ok, why = True, f"{len(exp)}/{len(exp)} identical"
         else:
-            greedy_ok, why = False, f"first difference at token {first}, outside the compared rows"
+            r = gen_row0 + first
+            if 0 <= r < len(ref):
+                g = float(best[r] - ref[r, gen[first]])
+                greedy_ok, why = g < NEAR_TIE, (f"first difference at token {first}: the engine's token {int(gen[first])} "
+                                                f"is {g:.3f} below HF's best there; teacher-forced, the engine chose "
+                                                f"{int(choice[r])}")
+            else:
+                greedy_ok, why = False, f"first difference at token {first}, outside the compared rows"
     rope_ok = rope_bad == 0
     lines = [f"  top-1 {len(ref) - len(mism)}/{len(ref)}, every mismatch's engine token < {NEAR_TIE} below HF's best: "
              f"{'yes' if top1_ok else 'NO'}" + "".join(f"; row {int(i)}: {gap[i]:.3f}" for i in mism),
@@ -82,6 +90,41 @@ def dense_verdict(ref, mine, gen, exp, gen_row0, rope_bad):
              f"  greedy: {why} ({'ok' if greedy_ok else 'FAIL'})",
              f"  RoPE tables: {rope_bad} differing entries ({'ok' if rope_ok else 'FAIL'})"]
     return top1_ok and cos_ok and greedy_ok and rope_ok, lines
+
+
+def judge_variants(ref, variants, exp, gen_row0):
+    """variants: (tag, engine logits, engine greedy tokens, differing RoPE entries of THAT run). Pass only if every
+    configuration passes every check. Returns (ok, lines)."""
+    ok, lines = True, []
+    for tag, mine, gen, rope_bad in variants:
+        v_ok, v_lines = dense_verdict(ref, mine, gen, exp, gen_row0, rope_bad)
+        lines += [f"verdict, {tag}: {'PASS' if v_ok else 'FAIL'}"] + v_lines
+        ok &= v_ok
+    return ok, lines
+
+
+# the revisions the reported results used (as PINNED in modal_aipref.py); a model not listed uses refs/main
+PINNED = {"Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca",
+          "Qwen/Qwen3-4B": "1cfa9a7208912126459214e8b04321603b3df60c"}
+
+
+def pinned_snapshot(hub: str, model: str, pinned=PINNED) -> str:
+    """The snapshot directory of `model` in the HF cache `hub`: the pinned revision if there is one (error if it is
+    not cached), else the one refs/main names. Never "the first directory found": a cache may hold several."""
+    base = os.path.join(hub, "models--" + model.replace("/", "--"))
+    rev = pinned.get(model)
+    if rev is None:
+        ref = os.path.join(base, "refs", "main")
+        if not os.path.exists(ref):
+            raise SystemExit(f"{model}: no refs/main in {base}")
+        rev = open(ref).read().strip()
+    snap = os.path.join(base, "snapshots", rev)
+    if not os.path.isdir(snap):
+        raise SystemExit(f"{model}: revision {rev} is not in the cache ({base}/snapshots)")
+    return snap
+
+
+MAX_GEN = 63   # engine_test keeps the last 64 logits rows; the first greedy token is predicted by the prompt's last row
 
 
 def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int = 0, yarn: float = 0.0):
@@ -101,7 +144,8 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
         print(r.stderr[-3000:])
         return 1
 
-    snap = glob.glob(f"/hf_cache/hub/models--{model_name.replace('/', '--')}/snapshots/*")[0]
+    snap = pinned_snapshot("/hf_cache/hub", model_name)
+    print(f"snapshot {snap}")
     tok = AutoTokenizer.from_pretrained(snap)
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(snap)
@@ -154,8 +198,16 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
     if ab:   # same HF reference, several engine configurations: isolates what changed the numbers
         variants += [("big GEMM tiles + SMALL attention (QWEN3_ATTN=small)", {"QWEN3_ATTN": "small"}),
                      ("all small tiles (QWEN3_TILES=small): the configuration verified on the L4", {"QWEN3_TILES": "small"})]
+    rot = model.model.rotary_emb
+    P = n_total + n_gen_real + 8
+    cos_hf, sin_hf = rot(torch.zeros(1, P, model.config.head_dim, dtype=torch.bfloat16), torch.arange(P)[None])
+    hf_c = cos_hf[0, :, :64].contiguous().view(torch.int16).numpy().view(np.uint16)
+    hf_s = sin_hf[0, :, :64].contiguous().view(torch.int16).numpy().view(np.uint16)
     summary = []
     for vi, (tag, extra) in enumerate(variants):
+        for f in ("/tmp/logits.bin", "/tmp/rope.bin", "/tmp/gen.bin"):   # a run that writes nothing must not reuse the
+            if os.path.exists(f):                                        # previous variant's files
+                os.remove(f)
         env = dict(os.environ)
         env.update(extra)
         if yarn > 0:
@@ -176,7 +228,10 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
         pre_cos = cos[:b].min().item() if b > 0 else 1.0
         dec_cos = cos[b:].min().item() if n_total > n_prompt else 1.0
         gen = np.frombuffer(open("/tmp/gen.bin", "rb").read(), dtype=np.int32)
-        first_bad = next((i for i in range(len(exp)) if gen[i] != exp[i]), None)
+        first_bad = next((i for i in range(min(len(gen), len(exp))) if gen[i] != exp[i]), None)
+        rt = np.frombuffer(open("/tmp/rope.bin", "rb").read(), dtype=np.uint16).reshape(2, P, 64)
+        bad_c, bad_s = int((rt[0] != hf_c).sum()), int((rt[1] != hf_s).sum())
+        print(f"  RoPE tables (positions 0..{P - 1}): differing bf16 entries cos {bad_c}/{hf_c.size}, sin {bad_s}/{hf_s.size}")
         print(f"--- engine configuration: {tag}")
         print(f"compared positions: {keep} (the last ones: {first_keep}..{n_total - 1}; prefill path up to {n_prompt - 1} of a "
               f"{n_prompt}-token prompt, KV-cache decode path {n_prompt}..{n_total - 1})")
@@ -187,34 +242,19 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
         print(f"  cosine similarity per position: min {cos.min():.6f} (position {first_keep + worst}, HF margin {margin[worst]:.3f}), mean {cos.mean():.6f}")
         print(f"  max abs logit error {maxabs.max():.3f}  (largest |logit| {scale:.1f}; relative {maxabs.max() / scale:.2e})")
         print(f"  min cosine: prefill {pre_cos:.6f}  decode {dec_cos:.6f}")
-        print(f"  greedy generation: engine matches HF for {len(exp) if first_bad is None else first_bad}/{len(exp)} tokens"
+        print(f"  greedy generation: {len(gen)} tokens; matches HF for {min(len(gen), len(exp)) if first_bad is None else first_bad}/{len(exp)}"
               + ("" if first_bad is None else f" (first difference at token {first_bad})"))
         if vi == 0:
             print("  engine text:", repr(tok.decode(gen.tolist())))
-        summary.append((tag, keep - len(mism), pre_cos, dec_cos, mine.numpy(), gen.copy()))
+        summary.append((tag, keep - len(mism), pre_cos, dec_cos, mine.numpy(), gen.copy(), bad_c + bad_s))
     if ab:
         print("\nA/B summary (same HF reference): configuration | top-1 | min cosine prefill | min cosine decode")
-        for tag, ok_n, pc, dc, _, _ in summary:
+        for tag, ok_n, pc, dc, *_ in summary:
             print(f"  {tag[:62]:<62} {ok_n}/{keep}  {pc:.6f}  {dc:.6f}")
 
-    # RoPE tables vs HF
-    rot = model.model.rotary_emb
-    P = n_total + n_gen_real + 8
-    cos_hf, sin_hf = rot(torch.zeros(1, P, model.config.head_dim, dtype=torch.bfloat16), torch.arange(P)[None])
-    rt = np.frombuffer(open("/tmp/rope.bin", "rb").read(), dtype=np.uint16).reshape(2, P, 64)
-    hf_c = cos_hf[0, :, :64].contiguous().view(torch.int16).numpy().view(np.uint16)
-    hf_s = sin_hf[0, :, :64].contiguous().view(torch.int16).numpy().view(np.uint16)
-    bad_c, bad_s = int((rt[0] != hf_c).sum()), int((rt[1] != hf_s).sum())
-    print(f"RoPE tables (positions 0..{P - 1}): differing bf16 entries cos {bad_c}/{hf_c.size}, sin {bad_s}/{hf_s.size}")
-
-    # verdict: every engine configuration must pass every check (see dense_verdict)
-    ok = True
-    ref_np = ref.numpy()
-    for tag, _, _, _, mine_np, gen_np in summary:
-        v_ok, lines = dense_verdict(ref_np, mine_np, gen_np, exp, n_prompt - 1 - first_keep, bad_c + bad_s)
-        print(f"\nverdict, {tag}: {'PASS' if v_ok else 'FAIL'}")
-        print("\n".join(lines))
-        ok &= v_ok
+    # verdict: every engine configuration must pass every check, with its own RoPE tables (see judge_variants)
+    ok, lines = judge_variants(ref.numpy(), [(t[0], t[4], t[5], t[6]) for t in summary], exp, n_prompt - 1 - first_keep)
+    print("\n" + "\n".join(lines))
     print("\nPASS (all configurations)" if ok else "\nFAIL")
     return 0 if ok else 1
 
@@ -234,6 +274,9 @@ def main(model: str = "Qwen/Qwen3-0.6B", n_gen: int = 16, gpu: str = "l4", ab: b
     price, cap = (3.95, 15) if gpu == "h100" else (PRICE_L4, 40)
     print(f"PLAN: {model} from volume qwen3-hf-cache (read-only, no download), HF on CPU as reference, engine on 1x {gpu.upper()}, "
           f"prompt {long or 27} tokens, YaRN={yarn or 'off'}, hard cap {cap} min -> at most ~${cap / 60 * price:.2f} of shared credit")
+    if not 1 <= n_gen <= MAX_GEN:
+        raise SystemExit(f"--n-gen must be 1..{MAX_GEN}: the check keeps the last 64 logits rows and needs the row of "
+                         f"every greedy prediction")
     if not yes:
         print("Dry run only. Pass --yes to start.")
         return

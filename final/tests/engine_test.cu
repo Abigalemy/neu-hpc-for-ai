@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
 
     const int V = eng.cfg.vocab;
     // Only the last `keep` positions are written: for long prompts the logits of all positions would be gigabytes.
-    const int keep = std::min(n_total, 64), first_keep = n_total - keep;   // keep >= number of decode steps
+    const int keep = std::min(n_total, 64), first_keep = n_total - keep;
     std::vector<bf16> all((size_t)keep * V);
     Timer tm;
 
@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
         tm.start();
         lg = eng.forward(tokens + t, 1, t, false);
         dec_ms += tm.stop();
-        CK(cudaMemcpy(all.data() + (size_t)(t - first_keep) * V, lg, (size_t)V * sizeof(bf16), cudaMemcpyDeviceToHost));
+        if (t >= first_keep)   // only the last `keep` rows are kept (n_total - n_prompt > 64 starts before them)
+            CK(cudaMemcpy(all.data() + (size_t)(t - first_keep) * V, lg, (size_t)V * sizeof(bf16), cudaMemcpyDeviceToHost));
     }
     write_file(argv[5], all.data(), all.size() * sizeof(bf16));
     std::printf("LOGITS_KEPT rows=%d first_position=%d\n", keep, first_keep);
