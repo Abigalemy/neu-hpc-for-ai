@@ -22,7 +22,8 @@ results_vol = modal.Volume.from_name("final-results", create_if_missing=True)  #
 HF_DIR, RES_DIR, PORT = "/hf_cache", "/results_store", 8000
 # keep identical to PINNED in modal_aipref.py (this file is mounted alone in its image, so it is copied, not imported)
 PINNED = {"Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
-          "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca"}
+          "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca",
+          "Qwen/Qwen3-4B": "1cfa9a7208912126459214e8b04321603b3df60c"}
 
 vllm_image = (
     modal.Image.debian_slim(python_version="3.12")

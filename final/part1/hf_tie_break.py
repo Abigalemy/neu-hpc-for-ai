@@ -68,12 +68,17 @@ def self_check():
         p = torch.softmax(lo, dtype=torch.float, dim=-1)
         top = torch.sort(p, dim=-1, descending=True).values
         boundary_tie = top[:, K - 1] == top[:, K]
-        same_set = (torch.sort(ip, -1).values == torch.sort(io, -1).values).all(-1)
+        # compare (expert id, weight) pairs: order each row by expert id and carry the weights along, so a weight
+        # attached to the wrong expert cannot pass as the same set of ids plus the same set of weights
+        ip_s, op = torch.sort(ip, -1)
+        io_s, oo = torch.sort(io, -1)
+        same_set = (ip_s == io_s).all(-1)
+        same_w = (torch.gather(wp, -1, op) == torch.gather(wo, -1, oo)).all(-1)
         assert torch.equal(lp, lo)
         assert same_set[~boundary_tie].all(), "patched router chose a different expert set on a row without a tie"
+        assert same_w[~boundary_tie].all(), "patched router gave an expert a different weight on a row without a tie"
         lines = [f"{len(x)} random rows: {int(boundary_tie.sum())} with a tie at the top-{K} boundary; every other row "
-                 f"takes the same {K} experts as torch.topk, same weights"]
-        assert torch.equal(torch.sort(wp, -1).values[~boundary_tie], torch.sort(wo, -1).values[~boundary_tie])
+                 f"takes the same {K} experts as torch.topk, each with the same weight"]
         # built ties: a router whose rows for experts 5, 9, 40, 77, 100 are identical gives those experts equal logits
         w = r.weight.clone()
         for e in (9, 40, 77, 100):

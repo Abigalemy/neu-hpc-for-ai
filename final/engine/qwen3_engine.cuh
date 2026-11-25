@@ -538,6 +538,7 @@ private:
                     const double ex_bytes = std::min<double>(cfg.experts, nn * cfg.top_k) * 3.0 * lin_bytes(cfg.moe_inter, H);
                     const double ex_flops = 3.0 * cfg.top_k * lin_flops(cfg.moe_inter, H);
                     if (ep_.world > 1) {
+                        if (force_T_) { std::fprintf(stderr, "QWEN3_MOE_FORCE: one GPU only (not with EP)\n"); std::exit(2); }
                         moe_ep_layer<bf16, 128, 8>(h_, L.router, L.ewg, L.ewu, L.ewd, o_, n, H, cfg.moe_inter, cfg.norm_topk,
                                                    moe_ws_, ep_ws_, ep_, 0, ncclBfloat16,
                                                    [&](const char* name, auto&& f) { stage(name, 0, 0, f); });
@@ -653,7 +654,13 @@ private:
 public:
     long long forced_calls = 0, own_calls = 0;
 private:
-    int force_T_ = [] { const char* t = std::getenv("QWEN3_MOE_FORCE_T"); return std::getenv("QWEN3_MOE_FORCE") && t ? std::atoi(t) : 0; }();
+    int force_T_ = [] {
+        if (!std::getenv("QWEN3_MOE_FORCE")) return 0;
+        const char* t = std::getenv("QWEN3_MOE_FORCE_T");
+        const int T = t ? std::atoi(t) : 0;
+        if (T <= 0) { std::fprintf(stderr, "QWEN3_MOE_FORCE needs QWEN3_MOE_FORCE_T > 0\n"); std::exit(2); }
+        return T;
+    }();
     std::vector<int> force_idx_;
     int* d_force_ = nullptr;
     std::map<int, int> moe_ordinal_;   // layer -> index among the MoE layers
@@ -672,7 +679,15 @@ private:
             if (got != force_idx_.size() || more) {
                 std::fprintf(stderr, "QWEN3_MOE_FORCE: file is not [%d, %d, %d] int32\n", m, force_T_, K); std::exit(2);
             }
-            if (ep_.world > 1) { std::fprintf(stderr, "QWEN3_MOE_FORCE: one GPU only\n"); std::exit(2); }
+            for (size_t r = 0; r < force_idx_.size() / K; ++r) {   // K distinct experts in [0, E) per row, or the
+                const int* row = &force_idx_[r * K];                  // count/sort would not see n*K valid assignments
+                for (int j = 0; j < K; ++j)
+                    if (row[j] < 0 || row[j] >= cfg.experts || std::count(row, row + j, row[j])) {
+                        std::fprintf(stderr, "QWEN3_MOE_FORCE: row %zu (MoE layer %zu, position %zu): expert %d invalid or repeated\n",
+                                     r, r / force_T_, r % force_T_, row[j]);
+                        std::exit(2);
+                    }
+            }
             d_force_ = alloc<int>((size_t)moe_ws_.max_tokens * K);
         }
         for (int i = 0; i < n; ++i)

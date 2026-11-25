@@ -83,10 +83,18 @@ def write(path, data):
 
 
 def report(title, rows):
+    """rows: (description, cases, passed within tolerance, bit-identical or None if not compared bit for bit, worst).
+    Fails when there is no module, or a module has no case: an empty test proves nothing."""
     print(f"\n{title}: cases / pass(tolerance) / pass(bit-identical) / worst abs err")
     for desc, n, n_ok, n_strict, worst in rows:
-        print("  %-28s cases=%-3d tol=%-3d strict=%-3d worst=%.3e" % (desc, n, n_ok, n_strict, worst))
-    return all(r[1] == r[2] for r in rows)
+        strict = "N/A" if n_strict is None else str(n_strict)
+        print("  %-28s cases=%-3d tol=%-3d strict=%-3s worst=%.3e" % (desc, n, n_ok, strict, worst))
+    if not rows:
+        print("  NO MODULE of this kind in the database: FAIL")
+    for desc, n, *_ in rows:
+        if n == 0:
+            print(f"  {desc}: no test case: FAIL")
+    return bool(rows) and all(r[1] > 0 and r[1] == r[2] for r in rows)
 
 
 def run_rmsnorm(db, binary):
@@ -423,14 +431,19 @@ def run_moe(db, binary):
                         f"for information: vs fp32 path {d32:.2e}, vs HF's bf16 sum {dhf:.2e}")
             n_ok += ok
             print(f"  {'ok  ' if ok else 'FAIL'} {kind} E={E} {label}: {msg}")
-        out.append((f"{kind} E={E} top-{K}", n, n_ok, n_ok, worst))
+        out.append((f"{kind} E={E} top-{K}", n, n_ok, None, worst))   # judged against a bound, not bit for bit
     return report("MoE (Qwen3-30B-A3B sparse block; worst = rel. to max|e|)", out)
 
 
 if __name__ == "__main__":
     db = sqlite3.connect(sys.argv[1])
     build = sys.argv[2]
-    which = sys.argv[3:] or ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention"]
+    known = ["rmsnorm", "rope", "mlp", "embedding", "linear", "argmax", "attention", "moe"]
+    which = sys.argv[3:] or known[:-1]
+    unknown = [w for w in which if w not in known]
+    if unknown:
+        print(f"unknown test name(s) {unknown}; known: {known}")
+        sys.exit(2)
     results = []
     if "rmsnorm" in which:
         results.append(run_rmsnorm(db, f"{build}/rmsnorm_test"))
@@ -448,6 +461,6 @@ if __name__ == "__main__":
         results.append(run_attention(db, f"{build}/attention_test"))
     if "moe" in which:
         results.append(run_moe(db, f"{build}/moe_test"))
-    ok = all(results)
+    ok = bool(results) and all(results)
     print("\nALL PASS (tolerance)" if ok else "\nSOME CASES FAILED")
     sys.exit(0 if ok else 1)
