@@ -128,7 +128,12 @@ def run(model: str, isl: int, osl: int, yarn: bool, requests: int, max_minutes: 
     # the pinned revision (PINNED), from the cache only: snapshot_download raises if that revision is not cached
     serve_path = snapshot_download(model, revision=PINNED.get(model), local_files_only=True)
     snap = serve_path
-    print(f"weights: {snap} (revision {os.path.basename(os.path.realpath(snap))})", flush=True)
+    # AIPerf loads the tokenizer by model name, i.e. the snapshot refs/main names: it must be the served one
+    tok_rev = os.path.basename(os.path.realpath(snapshot_download(model, local_files_only=True)))
+    rev = os.path.basename(os.path.realpath(snap))
+    if tok_rev != rev:
+        raise RuntimeError(f"{model}: weights at revision {rev}, but refs/main (AIPerf's tokenizer) is {tok_rev}")
+    print(f"weights: {snap} (revision {rev}; AIPerf's tokenizer: the same revision)", flush=True)
     if yarn:
         if os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN"):
             raise RuntimeError("VLLM_ALLOW_LONG_MAX_MODEL_LEN must not be set: it would hide a missing YaRN")

@@ -124,6 +124,18 @@ def pinned_snapshot(hub: str, model: str, pinned=PINNED) -> str:
     return snap
 
 
+def output_problems(expected):
+    """expected: {path: byte count}. The problems with the files a run should have written (missing, wrong size), so
+    a run that wrote nothing or too little is a clear FAIL naming the file, not an exception further on."""
+    out = []
+    for path, nbytes in expected.items():
+        if not os.path.exists(path):
+            out.append(f"{path} not written")
+        elif os.path.getsize(path) != nbytes:
+            out.append(f"{path}: {os.path.getsize(path)} bytes, expected {nbytes}")
+    return out
+
+
 MAX_GEN = 63   # engine_test keeps the last 64 logits rows; the first greedy token is predicted by the prompt's last row
 
 
@@ -208,6 +220,7 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
         for f in ("/tmp/logits.bin", "/tmp/rope.bin", "/tmp/gen.bin"):   # a run that writes nothing must not reuse the
             if os.path.exists(f):                                        # previous variant's files
                 os.remove(f)
+        print(f"--- running engine configuration: {tag}", flush=True)
         env = dict(os.environ)
         env.update(extra)
         if yarn > 0:
@@ -218,6 +231,11 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
             print(r.stdout)
         if r.returncode:
             print("engine_test failed:", r.stderr[-2000:])
+            return 1
+        bad_files = output_problems({"/tmp/logits.bin": keep * V * 2, "/tmp/rope.bin": 2 * P * 64 * 2,
+                                     "/tmp/gen.bin": n_gen_real * 4})
+        if bad_files:
+            print(f"FAIL: engine configuration {tag}: " + "; ".join(bad_files))
             return 1
         raw = np.frombuffer(open("/tmp/logits.bin", "rb").read(), dtype=np.uint16).astype(np.uint32) << 16
         mine = torch.from_numpy(raw.view(np.float32).reshape(keep, V).copy())
@@ -244,7 +262,7 @@ def _impl(model_name: str, n_gen: int, arch: str, ab: bool = False, long_n: int 
         print(f"  min cosine: prefill {pre_cos:.6f}  decode {dec_cos:.6f}")
         print(f"  greedy generation: {len(gen)} tokens; matches HF for {min(len(gen), len(exp)) if first_bad is None else first_bad}/{len(exp)}"
               + ("" if first_bad is None else f" (first difference at token {first_bad})"))
-        if vi == 0:
+        if vi == 0 and len(gen) and 0 <= gen.min() and gen.max() < V:   # decode only valid ids (the verdict says why not)
             print("  engine text:", repr(tok.decode(gen.tolist())))
         summary.append((tag, keep - len(mism), pre_cos, dec_cos, mine.numpy(), gen.copy(), bad_c + bad_s))
     if ab:

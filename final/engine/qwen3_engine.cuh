@@ -679,13 +679,20 @@ private:
             for (int l = 0; l < cfg.layers; ++l) if (layers_[l].router) moe_ordinal_[l] = m++;
             std::FILE* f = std::fopen(std::getenv("QWEN3_MOE_FORCE"), "rb");
             if (!f) { std::fprintf(stderr, "QWEN3_MOE_FORCE: cannot open\n"); std::exit(2); }
-            force_idx_.resize((size_t)m * force_T_ * K);
-            const size_t got = std::fread(force_idx_.data(), sizeof(int), force_idx_.size(), f);
-            const bool more = std::fgetc(f) != EOF;
-            std::fclose(f);
-            if (got != force_idx_.size() || more) {
-                std::fprintf(stderr, "QWEN3_MOE_FORCE: file is not [%d, %d, %d] int32\n", m, force_T_, K); std::exit(2);
+            const size_t want = (size_t)m * force_T_ * K;
+            std::fseek(f, 0, SEEK_END);
+            const long bytes = std::ftell(f);   // the size first: a wrong T must not allocate first
+            if (bytes < 0 || (size_t)bytes != want * sizeof(int)) {
+                std::fclose(f);
+                std::fprintf(stderr, "QWEN3_MOE_FORCE: file has %ld bytes, [%d, %d, %d] int32 needs %zu\n", bytes, m,
+                             force_T_, K, want * sizeof(int));
+                std::exit(2);
             }
+            std::rewind(f);
+            force_idx_.resize(want);
+            const size_t got = std::fread(force_idx_.data(), sizeof(int), want, f);
+            std::fclose(f);
+            if (got != want) { std::fprintf(stderr, "QWEN3_MOE_FORCE: short read\n"); std::exit(2); }
             for (size_t r = 0; r < force_idx_.size() / K; ++r) {   // K distinct experts in [0, E) per row, or the
                 const int* row = &force_idx_[r * K];                  // count/sort would not see n*K valid assignments
                 for (int j = 0; j < K; ++j)

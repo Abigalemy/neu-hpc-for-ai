@@ -414,7 +414,7 @@ the coordinator wakes them all (checked with real processes, `part3/protocol_sim
 | one expert of one layer: gate, up, down, each 2048 x 768 | 3 x 2048 x 768 x 2 B = 9 MiB |
 | one expert id across the 48 layers | 48 x 9 MiB = 432 MiB |
 | experts per GPU: 64 of 128 | 64 x 432 MiB = **27 GiB** (all 128 on one GPU: 54 GiB) |
-| non-expert weights, copied on every rank: attention 48 x 2048 x (4096 + 512 + 512) + 48 x 4096 x 2048, routers 48 x 2048 x 128, embedding and lm_head (untied) 2 x 151936 x 2048 | 1,540,882,432 parameters = 2.87 GiB |
+| non-expert weights, copied on every rank: attention 48 x 2048 x (4096 + 512 + 512) + 48 x 4096 x 2048, routers 48 x 2048 x 128, embedding and lm_head (untied) 2 x 151936 x 2048 | 1,541,093,376 parameters = 2.87 GiB (the matrices above, 1,540,882,432, plus the RMSNorm weights, 48 x (2 x 2048 + 2 x 128) + 2048) |
 | KV cache: 48 layers x (K + V) x 4 KV heads x 128 x 2 B | 96 KiB per token (the suite's pool, per rank: 64 sequences x 4224 tokens = 270336 tokens = 24.8 GiB) |
 | EP receive buffers and the MoE workspace | sized at startup for the worst case (all tokens of all ranks on one rank) |
 
@@ -542,9 +542,12 @@ The lecture and paged rows of Part 0 were not rerun.
   lengths 1-3000 incl. block edges 127/128/129, full and chunked) and batched decode (up to 100 sequences): 28/28
   outputs bit-identical. Speed (`tests/paged_bench_test.cu`): decode 500 us vs 497 us per layer at 128K, prefill
   16K 7.94 ms vs 7.65 ms, i.e. the block-table lookup costs nothing measurable.
-- Whole model vs HF (`e2e_test.py`, rerun with the paged KV cache on 2026-11-18, identical numbers): Qwen3-0.6B with an 8192-token prompt and YaRN x4: top-1 60/64 (every mismatch an
-  HF near-tie, margin <= 0.062), min cosine prefill 0.999789 / decode 0.999687 (criterion > 0.999), greedy tokens 16/16,
-  RoPE tables bit-identical. Qwen3-4B, 43 positions: criterion met (see the development log).
+- Whole model vs HF (`e2e_test.py`, rerun with the paged KV cache on 2026-11-18, identical numbers), judged by the
+  rule of that time: Qwen3-0.6B with an 8192-token prompt and YaRN x4: top-1 60/64 (the margins logged are HF's own
+  top-1 minus top-2, <= 0.062 at every mismatch, not HF's score of the engine's token), min cosine prefill 0.999789 /
+  decode 0.999687 (criterion > 0.999), greedy tokens 16/16, RoPE tables bit-identical. Qwen3-4B, 43 positions:
+  criterion of that time met (see the development log). These runs were not judged again by the rule of 2026-11-25
+  (Known limitations): the logs keep summaries, not the logits needed to do it on a CPU.
 - Batched decode vs decoding alone (`batch_check.py`, Qwen3-4B, 4 sequences of 27-3000 tokens, 16 steps): with a fixed
   split count, 64/64 logits rows bit-identical (rerun with the paged KV cache on 2026-11-18, same result).
 - Server (`server/test_server.py`, 18 tests, fake engine with the engine's block accounting): stream format, exact
@@ -590,8 +593,11 @@ The lecture and paged rows of Part 0 were not rerun.
   vocabulary, and judged every A/B variant with the last variant's RoPE tables. `run_tests.py` passed a module with
   no cases and an unknown test name, and its MoE "strict" column repeated the tolerance count (now N/A: MoE is judged
   against a bound). The dense branch of `part1/moe_e2e.py` (the 0.6B check) did not require the greedy tokens.
-  `tools/test_verdicts.py` has a CPU counterexample for each of these Python decisions, built so that only the
-  targeted check can catch it, and each one passed the previous code. Not covered there: the C++ side
+  `tools/test_verdicts.py` has CPU counterexamples for these Python decisions. For the dense verdict, each case asserts
+  (`holds`) that the checks it does not target pass on it. Four of them were run against earlier code: the A/B/C
+  case passes de179ff's rule (the HF top-2 gap); a short output ending on a tied token, one extra token and id -2
+  pass 01c3f21's; all four fail the current rule. The A/B RoPE case tests the combined verdict with given counts,
+  not the reading of each run's files (that reading is only checked for missing or short files). Not covered there: the C++ side
   (`QWEN3_MOE_FORCE` refused with EP before NCCL starts, its file checked at engine start, `tests/engine_test.cu`
   keeping only the last 64 rows), which is compiled but not run since, and the timeout through a whole process group
   (the test runs one engine-core proxy with a fake worker). The dense end-to-end runs were not repeated under the
