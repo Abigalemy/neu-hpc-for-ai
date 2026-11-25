@@ -10,7 +10,7 @@ Goal (from the assignment): approach vLLM performance without PyTorch in the ser
 | Part 2 | Two-GPU all-to-all mock | **done** (2026-11-18): `part2/`, exact on 2x H100 (below) |
 | Part 1 | Single-GPU Qwen3-30B-A3B (MoE) | **done** (2026-11-18): whole model matches HF under the frozen MoE rule on a held-out prompt; on 1x H200 every suite workload within 5.56x of vLLM (below) |
 | Part 3, Part 5 | DP + EP over K GPUs; multi-process architecture | **done** (2026-11-19, K = 2 as agreed with the instructor): EP layer bit-exact and whole model identical to 1 GPU; vLLM's process layout (API servers, engine cores, GPU workers, DP coordinator, ZMQ); 2x H200 AIPerf suite vs vLLM DP2 EP: every workload within 5.79x (below) |
-| Part 4 | Within 3x of vLLM; write-up | not started |
+| Part 4 | Within 3x of vLLM; write-up | **done** (2026-11-24): all 6 suite workloads within 3x of vLLM for TTFT and ITL on 4B 1x H100, 30B 1x H200 and 30B 2x H200 (worst 2.81x; below) |
 
 Weekly report item (single 128K-input sequence, Qwen3-4B, 1x H100, measured 2026-11-18 with the paged KV cache):
 TTFT 23.37 s vs vLLM 10.45 s (2.24x), ITL 24.73 ms vs 10.43 ms (2.37x).
@@ -373,6 +373,68 @@ What the numbers show:
   profiled: the per-layer host synchronisation for the counts (48 per step) and fixed per-layer costs. This is the
   first item for Part 4 on 2 GPUs.
 
+## Part 4: every suite workload within 3x of vLLM
+
+Every workload of the 6-workload suite is now within 3x of vLLM for both TTFT and ITL, on all three setups: Qwen3-4B
+on 1x H100, Qwen3-30B-A3B on 1x H200, and Qwen3-30B-A3B on 2x H200. The worst ratio is 2.81x (30B on 2 GPUs,
+balanced_c64 ITL). Our side was rerun after the Part 4 changes (4B and 2 GPUs 2026-11-24, 1 GPU 2026-11-21). The vLLM
+runs are the same ones as before. Every run had 0 request errors. The ratios are ratios of means, from
+`results/comparison.csv` (`tools/summarize_results.py`); the ratio before Part 4 is in parentheses.
+
+**Qwen3-4B, 1x H100** (ours `suite_ours_1795582887`, vLLM `suite_vllm_1794881615`)
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio (before Part 4) | ITL vLLM / ours (ms) | ratio (before Part 4) | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 29.21 / 12.38 | **0.42x** (0.51x) | 4.25 / 6.76 | **1.59x** (1.73x) | 224 / 147 |
+| long_out | 3072 / 1024, 1 | 63.73 / 77.26 | **1.21x** (1.24x) | 4.44 / 7.36 | **1.66x** (1.87x) | 222 / 135 |
+| balanced_c16 | 256 / 256, 16 | 107.33 / 108.83 | **1.01x** (1.02x) | 4.70 / 8.69 | **1.85x** (2.06x) | 3126 / 1758 |
+| balanced_c64 | 256 / 256, 64 | 270.13 / 405.22 | **1.50x** (1.50x) | 6.35 / 15.89 | **2.50x** (3.03x) | 8610 / 3667 |
+| prefill_heavy | 2048 / 32, 8 | 204.67 / 228.58 | **1.12x** (1.11x) | 6.99 / 14.78 | **2.11x** (2.25x) | 601 / 371 |
+| decode_heavy | 64 / 1024, 32 | 95.96 / 159.11 | **1.66x** (1.61x) | 5.57 / 11.64 | **2.09x** (2.34x) | 5639 / 2711 |
+
+**Qwen3-30B-A3B, 1x H200** (ours `suite_Qwen3-30B-A3B_ours_1795326093`, vLLM `suite_Qwen3-30B-A3B_vllm_1795049169`)
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio (before Part 4) | ITL vLLM / ours (ms) | ratio (before Part 4) | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 67.61 / 25.58 | **0.38x** (0.63x) | 4.00 / 7.38 | **1.85x** (2.76x) | 222 / 133 |
+| long_out | 3072 / 1024, 1 | 80.65 / 129.64 | **1.61x** (4.67x) | 4.15 / 8.19 | **1.97x** (2.96x) | 236 / 120 |
+| balanced_c16 | 256 / 256, 16 | 149.95 / 258.08 | **1.72x** (3.43x) | 8.46 / 16.13 | **1.91x** (2.56x) | 1771 / 936 |
+| balanced_c64 | 256 / 256, 64 | 467.52 / 978.16 | **2.09x** (4.13x) | 12.74 / 30.38 | **2.39x** (3.39x) | 4396 / 1874 |
+| prefill_heavy | 2048 / 32, 8 | 245.02 / 395.64 | **1.61x** (4.66x) | 8.24 / 23.08 | **2.80x** (5.56x) | 507 / 229 |
+| decode_heavy | 64 / 1024, 32 | 1064.34 / 325.52 | **0.31x** (0.46x) | 10.26 / 21.12 | **2.06x** (2.70x) | 2830 / 1493 |
+
+**Qwen3-30B-A3B, 2x H200 (DP = EP = 2; vLLM --data-parallel-size 2 --enable-expert-parallel)** (ours `suite_Qwen3-30B-A3B_ep2_ours_1795581836`, vLLM `suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843`)
+
+| Workload | in / out, concurrency | TTFT vLLM / ours (ms) | ratio (before Part 4) | ITL vLLM / ours (ms) | ratio (before Part 4) | output tok/s vLLM / ours |
+|---|---|---|---|---|---|---|
+| baseline | 128 / 128, 1 | 102.90 / 27.66 | **0.27x** (0.57x) | 4.97 / 11.39 | **2.29x** (2.91x) | 174 / 87 |
+| long_out | 3072 / 1024, 1 | 112.13 / 169.67 | **1.51x** (4.43x) | 5.10 / 12.74 | **2.50x** (3.11x) | 192 / 77 |
+| balanced_c16 | 256 / 256, 16 | 384.85 / 192.21 | **0.50x** (1.32x) | 8.11 / 18.10 | **2.23x** (2.95x) | 1663 / 848 |
+| balanced_c64 | 256 / 256, 64 | 320.04 / 625.47 | **1.95x** (5.47x) | 9.21 / 25.83 | **2.81x** (4.76x) | 6116 / 2263 |
+| prefill_heavy | 2048 / 32, 8 | 259.37 / 412.15 | **1.59x** (5.67x) | 8.75 / 23.63 | **2.70x** (5.79x) | 476 / 223 |
+| decode_heavy | 64 / 1024, 32 | 218.80 / 228.75 | **1.05x** (2.06x) | 8.68 / 21.08 | **2.43x** (3.30x) | 3593 / 1501 |
+
+What changed (each step checked bit-exact or byte-identical before it was timed; profiles in `results/part4/`):
+1. Per-stage profile of the MoE and EP layers with the host clock (`tests/moe_profile_test.cu`). On 1x H200 the
+   expert GEMMs took most of a long prefill, at 30-40 TFLOP/s: most of the blocks of their grid had no rows.
+2. Work list for the expert GEMMs: blocks are launched only for the (expert, row tile) pairs that have rows
+   (`part4/tile_list_sim.py` checked the indexing on the CPU first; `tests/moe_tiles_test.cu`: same output as the full
+   grid, bit for bit). 2048-token prefill 251 -> 183 ms on 1 GPU, 594 -> 259 ms on 2 GPUs.
+3. Expert GEMM tiles and alignment hints chosen by a sweep (`tests/moe_sweep_test.cu`, bit-exact): 2048-token
+   prefill 183 -> 86 ms on 1 GPU.
+4. The sort kernel writes the work list itself, so each MoE layer needs one launch fewer (bit-exact).
+5. Decode steps as CUDA graphs, one per batch size, on 1 GPU. Logits are identical with and without the graph on
+   19 steps at batch 1 / 8 / 32 / 64. Decode step 8.14 -> 7.33 ms at batch 1 and 20.32 -> 19.03 ms at batch 64
+   (30B, 1x H200). Graphs are off with expert parallelism, so the 2-GPU gains come from steps 2-4.
+
+Rejected: chunked prefill. A simulation of the scheduler (it matched the measured prefill_heavy run) showed that
+it raises the mean ITL here. Every forward reads all the expert weights, so splitting a prefill into chunks adds
+whole forwards.
+
+Caveat: runs of our server in different containers have differed by up to 7-28% (Known limitations). The 4B gains
+of 5-17% in ITL are within that range; only the 30B changes (up to 3.5x in TTFT) are clearly larger than that noise.
+The lecture and paged rows of Part 0 were not rerun.
+
 ## Correctness checks
 
 - Unit tests per module against HF (SQLite cases, `modal_test_h100.py`): RMSNorm, RoPE, linear, MLP, embedding,
@@ -405,7 +467,8 @@ What the numbers show:
   (`tests/paged_bench_test.cu`).
 - A prefill stalls the decode of the other running sequences (no chunked-prefill interleaving).
 - Greedy only (`temperature` > 0 is rejected); `min_tokens` does not mask EOS like vLLM.
-- Above the Part 4 limit (3x): lecture workload ITL with the 32K context limit (3.45x) and balanced_c64 ITL (3.03x).
+- Above the Part 4 limit (3x), not rerun after Part 4: lecture workload ITL with the 32K context limit (3.45x).
+  The six suite workloads are all within 3x since Part 4 (balanced_c64 ITL 3.03x -> 2.50x on 4B).
   Closest below it: the lecture
   workload at context 2048 (TTFT 2.51x, ITL 2.50x), long prompts at concurrency 8 (ITL 2.70x), long-context
   decode (2.37x); decode attention still dominates the 128K step. (balanced_c64 ITL was 2.36x before the suite rerun;

@@ -16,12 +16,12 @@ RES = os.path.join(HERE, "results")
 
 # (workload, our run dir, vLLM run dir): the pairs compared in the README
 PAIRS = [
-    ("baseline", "suite_ours_1795031469/baseline", "suite_vllm_1794881615/baseline"),
-    ("long_out", "suite_ours_1795031469/long_out", "suite_vllm_1794881615/long_out"),
-    ("balanced_c16", "suite_ours_1795031469/balanced_c16", "suite_vllm_1794881615/balanced_c16"),
-    ("balanced_c64", "suite_ours_1795031469/balanced_c64", "suite_vllm_1794881615/balanced_c64"),
-    ("prefill_heavy", "suite_ours_1795031469/prefill_heavy", "suite_vllm_1794881615/prefill_heavy"),
-    ("decode_heavy", "suite_ours_1795031469/decode_heavy", "suite_vllm_1794881615/decode_heavy"),
+    ("baseline", "suite_ours_1795582887/baseline", "suite_vllm_1794881615/baseline"),
+    ("long_out", "suite_ours_1795582887/long_out", "suite_vllm_1794881615/long_out"),
+    ("balanced_c16", "suite_ours_1795582887/balanced_c16", "suite_vllm_1794881615/balanced_c16"),
+    ("balanced_c64", "suite_ours_1795582887/balanced_c64", "suite_vllm_1794881615/balanced_c64"),
+    ("prefill_heavy", "suite_ours_1795582887/prefill_heavy", "suite_vllm_1794881615/prefill_heavy"),
+    ("decode_heavy", "suite_ours_1795582887/decode_heavy", "suite_vllm_1794881615/decode_heavy"),
     ("128k_yarn", "ours_isl130816_osl128_1795026977", "vllm_isl130816_osl128_1794875810"),
     # the AIPerf example of the Week 7 lecture: 100 connections, 1000 requests, 1000 in / 500 out, 2048 x 128 limits
     ("lecture_c100", "lecture_ours_1794894311/lecture_c100", "lecture_vllm_1794893920/lecture_c100"),
@@ -32,16 +32,16 @@ PAIRS = [
     ("paged/long_c8", "paged_ours_1795030271/long_c8", "paged_vllm_1795029909/long_c8"),
     ("slots8/lecture_c100", "slots8_ours_1795030663/lecture_c100", "paged_vllm_1795029909/lecture_c100"),
     ("slots8/long_c8", "slots8_ours_1795030663/long_c8", "paged_vllm_1795029909/long_c8"),
-    # Part 1 (2026-11-18): Qwen3-30B-A3B (MoE), 1x H200, same 6-workload suite, both at revision ad44e777
-    ("30B/baseline", "suite_Qwen3-30B-A3B_ours_1795057331/baseline", "suite_Qwen3-30B-A3B_vllm_1795049169/baseline"),
-    ("30B/long_out", "suite_Qwen3-30B-A3B_ours_1795057331/long_out", "suite_Qwen3-30B-A3B_vllm_1795049169/long_out"),
-    ("30B/balanced_c16", "suite_Qwen3-30B-A3B_ours_1795057331/balanced_c16", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c16"),
-    ("30B/balanced_c64", "suite_Qwen3-30B-A3B_ours_1795057331/balanced_c64", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c64"),
-    ("30B/prefill_heavy", "suite_Qwen3-30B-A3B_ours_1795057331/prefill_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/prefill_heavy"),
-    ("30B/decode_heavy", "suite_Qwen3-30B-A3B_ours_1795057331/decode_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/decode_heavy"),
-    # Parts 3 + 5 (2026-11-19): Qwen3-30B-A3B on 2x H200, DP = EP = 2, TP = 1; ours through part5/launch.py, vLLM with
+    # Part 1 + Part 4: Qwen3-30B-A3B (MoE), 1x H200, same 6-workload suite, both at revision ad44e777 (ours rerun 2026-11-21 after Part 4)
+    ("30B/baseline", "suite_Qwen3-30B-A3B_ours_1795326093/baseline", "suite_Qwen3-30B-A3B_vllm_1795049169/baseline"),
+    ("30B/long_out", "suite_Qwen3-30B-A3B_ours_1795326093/long_out", "suite_Qwen3-30B-A3B_vllm_1795049169/long_out"),
+    ("30B/balanced_c16", "suite_Qwen3-30B-A3B_ours_1795326093/balanced_c16", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c16"),
+    ("30B/balanced_c64", "suite_Qwen3-30B-A3B_ours_1795326093/balanced_c64", "suite_Qwen3-30B-A3B_vllm_1795049169/balanced_c64"),
+    ("30B/prefill_heavy", "suite_Qwen3-30B-A3B_ours_1795326093/prefill_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/prefill_heavy"),
+    ("30B/decode_heavy", "suite_Qwen3-30B-A3B_ours_1795326093/decode_heavy", "suite_Qwen3-30B-A3B_vllm_1795049169/decode_heavy"),
+    # Parts 3 + 5 (ours rerun 2026-11-24 after Part 4): Qwen3-30B-A3B on 2x H200, DP = EP = 2, TP = 1; ours through part5/launch.py, vLLM with
     # --data-parallel-size 2 --enable-expert-parallel
-] + [(f"30B_2gpu/{w}", f"suite_Qwen3-30B-A3B_ep2_ours_1795147115/{w}", f"suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/{w}")
+] + [(f"30B_2gpu/{w}", f"suite_Qwen3-30B-A3B_ep2_ours_1795581836/{w}", f"suite_Qwen3-30B-A3B_dp2ep_vllm_1795151843/{w}")
      for w in ("baseline", "long_out", "balanced_c16", "balanced_c64", "prefill_heavy", "decode_heavy")]
 
 
